@@ -176,7 +176,9 @@ class LSImagineWrapper(Wrapper, ABC):
                 space = self.observation_space[key]
                 if not isinstance(value, np.ndarray):
                     value = np.array(value)
-                assert (key, value, value.dtype, value.shape, space)
+                #修改前：assert (key, value, value.dtype, value.shape, space)
+                #修改后：检查真实的张量形状是否与空间定义匹配
+                assert value.shape == space.shape, f"Shape mismatch in {key}: {value.shape} != {space.shape}"
         return obs
 
     def _action(self, action):
