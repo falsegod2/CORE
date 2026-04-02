@@ -244,7 +244,7 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            indices = [index for index in indices if information[index].get("real_done", True)]
+            #indices = [index for index in indices if information[index].get("real_done", True)]
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results] 
 
@@ -327,9 +327,10 @@ def simulate(
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
+                '''
                 if (not is_eval) and (not information[i].get("real_done", False)):
                     continue
-
+                '''
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
                 '''清理 done 逻辑
                 step_calculator.remove_all(envs[i].id)
