@@ -20,6 +20,7 @@ from bisect import insort
 
 to_np = lambda x: x.detach().cpu().numpy()
 
+'''删除类 ScoreStorage
 class ScoreStorage:
     def __init__(self, max_steps=1000):
         self.data = defaultdict(list)
@@ -50,7 +51,7 @@ class ScoreStorage:
     
     def count_data_pairs(self, env_id):
         return len(self.data[env_id])
-
+'''
 
 def symlog(x):
     return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
@@ -196,6 +197,7 @@ class Logger:
         if self._wandb:
             wandb.finish()
 
+'''删除函数 calculate_accumulated_reward
 def calculate_accumulated_reward(rewards, intrinsics, gamma):
     if len(rewards) == 0:
         return 0
@@ -209,14 +211,14 @@ def calculate_accumulated_reward(rewards, intrinsics, gamma):
     gamma_sum = np.sum(gammas)
     
     return total_reward / gamma_sum  
-
+'''
 def simulate(
     agent,
     envs, 
     cache, 
     directory, 
     logger, 
-    step_calculator,
+    #step_calculator,
     max_steps,
     gamma,
     is_eval=False,
@@ -254,11 +256,11 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
-
+                '''清理 reset 逻辑
                 current_step = 0
                 if t["is_zoomed"] == True:
                     step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
-
+                '''
                 # replace obs with done by initial state
                 obs[index] = result
 
@@ -305,7 +307,7 @@ def simulate(
             transition["success"] = info.get("success", False)
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
-
+            ''' 清理步进 (step) 逻辑
             length = len(cache[env.id]["reward"]) 
             current_step = length - 1
             if transition["is_zoomed"] == True and not d:
@@ -320,7 +322,7 @@ def simulate(
 
             if step_calculator.count_data_pairs(env.id) == 0:
                 information[tmp_index]['real_done'] = True
-
+            '''
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
@@ -329,8 +331,9 @@ def simulate(
                     continue
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-
+                '''清理 done 逻辑
                 step_calculator.remove_all(envs[i].id)
+                '''
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -442,7 +445,7 @@ def convert(value, precision=32):
     else:
         raise NotImplementedError(value.dtype)
     return value.astype(dtype)
-
+'''删除函数 selective_deepcopy
 def selective_deepcopy(episode):
     episode_copy = episode.copy()
 
@@ -453,7 +456,7 @@ def selective_deepcopy(episode):
         episode_copy["heatmap_on_zoomed"] = copy.deepcopy(episode_copy["heatmap_on_zoomed"])
     
     return episode_copy
-
+'''
 def save_episodes(directory, episodes):
     directory = pathlib.Path(directory).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
@@ -461,15 +464,20 @@ def save_episodes(directory, episodes):
         length = len(episode["reward"])
         filename = directory / f"{filename}-{length}.npz"
         with io.BytesIO() as f1:
+            '''清理数据落盘
             episode_copy = selective_deepcopy(episode)
             episode_copy = replace_none_with_zeros(episode_copy)
-            np.savez_compressed(f1, **episode_copy)
+            '''
+            #**episode_copy换成episode
+            np.savez_compressed(f1, **episode)
             f1.seek(0)
             with filename.open("wb") as f2:
                 f2.write(f1.read())
+            '''清理数据落盘
             del episode_copy
+            '''
     return True
-
+'''删除函数 replace_none_with_zeros
 def replace_none_with_zeros(episode):
     if "image" in episode and episode["image"]:
         reference_shape = episode["image"][0].shape
@@ -492,7 +500,7 @@ def replace_none_with_zeros(episode):
         ]
     
     return episode
-
+'''
 def from_generator(generator, batch_size):
 
     while True:
@@ -524,15 +532,16 @@ def sample_episodes(episodes, length, seed=0):
             # make sure at least one transition included
             if total < 2:
                 continue
-
+            '''清理采样逻辑
             episode_copy = selective_deepcopy(episode)
             episode_copy = replace_none_with_zeros(episode_copy)
-
+            '''
             if not ret:
                 index = int(np_random.randint(0, total - 1))
                 ret = {
                     k: v[index : min(index + length, total)].copy()
-                    for k, v in episode_copy.items()
+                    #episode_copy换成episode，相当于直接使用episode
+                    for k, v in episode.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
@@ -545,13 +554,15 @@ def sample_episodes(episodes, length, seed=0):
                     k: np.append(
                         ret[k], v[index : min(index + possible, total)].copy(), axis=0
                     )
-                    for k, v in episode_copy.items()
+                    for k, v in episode.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
+            '''清理采样逻辑
             del episode_copy
+            '''
         yield ret
 
 

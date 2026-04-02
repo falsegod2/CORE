@@ -6,6 +6,7 @@ import cv2
 from collections import OrderedDict
 
 import copy
+'''这个文件是环境吐出 obs 字典的最后一道关卡。'''
 
 BASIC_ACTIONS = {
     "noop": dict(),
@@ -61,23 +62,24 @@ class LSImagineWrapper(Wrapper, ABC):
         self._action_names = tuple(actions.keys())
         self._action_values = tuple(actions.values())
 
+        '''将冗余的 8 个特有变量删除'''
         self.observation_space = spaces.Dict(
             {
                 'image': spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
-                'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
+                #'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
                 'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                #'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                #'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_first': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_last': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_terminal': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
-                'reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'intrinsic': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-                'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                #'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             }
         )
 
@@ -123,11 +125,14 @@ class LSImagineWrapper(Wrapper, ABC):
 
         return obs, reward, done, info
 
+    '''删掉 cv2.resize 处理 heatmap 和 zoomed_image 的逻辑。'''
     def _obs(self, obs):
         image = obs['rgb'] # 3 * H * W
         image = image.transpose(1, 2, 0).astype(np.uint8) # H * W * 3
         image = cv2.resize(image, (64, 64)) # 64 * 64 * 3
 
+        
+        ''' === 【删除 heatmap 和 zoomed_image 的全部处理代码】 ===
         if 'zoomed_image' in obs:
             zoomed_image = obs['zoomed_image'] # H * W * 3
             zoomed_image = zoomed_image.astype(np.uint8) # H * W * 3
@@ -139,32 +144,32 @@ class LSImagineWrapper(Wrapper, ABC):
         heatmap_on_zoomed = cv2.resize(obs['heatmap_on_zoomed'] if 'heatmap_on_zoomed' in obs else np.zeros((64, 64, 1)), (64, 64))
         heatmap = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
         heatmap_on_zoomed = np.clip(heatmap_on_zoomed * 255, 0, 255).astype(np.uint8)
-
+        '''
         obs = {
             'image': image,
-            'heatmap': heatmap,
+            #'heatmap': heatmap,
             'jump': obs['jump'] if 'jump' in obs else False,
-            'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
-            'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
+            #'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
+            #'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
             'is_first': obs['is_first'],
             'is_last': obs['is_last'],
             'is_terminal': obs['is_terminal'],
-            'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
+            #'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
             'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
-            'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
+            #'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
             'score': obs['score'] if 'score' in obs else 0.0,
-            'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
-            'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
-            'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
+            #'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
+            #'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
+            #'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
         }
-
+        '''
         if obs["is_zoomed"]:
             obs["zoomed_image"] = zoomed_image
             obs["heatmap_on_zoomed"] = heatmap_on_zoomed
         else:
             obs["zoomed_image"] = None
             obs["heatmap_on_zoomed"] = None
-
+        '''
         
         for key, value in obs.items():
             if key in self.observation_space:

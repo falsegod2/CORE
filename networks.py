@@ -41,15 +41,17 @@ class RSSM(nn.Module):
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions + 1
+        self._num_actions = num_actions #去掉+ 1
         self._embed = embed
         self._device = device
 
         inp_layers = []
         if self._discrete:
-            inp_dim = self._stoch * self._discrete + num_actions + 1
+            inp_dim = self._stoch * self._discrete + self._num_actions # 统一使用 self._num_actions
+            #inp_dim = self._stoch * self._discrete + num_actions + 1
         else:
-            inp_dim = self._stoch + num_actions + 1
+            inp_dim = self._stoch + self._num_actions # 统一使用 self._num_actions
+            #inp_dim = self._stoch + num_actions + 1
         inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
         if norm:
             inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
@@ -142,7 +144,7 @@ class RSSM(nn.Module):
         prior = {k: swap(v) for k, v in prior.items()}
 
         return post, prior
-
+    '''彻底删除 observe_zoomed 方法
     def observe_zoomed(self, embed_zoomed, action_zoomed, is_first_zoomed, rely_post, rely_prior):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         # (batch, time, ch) -> (time, batch, ch)
@@ -164,7 +166,7 @@ class RSSM(nn.Module):
         prior_zoomed = {k: swap(v) for k, v in prior_zoomed.items()}
 
         return post_zoomed, prior_zoomed
-
+    '''
     def imagine_with_action(self, action, state):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         assert isinstance(state, dict), state
@@ -195,12 +197,13 @@ class RSSM(nn.Module):
         return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+        '''清理 obs_step 中的动作维度强行对齐补丁
         if prev_action is not None and prev_action.shape[-1] != self._num_actions:
             shape = prev_action.shape
             new_shape = list(shape[:-1]) + [1]
             zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
             prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
-
+        '''
 
         if prev_state == None or torch.sum(is_first) == len(is_first):
             prev_state = self.initial(len(is_first))

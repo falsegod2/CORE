@@ -40,7 +40,9 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  #修改 grad_heads：将末尾的 3 个跳跃头删掉。
+  #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  修改后：grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
   units: 512
   act: 'SiLU'
   norm: True
@@ -56,21 +58,21 @@ defaults:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   end_head:
     {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  jump_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  concentration_score_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  #jump_head:
+   # {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  #concentration_score_head:
+   # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   intrinsic_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  jumping_steps_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  accumulated_reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  #jumping_steps_head:
+   # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  #accumulated_reward_head:
+  #  {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
-  img_weight: 1.0
-  jmp_weight: 1.0
+  #img_weight: 1.0
+  #jmp_weight: 1.0
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
@@ -89,8 +91,8 @@ defaults:
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7
-  jump_prob_decay: 0.9997
+  #jump_prob: 0.7
+  #jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
   imag_gradient: 'dynamics'
@@ -112,16 +114,16 @@ defaults:
 
 minedojo:
 
-  long_term_branch_weight: 1.0
-  gaussian_reward_weight: 1.0
-  gaussian_sigma_weight: 0.5
+  #long_term_branch_weight: 1.0
+  #gaussian_reward_weight: 1.0
+  #gaussian_sigma_weight: 0.5
 
   # rollout
   is_random: True
   agent_checkpoint_dir: ""
   rollout_image_num: 2000
 
-  unet_batch_size: 64
+  #unet_batch_size: 64
   results_dir: "./results"
   name: "test"
   target_item: "log"
@@ -136,16 +138,16 @@ minedojo:
   dyn_hidden: 1024
   dyn_deter: 4096
   units: 1024
-  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   actor: {layers: 5, dist: 'onehot', std: 'none'}
   value: {layers: 5}
   reward_head: {layers: 5}
   intrinsic_head: {layers: 5}
-  jumping_steps_head: {layers: 5}
-  accumulated_reward_head: {layers: 5}
+  #jumping_steps_head: {layers: 5}
+  #accumulated_reward_head: {layers: 5}
   end_head: {layers: 5}
-  jump_head: {layers: 5}
+  #jump_head: {layers: 5}
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000
