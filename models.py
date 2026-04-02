@@ -392,7 +392,7 @@ class WorldModel(nn.Module):
     '''
     def _train(self, data_origin):
         
-        data = self.preprocess(data_origin, zoomed=False)
+        data = self.preprocess(data_origin)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
