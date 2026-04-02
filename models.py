@@ -1072,8 +1072,7 @@ class ImagBehavior(nn.Module):
         target = tools.lambda_return(
             reward[1:],
             value[:-1],
-            gamma[:-1],
-            end[:-1],
+            discount[:-1],
             bootstrap=value[-1],
             lambda_=self._config.discount_lambda,
             axis=0,
