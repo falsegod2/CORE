@@ -535,7 +535,7 @@ class WorldModel(nn.Module):
         return obs
 
     def video_pred(self, data):
-        data = self.preprocess(data, zoomed=False)
+        data = self.preprocess(data)
         embed = self.encoder(data)
 
         states, _ = self.dynamics.observe(
