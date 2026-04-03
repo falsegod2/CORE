@@ -162,6 +162,9 @@ habitat:
   action_repeat: 1
   time_limit: 500  # Habitat 的步数通常较长
   
+  # 【新增这一行】强制覆盖 grad_heads，只用图像、奖励和结束标志计算重构损失
+  grad_heads: ['decoder', 'reward', 'end']
+  
   # Habitat 只有纯图像输入，去掉 Minecraft 的 inventory 等 mlp_keys
   encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 48, mlp_layers: 4, mlp_units: 512}
   decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 48, mlp_layers: 4, mlp_units: 512}

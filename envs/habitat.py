@@ -6,11 +6,9 @@ import os
 
 class HabitatDreamerEnv(gym.Env):
     def __init__(self, config_path, res=(64, 64)):
-        # 屏蔽底层烦人的日志
         os.environ["HABITAT_SIM_LOG"] = "quiet"
         os.environ["MAGNUM_LOG"] = "quiet"
         
-        # 动态修改 Config，使用 -1 禁用严格的 CUDA 设备匹配
         config = habitat.get_config(config_path)
         with habitat.config.read_write(config):
             config.habitat.simulator.habitat_sim_v0.gpu_device_id = -1 
@@ -18,10 +16,11 @@ class HabitatDreamerEnv(gym.Env):
         self._env = habitat.Env(config=config)
         self._res = res
         
-        # Habitat 离散动作空间
-        self.action_space = gym.spaces.Discrete(4)
+        # 【修改1】动作空间从 4 改为 3 (剔除智能体主动调用的 STOP)
+        # 我们映射: 0->FORWARD, 1->LEFT, 2->RIGHT
+        self.action_space = gym.spaces.Discrete(3)
+        self._prev_distance = None
         
-        # Dreamer 字典观测空间 (注意：移除了 reward，因为 Gym 会将其作为单独返回值)
         self.observation_space = gym.spaces.Dict({
             'image': gym.spaces.Box(0, 255, self._res + (3,), dtype=np.uint8),
             'is_first': gym.spaces.Box(0, 1, (), dtype=np.bool_),
@@ -33,7 +32,6 @@ class HabitatDreamerEnv(gym.Env):
         image = obs['rgb']
         if image.shape[:2] != self._res:
             image = cv2.resize(image, self._res, interpolation=cv2.INTER_AREA)
-            
         return {
             'image': image,
             'is_first': np.bool_(is_first),
@@ -42,24 +40,46 @@ class HabitatDreamerEnv(gym.Env):
         }
 
     def step(self, action):
-        obs = self._env.step(action)
+        # 【修改2】动作映射: Dreamer(0,1,2) -> Habitat(1,2,3)
+        # 巧妙地避开了 0 (STOP)
+        habitat_action = action + 1 
         
+        obs = self._env.step(habitat_action)
         metrics = self._env.get_metrics()
-        # 获取奖励
-        reward = metrics.get('reward', 0.0) 
         done = self._env.episode_over
         
-        # 获取观测字典
-        dict_obs = self._process_obs(obs, False, done, done)
+        # 【修改3】手工打造稠密奖励 (Dense Reward)
+        current_distance = metrics.get('distance_to_goal', None)
+        reward = 0.0
         
-        # 【关键修复】严格返回 4 个值：obs, reward, done, info
+        if current_distance is not None and self._prev_distance is not None:
+            # 每靠近目标 1 米，给 1.0 的奖励；远离则惩罚
+            reward = self._prev_distance - current_distance
+            
+        self._prev_distance = current_distance
+        
+        # 【修改4】自动停止机制 (Auto-STOP)
+        # 如果距离目标极近（通常PointNav阈值是0.2米），强制调用 STOP 判定胜利
+        if current_distance is not None and current_distance < 0.2:
+            # 给环境发送真正的 STOP 指令以获取最终的 Success Metric
+            obs = self._env.step(0) 
+            reward += 10.0  # 到达终点，给予巨大奖励！
+            done = True
+            
+        # 增加极其微小的 step 惩罚，鼓励智能体走捷径
+        reward -= 0.01 
+            
+        dict_obs = self._process_obs(obs, False, done, done)
         return dict_obs, float(reward), done, {}
 
     def reset(self):
         obs = self._env.reset()
-        # 【关键修复】经典 Gym 的 reset 只返回 obs
-        dict_obs = self._process_obs(obs, True, False, False)
-        return dict_obs
+        
+        # 初始化上一帧距离
+        metrics = self._env.get_metrics()
+        self._prev_distance = metrics.get('distance_to_goal', None)
+        
+        return self._process_obs(obs, True, False, False)
 
     def close(self):
         self._env.close()
