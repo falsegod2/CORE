@@ -13,7 +13,7 @@ class HabitatDreamerEnv(gym.Env):
         # 动态修改 Config 绑定 GPU 0
         config = habitat.get_config(config_path)
         with habitat.config.read_write(config):
-            config.habitat.simulator.habitat_sim_v0.gpu_device_id = 0 
+            config.habitat.simulator.habitat_sim_v0.gpu_device_id = -1 
             
         self._env = habitat.Env(config=config)
         self._res = res

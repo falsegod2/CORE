@@ -154,6 +154,7 @@ minedojo:
 
 habitat:
   task: 'habitat_pointnav'
+  logdir: './results/habitat_logs'
   name: "habitat_test"
   steps: 1e6
   parallel: False # 建议先关掉并行，跑通后再开
