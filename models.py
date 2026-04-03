@@ -427,6 +427,9 @@ class WorldModel(nn.Module):
                         
                 losses = {}
                 for name, pred in preds.items():
+                    # === 【关键修复 1】安全判定，优雅地跳过环境中没有的标签 ===
+                    if name not in data:
+                        continue
                     loss = -pred.log_prob(data[name])
                     assert loss.shape == embed.shape[:2], (name, loss.shape)
                     losses[name] = loss
@@ -846,8 +849,11 @@ class ImagBehavior(nn.Module):
                 ) # [L, N, xx, xx]
 
                 reward = objective(imag_feat, imag_state, imag_action)
-                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                reward += intrinsic_reward
+
+                # === 【关键修复 2】切断随机噪声！只有在配置了 intrinsic 训练时，才加上内在动机奖励 ===
+                if "intrinsic" in self._config.grad_heads:
+                    intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                    reward += intrinsic_reward
 
 
                 actor_ent = self.actor(imag_feat).entropy() 
