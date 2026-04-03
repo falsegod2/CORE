@@ -10,7 +10,7 @@ class HabitatDreamerEnv(gym.Env):
         os.environ["HABITAT_SIM_LOG"] = "quiet"
         os.environ["MAGNUM_LOG"] = "quiet"
         
-        # 动态修改 Config 绑定 GPU 0
+        # 动态修改 Config，使用 -1 禁用严格的 CUDA 设备匹配
         config = habitat.get_config(config_path)
         with habitat.config.read_write(config):
             config.habitat.simulator.habitat_sim_v0.gpu_device_id = -1 
@@ -21,23 +21,21 @@ class HabitatDreamerEnv(gym.Env):
         # Habitat 离散动作空间
         self.action_space = gym.spaces.Discrete(4)
         
-        # Dreamer 字典观测空间
+        # Dreamer 字典观测空间 (注意：移除了 reward，因为 Gym 会将其作为单独返回值)
         self.observation_space = gym.spaces.Dict({
             'image': gym.spaces.Box(0, 255, self._res + (3,), dtype=np.uint8),
-            'reward': gym.spaces.Box(-np.inf, np.inf, (), dtype=np.float32),
             'is_first': gym.spaces.Box(0, 1, (), dtype=np.bool_),
             'is_last': gym.spaces.Box(0, 1, (), dtype=np.bool_),
             'is_terminal': gym.spaces.Box(0, 1, (), dtype=np.bool_),
         })
 
-    def _process_obs(self, obs, reward, is_first, is_last, is_terminal):
+    def _process_obs(self, obs, is_first, is_last, is_terminal):
         image = obs['rgb']
         if image.shape[:2] != self._res:
             image = cv2.resize(image, self._res, interpolation=cv2.INTER_AREA)
             
         return {
             'image': image,
-            'reward': np.float32(reward),
             'is_first': np.bool_(is_first),
             'is_last': np.bool_(is_last),
             'is_terminal': np.bool_(is_terminal),
@@ -47,15 +45,21 @@ class HabitatDreamerEnv(gym.Env):
         obs = self._env.step(action)
         
         metrics = self._env.get_metrics()
-        # 如果你的基础 config 没有奖励，暂时用 0.0，后续我们可以自定义稠密奖励
+        # 获取奖励
         reward = metrics.get('reward', 0.0) 
         done = self._env.episode_over
         
-        return self._process_obs(obs, reward, False, done, done)
+        # 获取观测字典
+        dict_obs = self._process_obs(obs, False, done, done)
+        
+        # 【关键修复】严格返回 4 个值：obs, reward, done, info
+        return dict_obs, float(reward), done, {}
 
     def reset(self):
         obs = self._env.reset()
-        return self._process_obs(obs, 0.0, True, False, False)
+        # 【关键修复】经典 Gym 的 reset 只返回 obs
+        dict_obs = self._process_obs(obs, True, False, False)
+        return dict_obs
 
     def close(self):
         self._env.close()
