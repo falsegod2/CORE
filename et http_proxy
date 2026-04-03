@@ -1,0 +1,12 @@
+core.repositoryformatversion=0
+core.filemode=false
+core.bare=false
+core.logallrefupdates=true
+core.symlinks=false
+core.ignorecase=true
+remote.origin.url=https://github.com/falsegod2/CORE.git
+remote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+branch.ls-origin.remote=origin
+branch.ls-origin.merge=refs/heads/ls-origin
+branch.dreamerv3.remote=origin
+branch.dreamerv3.merge=refs/heads/dreamerv3

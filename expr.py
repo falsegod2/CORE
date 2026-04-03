@@ -170,6 +170,15 @@ def make_env(config, mode, id):
             )
         env = minedojo.make_env(task, **kwargs)
         env = wrappers.OneHotAction(env)
+    # === 新增的 Habitat 分支 ===
+    elif suite == "habitat":
+        from envs.habitat import HabitatDreamerEnv
+        # 使用你跑通的测试配置文件绝对路径
+        test_config = "/gz-data/habitat-lab/habitat-lab/habitat/config/benchmark/nav/pointnav/pointnav_habitat_test.yaml"
+        
+        env = HabitatDreamerEnv(test_config, res=tuple(config.size))
+        env = wrappers.OneHotAction(env)
+
 
     else:
         raise NotImplementedError(suite)
@@ -223,23 +232,27 @@ def main(config): # config is namespace
 
     make = lambda mode, id: make_env(config, mode, id)
     suite, task = config.task.split("_", 1)
-    
-    from envs.tasks import get_specs
+    if suite == "minedojo":
+        from envs.tasks import get_specs
 
-    kwargs=dict(
-            # log_dir=log_dir,
-            target_item=config.target_item
-        )
-    task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
+        kwargs=dict(
+                # log_dir=log_dir,
+                target_item=config.target_item
+            )
+        task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
 
-    config.episode_max_steps = task_specs['terminal_specs']['max_steps']
-    '''=== 【把下面这 3 行 U-Net 相关的代码全部删除】 ===
-    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
-    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
-    '''
-    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
+        config.episode_max_steps = task_specs['terminal_specs']['max_steps']
+        '''=== 【把下面这 3 行 U-Net 相关的代码全部删除】 ===
+        task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
+        task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
+        task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
+        '''
+        task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
     
+    elif suite == "habitat":
+        # Habitat 任务更简单，直接使用 configs.yaml 中定义的 time_limit 作为最大步数
+        config.episode_max_steps = config.time_limit
+
     train_envs = [make("train", i) for i in range(config.envs)]
     eval_envs = [make("eval", i) for i in range(config.envs)]
 

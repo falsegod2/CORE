@@ -152,6 +152,24 @@ minedojo:
   break_speed: 100.0
   time_limit: 36000
 
+habitat:
+  task: 'habitat_pointnav'
+  name: "habitat_test"
+  steps: 1e6
+  parallel: False # 建议先关掉并行，跑通后再开
+  envs: 1
+  action_repeat: 1
+  time_limit: 500  # Habitat 的步数通常较长
+  
+  # Habitat 只有纯图像输入，去掉 Minecraft 的 inventory 等 mlp_keys
+  encoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 48, mlp_layers: 4, mlp_units: 512}
+  decoder: {mlp_keys: '$^', cnn_keys: 'image', cnn_depth: 48, mlp_layers: 4, mlp_units: 512}
+  actor: {layers: 4, dist: 'onehot', std: 'none'}
+  value: {layers: 4}
+  reward_head: {layers: 4}
+  intrinsic_head: {layers: 4}
+  end_head: {layers: 4}
+
 debug:
   debug: True
   pretrain: 1
