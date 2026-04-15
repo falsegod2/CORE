@@ -571,33 +571,43 @@ def load_episodes(directory, limit=None, reverse=True):
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
     total = 0
+    
+    # 1. First, get the list of files to know the total count
     if reverse:
-        for filename in reversed(sorted(directory.glob("*.npz"))):
-            try:
-                with filename.open("rb") as f:
-                    episode = np.load(f)
-                    episode = {k: episode[k] for k in episode.keys()}
-            except Exception as e:
-                print(f"Could not load episode: {e}")
-                continue
-            # extract only filename without extension
-            episodes[str(os.path.splitext(os.path.basename(filename))[0])] = episode
-            total += len(episode["reward"]) - 1
-            if limit and total >= limit:
-                break
+        filenames = list(reversed(sorted(directory.glob("*.npz"))))
     else:
-        for filename in sorted(directory.glob("*.npz")):
-            try:
-                with filename.open("rb") as f:
-                    episode = np.load(f)
-                    episode = {k: episode[k] for k in episode.keys()}
-            except Exception as e:
-                print(f"Could not load episode: {e}")
-                continue
+        filenames = list(sorted(directory.glob("*.npz")))
+        
+    total_files = len(filenames)
+    print(f"Found {total_files} .npz files in {directory}. Beginning to load...")
+
+    # 2. Iterate through the pre-fetched list
+    for i, filename in enumerate(filenames):
+        try:
+            with filename.open("rb") as f:
+                episode = np.load(f)
+                episode = {k: episode[k] for k in episode.keys()}
+        except Exception as e:
+            print(f"Could not load episode: {e}")
+            continue
+            
+        # extract only filename without extension
+        if reverse:
+            episodes[str(os.path.splitext(os.path.basename(filename))[0])] = episode
+        else:
             episodes[str(filename)] = episode
-            total += len(episode["reward"]) - 1
-            if limit and total >= limit:
-                break
+            
+        total += len(episode["reward"]) - 1
+        
+        # 3. Print progress every 100 files
+        if (i + 1) % 100 == 0 or (i + 1) == total_files:
+            print(f"Loaded {i + 1} / {total_files} files... (Total steps in buffer: {total})")
+
+        if limit and total >= limit:
+            print(f"Reached step limit ({limit}). Stopping load.")
+            break
+            
+    print(f"Loading complete! Total episodes: {len(episodes)}, Total steps: {total}")
     return episodes
 
 
