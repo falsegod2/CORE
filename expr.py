@@ -120,9 +120,11 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
+        '''
         intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
+        '''
         '''
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
             f
@@ -140,7 +142,7 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})

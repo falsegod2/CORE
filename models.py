@@ -848,8 +848,8 @@ class ImagBehavior(nn.Module):
                 ) # [L, N, xx, xx]
 
                 reward = objective(imag_feat, imag_state, imag_action)
-                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                reward += intrinsic_reward
+                #intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                #reward += intrinsic_reward
 
 
                 actor_ent = self.actor(imag_feat).entropy() 

@@ -52,7 +52,7 @@ def _add_wrappers(
     reward_specs: Dict = None,
     success_specs: Dict = None,
     terminal_specs: Dict = None,
-    clip_specs: Dict = None,
+    #clip_specs: Dict = None,
     #concentration_specs: Dict = None,
     fast_reset: int = None,
     log_dir: str = None,
@@ -73,10 +73,12 @@ def _add_wrappers(
     
     env = MinedojoTerminalWrapper(env, **terminal_specs)
 
+    '''
     # Add reward shaping wrapper
     if clip_specs is not None:
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
+    '''
     '''=== 【删除这整块代码】 ===
     if concentration_specs is not None:
         unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
