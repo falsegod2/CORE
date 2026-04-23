@@ -117,6 +117,7 @@ class WorldModel(nn.Module):
             name="Jump",
         )
         '''
+        '''
         self.heads["intrinsic"] = networks.MLP(
             feat_size,
             (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
@@ -129,6 +130,7 @@ class WorldModel(nn.Module):
             device=config.device,
             name="Intrinsic",
         )
+        '''
         '''
         self.heads["jumping_steps"] = networks.MLP(
             feat_size * 2,
@@ -181,7 +183,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
             #jump=config.jump_head["loss_scale"],
-            intrinsic=config.intrinsic_head["loss_scale"],
+            #intrinsic=config.intrinsic_head["loss_scale"],
             #jumping_steps=config.jumping_steps_head["loss_scale"],
             #accumulated_reward=config.accumulated_reward_head["loss_scale"],
         )
@@ -825,7 +827,7 @@ class ImagBehavior(nn.Module):
         start,
         #start_zoomed,
         objective,
-        intrinsic_objective,
+        #intrinsic_objective,
         #jumping_steps_predictor,
         #accumulated_reward_predictor,
         #jump_indicator,

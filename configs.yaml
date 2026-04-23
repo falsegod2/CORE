@@ -42,7 +42,7 @@ defaults:
   dyn_min_std: 0.1
   #修改 grad_heads：将末尾的 3 个跳跃头删掉。
   #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
+  grad_heads: ['decoder', 'reward', 'end']
   units: 512
   act: 'SiLU'
   norm: True
