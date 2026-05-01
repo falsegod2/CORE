@@ -511,10 +511,14 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_aff_vis = aff.detach() if aff is not None else None
 
         slots = slots.reshape(lead_shape + [self.num_slots * self.slot_dim])
+
+        raw_slots, attn = self.slot_attention(tokens, aff)
+
         if not hasattr(self, "_debug_printed"):
-            print("[ObjectCentricConvEncoder] slots:", slots.shape)
+            print("[ObjectCentricConvEncoder] raw slots:", raw_slots.shape)
             print("[ObjectCentricConvEncoder] affordance:", None if aff is None else aff.shape)
-            print("[ObjectCentricConvEncoder] out:", slots.reshape(lead_shape + [self.num_slots * self.slot_dim]).shape)
+            print("[ObjectCentricConvEncoder] attn:", attn.shape)
+            print("[ObjectCentricConvEncoder] out:", raw_slots.reshape(lead_shape + [self.num_slots * self.slot_dim]).shape)
             self._debug_printed = True
 
         return slots
@@ -585,10 +589,13 @@ class MultiEncoder(nn.Module):
             )
         self.outdim = 0
         self.use_slots = use_slots
-        self.affordance_shapes = {
-            k: v
-            for k, v in shapes.items()
+        self.affordance_keys = [
+            k for k, v in shapes.items()
             if len(v) == 3 and re.match(affordance_keys, k)
+        ]
+
+        self.affordance_shapes = {
+            k: shapes[k] for k in self.affordance_keys
         }
 
         if self.cnn_shapes:
@@ -637,7 +644,7 @@ class MultiEncoder(nn.Module):
 
             if self.use_slots:
                 affordance = None
-                for key in self.affordance_shapes:
+                for key in self.affordance_keys:
                     if key in obs:
                         affordance = obs[key]
                         break
