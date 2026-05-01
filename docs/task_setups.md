@@ -44,3 +44,5 @@ This document introduces the meaning and configuration guidelines for each field
 
 - **`LS_Imagine_specs`**: Settings for integrating the LS-Imagine algorithm with the MineDojo environment.
   - **`repeat`**: Number of times a single action is repeated. Typically set to `1`.
+
+  当前修改的核心是把你的 no-intrinsic 版 Dreamer / LS-Imagine 代码改成一个 Affordance-guided Object-Centric Dreamer：首先在环境侧恢复 heatmap 输出，并重新启用 MineDojo 的 affordance / concentration wrapper，让 MineCLIP + Swin-Unet 生成的任务相关 affordance map 能进入 observation；然后在模型侧不把 heatmap 当普通图像通道拼进 CNN，而是新增 SlotAttention 和 ObjectCentricConvEncoder，先用 CNN 把 RGB 图像编码成 spatial tokens，再用 affordance map 作为 attention bias，引导 slots 更关注任务相关、可交互区域，最后把多个 object slots 展平成 Dreamer RSSM 的输入 embedding；同时在 preprocess() 中对 heatmap 做归一化，并建议让 decoder 同时重建 image|heatmap，使世界模型 latent 保留任务相关空间信息；此外还加入可选的 MineCLIP score 辅助预测头，并允许在 imagination reward 中按较小权重加入预测的 score，从而让 actor-critic 的 latent imagination 不只依赖稀疏环境奖励，也能利用语言目标相关的进展信号。整体上，这些修改把原来的 monolithic visual latent 改成了由 affordance 引导的 object-centric latent，同时保留 Dreamer 主体结构不变，形成了“MineCLIP/affordance 引导对象中心世界模型”的创新点。
