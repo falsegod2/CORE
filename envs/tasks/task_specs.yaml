@@ -154,6 +154,7 @@ shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
+    target_object: "wool"
   concentration_specs:
     prompts: ["Obtain wool"]
     unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/shear_sheep"
@@ -481,6 +482,7 @@ test_shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
+    target_object: "wool"
   concentration_specs:
     prompts: ["Obtain wool"]
     unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/shear_sheep"

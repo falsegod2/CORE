@@ -91,6 +91,20 @@ class WorldModel(nn.Module):
             name="Reward",
         )
 
+        if "score" in shapes:
+            self.heads["score"] = networks.MLP(
+                feat_size,
+                (255,) if config.score_head["dist"] == "symlog_disc" else (),
+                config.score_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.score_head["dist"],
+                outscale=config.score_head["outscale"],
+                device=config.device,
+                name="Score",
+            )
+
         self.heads["end"] = networks.MLP(
             feat_size,
             (),
@@ -187,6 +201,9 @@ class WorldModel(nn.Module):
             #jumping_steps=config.jumping_steps_head["loss_scale"],
             #accumulated_reward=config.accumulated_reward_head["loss_scale"],
         )
+        if "score" in self.heads:
+            self._scales["score"] = config.score_head["loss_scale"]
+            
     '''原版的 _train 为了处理 data_zoomed，写了大量的 if zoomed_num > 0: 分支和张量拼接操作。
     def _train(self, data_origin):
         
@@ -523,6 +540,9 @@ class WorldModel(nn.Module):
     def preprocess(self, obs):
         obs = obs.copy()
         obs["image"] = torch.Tensor(obs["image"]) / 255.0
+
+        if "heatmap" in obs:
+            obs["heatmap"] = torch.Tensor(obs["heatmap"]) / 255.0
 
         if "discount" in obs:
             obs["discount"] *= self._config.discount

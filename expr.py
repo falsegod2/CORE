@@ -116,9 +116,15 @@ class LS_Imagine(nn.Module):
         post, _, context, mets = self._wm._train(data)
         metrics.update(mets)
 
-        reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
-        ).mode()
+        def reward(f, s, a):
+            feat = self._wm.dynamics.get_feat(s)
+            rew = self._wm.heads["reward"](feat).mode()
+
+            if "score" in self._wm.heads:
+                clip_score = self._wm.heads["score"](feat).mode()
+                rew = rew + self._config.clip_score_imag_scale * clip_score
+
+            return rew
 
         '''
         intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](

@@ -42,12 +42,31 @@ defaults:
   dyn_min_std: 0.1
   #修改 grad_heads：将末尾的 3 个跳跃头删掉。
   #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  grad_heads: ['decoder', 'reward', 'end']
+  grad_heads: ['decoder', 'reward', 'end', 'score']
   units: 512
   act: 'SiLU'
   norm: True
   encoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+    {
+      mlp_keys: '$^',
+      cnn_keys: 'image',
+      act: 'SiLU',
+      norm: True,
+      cnn_depth: 32,
+      kernel_size: 4,
+      minres: 4,
+      mlp_layers: 5,
+      mlp_units: 1024,
+      symlog_inputs: True,
+
+      use_slots: True,
+      num_slots: 16,
+      slot_dim: 128,
+      slot_iters: 3,
+      affordance_keys: 'heatmap',
+      affordance_bias: 2.0,
+      slot_use_coords: True
+    }
   decoder:
     {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   actor:
@@ -68,6 +87,9 @@ defaults:
    # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   #accumulated_reward_head:
   #  {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  score_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.5, outscale: 0.0}
+
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -87,6 +109,7 @@ defaults:
   grad_clip: 1000
   dataset_size: 1000000
   opt: 'adam'
+  clip_score_imag_scale: 0.1
 
   # Behavior.
   discount: 0.997
@@ -138,8 +161,23 @@ minedojo:
   dyn_hidden: 1024
   dyn_deter: 4096
   units: 1024
-  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  encoder:
+    {
+      mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward',
+      cnn_keys: 'image',
+      cnn_depth: 96,
+      mlp_layers: 5,
+      mlp_units: 1024,
+
+      use_slots: True,
+      num_slots: 16,
+      slot_dim: 128,
+      slot_iters: 3,
+      affordance_keys: 'heatmap',
+      affordance_bias: 2.0,
+      slot_use_coords: True
+    }
+  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image|heatmap', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
   actor: {layers: 5, dist: 'onehot', std: 'none'}
   value: {layers: 5}
   reward_head: {layers: 5}
@@ -148,6 +186,8 @@ minedojo:
   #accumulated_reward_head: {layers: 5}
   end_head: {layers: 5}
   #jump_head: {layers: 5}
+  score_head: {layers: 5}
+
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000

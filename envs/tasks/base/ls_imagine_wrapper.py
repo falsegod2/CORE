@@ -66,7 +66,7 @@ class LSImagineWrapper(Wrapper, ABC):
         self.observation_space = spaces.Dict(
             {
                 'image': spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
-                #'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
+                'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
                 'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 #'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 #'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
@@ -145,9 +145,20 @@ class LSImagineWrapper(Wrapper, ABC):
         heatmap = np.clip(heatmap * 255, 0, 255).astype(np.uint8)
         heatmap_on_zoomed = np.clip(heatmap_on_zoomed * 255, 0, 255).astype(np.uint8)
         '''
+        if 'heatmap' in obs:
+            heatmap = obs['heatmap']
+            if heatmap.ndim == 2:
+                heatmap = heatmap[..., None]
+            heatmap = cv2.resize(heatmap, (64, 64))
+            if heatmap.ndim == 2:
+                heatmap = heatmap[..., None]
+            heatmap = np.clip(heatmap * 255 if heatmap.max() <= 1.0 else heatmap, 0, 255).astype(np.uint8)
+        else:
+            heatmap = np.zeros((64, 64, 1), dtype=np.uint8)
+
         obs = {
             'image': image,
-            #'heatmap': heatmap,
+            'heatmap': heatmap,
             'jump': obs['jump'] if 'jump' in obs else False,
             #'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
             #'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,

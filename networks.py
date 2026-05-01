@@ -322,6 +322,194 @@ class RSSM(nn.Module):
 
         return loss, value, dyn_loss, rep_loss
 
+class SlotAttention(nn.Module):
+    """Slot Attention with optional affordance bias."""
+
+    def __init__(
+        self,
+        num_slots,
+        token_dim,
+        slot_dim=128,
+        iters=3,
+        hidden_dim=256,
+        eps=1e-8,
+        affordance_bias=1.0,
+    ):
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.iters = iters
+        self.eps = eps
+        self.affordance_bias = affordance_bias
+
+        self.slots_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
+        self.slots_logsigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
+
+        self.norm_tokens = nn.LayerNorm(token_dim)
+        self.norm_slots = nn.LayerNorm(slot_dim)
+        self.norm_mlp = nn.LayerNorm(slot_dim)
+
+        self.to_q = nn.Linear(slot_dim, slot_dim, bias=False)
+        self.to_k = nn.Linear(token_dim, slot_dim, bias=False)
+        self.to_v = nn.Linear(token_dim, slot_dim, bias=False)
+
+        self.gru = nn.GRUCell(slot_dim, slot_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+
+        self.scale = slot_dim ** -0.5
+        self.apply(tools.weight_init)
+
+    def forward(self, tokens, affordance=None):
+        # tokens: [B, N, token_dim]
+        b, n, _ = tokens.shape
+
+        tokens = self.norm_tokens(tokens)
+        k = self.to_k(tokens)
+        v = self.to_v(tokens)
+
+        mu = self.slots_mu.expand(b, -1, -1)
+        sigma = torch.exp(self.slots_logsigma).expand(b, -1, -1)
+        slots = mu + sigma * torch.randn_like(mu)
+
+        if affordance is not None:
+            affordance = affordance.reshape(b, 1, n).to(tokens.dtype)
+            affordance = affordance.clamp(0.0, 1.0)
+
+        attn = None
+        for _ in range(self.iters):
+            slots_prev = slots
+
+            q = self.to_q(self.norm_slots(slots))
+            logits = torch.einsum("bkd,bnd->bkn", q, k) * self.scale
+
+            if affordance is not None and self.affordance_bias != 0:
+                logits = logits + self.affordance_bias * affordance
+
+            attn = torch.softmax(logits, dim=1) + self.eps
+            attn = attn / attn.sum(dim=-1, keepdim=True)
+
+            updates = torch.einsum("bkn,bnd->bkd", attn, v)
+
+            slots = self.gru(
+                updates.reshape(-1, self.slot_dim),
+                slots_prev.reshape(-1, self.slot_dim),
+            )
+            slots = slots.reshape(b, self.num_slots, self.slot_dim)
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        return slots, attn
+
+class ObjectCentricConvEncoder(nn.Module):
+    """
+    CNN -> spatial tokens -> affordance-biased Slot Attention -> flat Dreamer embedding.
+
+    输出仍然是 [B, T, num_slots * slot_dim]，
+    所以 RSSM、actor、critic 主体可以不改。
+    """
+
+    def __init__(
+        self,
+        input_shape,
+        depth=32,
+        act="SiLU",
+        norm=True,
+        kernel_size=4,
+        minres=4,
+        num_slots=16,
+        slot_dim=128,
+        slot_iters=3,
+        affordance_bias=1.0,
+        use_coords=True,
+    ):
+        super().__init__()
+        act = getattr(torch.nn, act)
+
+        h, w, input_ch = input_shape
+        stages = int(np.log2(h) - np.log2(minres))
+
+        in_dim = input_ch
+        out_dim = depth
+        layers = []
+
+        for _ in range(stages):
+            layers.append(
+                Conv2dSamePad(
+                    in_channels=in_dim,
+                    out_channels=out_dim,
+                    kernel_size=kernel_size,
+                    stride=2,
+                    bias=False,
+                )
+            )
+            if norm:
+                layers.append(ImgChLayerNorm(out_dim))
+            layers.append(act())
+
+            in_dim = out_dim
+            out_dim *= 2
+            h, w = h // 2, w // 2
+
+        self.layers = nn.Sequential(*layers)
+        self.layers.apply(tools.weight_init)
+
+        self.use_coords = use_coords
+        token_dim = in_dim + (2 if use_coords else 0)
+
+        self.slot_attention = SlotAttention(
+            num_slots=num_slots,
+            token_dim=token_dim,
+            slot_dim=slot_dim,
+            iters=slot_iters,
+            hidden_dim=max(slot_dim * 2, 256),
+            affordance_bias=affordance_bias,
+        )
+
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.outdim = num_slots * slot_dim
+        self.last_attn = None
+
+    def _coords(self, b, h, w, device, dtype):
+        ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([xx, yy], dim=-1).reshape(1, h * w, 2)
+        return coords.expand(b, -1, -1)
+
+    def forward(self, obs, affordance=None):
+        # obs: [B, T, H, W, C]
+        obs = obs - 0.5
+        lead_shape = list(obs.shape[:-3])
+
+        x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
+        x = x.permute(0, 3, 1, 2)
+        x = self.layers(x)
+
+        b, c, h, w = x.shape
+        tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
+
+        if self.use_coords:
+            coords = self._coords(b, h, w, x.device, x.dtype)
+            tokens = torch.cat([tokens, coords], dim=-1)
+
+        aff = None
+        if affordance is not None:
+            aff = affordance.reshape((-1,) + tuple(affordance.shape[-3:]))
+            aff = aff.permute(0, 3, 1, 2)
+            aff = F.interpolate(aff, size=(h, w), mode="bilinear", align_corners=False)
+            aff = aff.reshape(b, h * w)
+
+        slots, attn = self.slot_attention(tokens, aff)
+        self.last_attn = attn.detach()
+
+        slots = slots.reshape(lead_shape + [self.num_slots * self.slot_dim])
+        return slots
+
+
 class MultiEncoder(nn.Module):
     def __init__(
         self,
@@ -335,7 +523,14 @@ class MultiEncoder(nn.Module):
         minres,
         mlp_layers,
         mlp_units,
-        symlog_inputs,
+        symlog_inputs=False,
+        use_slots=False,
+        num_slots=16,
+        slot_dim=128,
+        slot_iters=3,
+        affordance_keys="heatmap",
+        affordance_bias=1.0,
+        slot_use_coords=True,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -356,13 +551,38 @@ class MultiEncoder(nn.Module):
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.outdim = 0
+        self.use_slots = use_slots
+        self.affordance_shapes = {
+            k: v
+            for k, v in shapes.items()
+            if len(v) == 3 and re.match(affordance_keys, k)
+        }
+
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
-            self._cnn = ConvEncoder(
-                input_shape, cnn_depth, act, norm, kernel_size, minres
-            )
+
+            if use_slots:
+                self._cnn = ObjectCentricConvEncoder(
+                    input_shape,
+                    cnn_depth,
+                    act,
+                    norm,
+                    kernel_size,
+                    minres,
+                    num_slots=num_slots,
+                    slot_dim=slot_dim,
+                    slot_iters=slot_iters,
+                    affordance_bias=affordance_bias,
+                    use_coords=slot_use_coords,
+                )
+            else:
+                self._cnn = ConvEncoder(
+                    input_shape, cnn_depth, act, norm, kernel_size, minres
+                )
+
             self.outdim += self._cnn.outdim
+
         if self.mlp_shapes:
             input_size = sum([sum(v) for v in self.mlp_shapes.values()])
             self._mlp = MLP(
@@ -381,7 +601,17 @@ class MultiEncoder(nn.Module):
         outputs = []
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
-            outputs.append(self._cnn(inputs))
+
+            if self.use_slots:
+                affordance = None
+                for key in self.affordance_shapes:
+                    if key in obs:
+                        affordance = obs[key]
+                        break
+                outputs.append(self._cnn(inputs, affordance))
+            else:
+                outputs.append(self._cnn(inputs))
+                
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
