@@ -147,12 +147,22 @@ class LSImagineWrapper(Wrapper, ABC):
         '''
         if 'heatmap' in obs:
             heatmap = obs['heatmap']
+            heatmap = np.nan_to_num(heatmap, nan=0.0, posinf=1.0, neginf=0.0)
+
             if heatmap.ndim == 2:
                 heatmap = heatmap[..., None]
+
             heatmap = cv2.resize(heatmap, (64, 64))
+
             if heatmap.ndim == 2:
                 heatmap = heatmap[..., None]
-            heatmap = np.clip(heatmap * 255 if heatmap.max() <= 1.0 else heatmap, 0, 255).astype(np.uint8)
+
+            heatmap = np.nan_to_num(heatmap, nan=0.0, posinf=1.0, neginf=0.0)
+
+            if heatmap.max() <= 1.0:
+                heatmap = heatmap * 255.0
+
+            heatmap = np.clip(heatmap, 0, 255).astype(np.uint8)
         else:
             heatmap = np.zeros((64, 64, 1), dtype=np.uint8)
 

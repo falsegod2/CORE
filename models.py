@@ -203,7 +203,7 @@ class WorldModel(nn.Module):
         )
         if "score" in self.heads:
             self._scales["score"] = config.score_head["loss_scale"]
-            
+
     '''原版的 _train 为了处理 data_zoomed，写了大量的 if zoomed_num > 0: 分支和张量拼接操作。
     def _train(self, data_origin):
         
@@ -418,6 +418,10 @@ class WorldModel(nn.Module):
                 
                 embed = self.encoder(data)
 
+                aff_loss = None
+                if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "affordance_alignment_loss"):
+                    aff_loss = self.encoder._cnn.affordance_alignment_loss()
+
                 # process original data
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
@@ -457,6 +461,10 @@ class WorldModel(nn.Module):
                     
                 model_loss = sum(scaled.values()) + kl_loss
 
+                if aff_loss is not None:
+                    aff_loss = aff_loss.reshape(embed.shape[:2])
+                    model_loss = model_loss + self._config.affordance_align_scale * aff_loss
+
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
@@ -467,6 +475,8 @@ class WorldModel(nn.Module):
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(torch.mean(model_loss))
+        if aff_loss is not None:
+            metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
 
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(

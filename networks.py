@@ -504,10 +504,40 @@ class ObjectCentricConvEncoder(nn.Module):
             aff = aff.reshape(b, h * w)
 
         slots, attn = self.slot_attention(tokens, aff)
-        self.last_attn = attn.detach()
+        self.last_attn = attn
+        self.last_affordance = aff
+
+        self.last_attn_vis = attn.detach()
+        self.last_aff_vis = aff.detach() if aff is not None else None
 
         slots = slots.reshape(lead_shape + [self.num_slots * self.slot_dim])
+        if not hasattr(self, "_debug_printed"):
+            print("[ObjectCentricConvEncoder] slots:", slots.shape)
+            print("[ObjectCentricConvEncoder] affordance:", None if aff is None else aff.shape)
+            print("[ObjectCentricConvEncoder] out:", slots.reshape(lead_shape + [self.num_slots * self.slot_dim]).shape)
+            self._debug_printed = True
+
         return slots
+    
+    def affordance_alignment_loss(self):
+        if not hasattr(self, "last_attn") or self.last_attn is None:
+            return None
+        if not hasattr(self, "last_affordance") or self.last_affordance is None:
+            return None
+
+        attn = self.last_attn
+        aff = self.last_affordance
+
+        # attn: [B*T, K, N]
+        # aff:  [B*T, N]
+        slot_cover = attn.sum(dim=1)
+        slot_cover = slot_cover / (slot_cover.sum(dim=-1, keepdim=True) + 1e-8)
+
+        aff = aff.clamp(0.0, 1.0)
+        aff = aff / (aff.sum(dim=-1, keepdim=True) + 1e-8)
+
+        loss = -(aff * torch.log(slot_cover + 1e-8)).sum(dim=-1)
+        return loss
 
 
 class MultiEncoder(nn.Module):
@@ -549,7 +579,10 @@ class MultiEncoder(nn.Module):
         }
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
-
+        print(
+                "Encoder Affordance shapes:",
+                self.affordance_shapes if hasattr(self, "affordance_shapes") else {}
+            )
         self.outdim = 0
         self.use_slots = use_slots
         self.affordance_shapes = {
@@ -611,7 +644,7 @@ class MultiEncoder(nn.Module):
                 outputs.append(self._cnn(inputs, affordance))
             else:
                 outputs.append(self._cnn(inputs))
-                
+
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))

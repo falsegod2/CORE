@@ -110,6 +110,7 @@ defaults:
   dataset_size: 1000000
   opt: 'adam'
   clip_score_imag_scale: 0.1
+  affordance_align_scale: 0.1
 
   # Behavior.
   discount: 0.997
