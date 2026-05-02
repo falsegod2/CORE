@@ -503,19 +503,52 @@ def replace_none_with_zeros(episode):
     return episode
 '''
 def from_generator(generator, batch_size):
-
     while True:
         batch = []
         for _ in range(batch_size):
             batch.append(next(generator))
-        data = {}
-        for key in batch[0].keys():
-            data[key] = []
-            for i in range(batch_size):
-                data[key].append(batch[i][key])
-            data[key] = np.stack(data[key], 0)
-        yield data
 
+        data = {}
+        keys = list(batch[0].keys())
+
+        for key in keys:
+            values = []
+            for i in range(batch_size):
+                if key not in batch[i]:
+                    print(f"[from_generator] Missing key={key} in batch[{i}], using zeros_like batch[0].")
+                    values.append(np.zeros_like(batch[0][key]))
+                else:
+                    values.append(batch[i][key])
+
+            try:
+                data[key] = np.stack(values, 0)
+            except Exception as e:
+                print(f"\n[from_generator] Failed to stack key={key}")
+                print(f"[from_generator] batch_size={batch_size}")
+
+                for i, value in enumerate(values[:32]):
+                    arr = np.asarray(value)
+                    print(
+                        f"  batch[{i}] key={key}: "
+                        f"type={type(value)}, "
+                        f"shape={getattr(value, 'shape', None)}, "
+                        f"asarray_shape={arr.shape}, "
+                        f"dtype={getattr(arr, 'dtype', None)}"
+                    )
+
+                print("\n[from_generator] All keys in batch[0]:")
+                for k, v in batch[0].items():
+                    arr = np.asarray(v)
+                    print(
+                        f"  {k}: type={type(v)}, "
+                        f"shape={getattr(v, 'shape', None)}, "
+                        f"asarray_shape={arr.shape}, "
+                        f"dtype={getattr(arr, 'dtype', None)}"
+                    )
+
+                raise e
+
+        yield data
 
 def sample_episodes(episodes, length, seed=0):
 
