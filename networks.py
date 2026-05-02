@@ -386,10 +386,14 @@ class SlotAttention(nn.Module):
             q = self.to_q(self.norm_slots(slots))
             logits = torch.einsum("bkd,bnd->bkn", q, k) * self.scale
 
-            if affordance is not None and self.affordance_bias != 0:
-                logits = logits + self.affordance_bias * affordance
-
+            # Slot Attention normalizes over slots first, so adding the same
+            # token-wise affordance bias to every slot would cancel out. Instead,
+            # we first compute slot competition and then reweight each slot
+            # distribution over tokens toward high-affordance patches.
             attn = torch.softmax(logits, dim=1) + self.eps
+            if affordance is not None and self.affordance_bias != 0:
+                token_weight = 1.0 + self.affordance_bias * affordance
+                attn = attn * token_weight
             attn = attn / attn.sum(dim=-1, keepdim=True)
 
             updates = torch.einsum("bkn,bnd->bkd", attn, v)
@@ -424,6 +428,14 @@ class ObjectCentricConvEncoder(nn.Module):
         slot_iters=3,
         affordance_bias=1.0,
         use_coords=True,
+        task_embed_dim=512,
+        tao_include_flat=True,
+        tao_include_global=True,
+        tao_include_affordance=True,
+        tao_include_task=True,
+        tao_affordance_weight=1.0,
+        tao_task_weight=1.0,
+        tao_temperature=5.0,
     ):
         super().__init__()
         act = getattr(torch.nn, act)
@@ -470,8 +482,34 @@ class ObjectCentricConvEncoder(nn.Module):
 
         self.num_slots = num_slots
         self.slot_dim = slot_dim
-        self.outdim = num_slots * slot_dim
+        self.task_embed_dim = task_embed_dim
+        self.tao_include_flat = tao_include_flat
+        self.tao_include_global = tao_include_global
+        self.tao_include_affordance = tao_include_affordance
+        self.tao_include_task = tao_include_task
+        self.tao_affordance_weight = tao_affordance_weight
+        self.tao_task_weight = tao_task_weight
+        self.tao_temperature = tao_temperature
+
+        self.slot_task_proj = nn.Linear(slot_dim, task_embed_dim)
+        self.slot_task_proj.apply(tools.weight_init)
+
+        outdim = 0
+        if tao_include_flat:
+            outdim += num_slots * slot_dim
+        if tao_include_global:
+            outdim += slot_dim
+        if tao_include_affordance:
+            outdim += slot_dim + num_slots
+        if tao_include_task:
+            outdim += slot_dim + num_slots
+        self.outdim = outdim
+
         self.last_attn = None
+        self.last_affordance = None
+        self.last_aff_scores = None
+        self.last_task_scores = None
+        self.last_tao_weights = None
 
     def _coords(self, b, h, w, device, dtype):
         ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
@@ -480,7 +518,7 @@ class ObjectCentricConvEncoder(nn.Module):
         coords = torch.stack([xx, yy], dim=-1).reshape(1, h * w, 2)
         return coords.expand(b, -1, -1)
 
-    def forward(self, obs, affordance=None):
+    def forward(self, obs, affordance=None, task_embed=None):
         # obs: [B, T, H, W, C]
         obs = obs - 0.5
         lead_shape = list(obs.shape[:-3])
@@ -507,22 +545,82 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_attn = attn
         self.last_affordance = aff
 
+        # Slot-level affordance score: how much each object slot attends to
+        # high-affordance image patches. Shape: [B*T, K].
+        if aff is not None:
+            aff_scores = torch.einsum("bkn,bn->bk", attn, aff.clamp(0.0, 1.0))
+        else:
+            aff_scores = torch.zeros(b, self.num_slots, device=slots.device, dtype=slots.dtype)
+
+        # Slot-level MineCLIP/task relevance. The environment wrapper can provide
+        # the prompt embedding cached by the affordance/MineCLIP module.
+        if task_embed is not None:
+            task = task_embed.reshape((-1,) + tuple(task_embed.shape[-1:])).to(slots.dtype)
+            task = F.normalize(task, dim=-1)
+            slot_sem = F.normalize(self.slot_task_proj(slots), dim=-1)
+            task_scores = torch.einsum("bkd,bd->bk", slot_sem, task)
+        else:
+            task_scores = torch.zeros_like(aff_scores)
+
+        tao_logits = (
+            self.tao_affordance_weight * aff_scores
+            + self.tao_task_weight * task_scores
+        ) * self.tao_temperature
+        tao_weights = torch.softmax(tao_logits, dim=-1)
+
+        global_slot = slots.mean(dim=1)
+        affordance_slot = torch.einsum("bk,bkd->bd", torch.softmax(aff_scores * self.tao_temperature, dim=-1), slots)
+        task_slot = torch.einsum("bk,bkd->bd", tao_weights, slots)
+
+        pieces = []
+        if self.tao_include_flat:
+            pieces.append(slots.reshape(b, self.num_slots * self.slot_dim))
+        if self.tao_include_global:
+            pieces.append(global_slot)
+        if self.tao_include_affordance:
+            pieces.extend([affordance_slot, aff_scores])
+        if self.tao_include_task:
+            pieces.extend([task_slot, task_scores])
+        out = torch.cat(pieces, dim=-1)
+        out = out.reshape(lead_shape + [self.outdim])
+
         self.last_attn_vis = attn.detach()
         self.last_aff_vis = aff.detach() if aff is not None else None
-
-        slots = slots.reshape(lead_shape + [self.num_slots * self.slot_dim])
-
-        raw_slots, attn = self.slot_attention(tokens, aff)
+        self.last_aff_scores = aff_scores
+        self.last_task_scores = task_scores
+        self.last_tao_weights = tao_weights
 
         if not hasattr(self, "_debug_printed"):
-            print("[ObjectCentricConvEncoder] raw slots:", raw_slots.shape)
+            print("[ObjectCentricConvEncoder] slots:", slots.shape)
             print("[ObjectCentricConvEncoder] affordance:", None if aff is None else aff.shape)
+            print("[ObjectCentricConvEncoder] task_embed:", None if task_embed is None else task_embed.shape)
             print("[ObjectCentricConvEncoder] attn:", attn.shape)
-            print("[ObjectCentricConvEncoder] out:", raw_slots.reshape(lead_shape + [self.num_slots * self.slot_dim]).shape)
+            print("[ObjectCentricConvEncoder] out:", out.shape)
             self._debug_printed = True
 
-        return slots
-    
+        return out
+
+    def object_aux_losses(self):
+        losses = {}
+        align = self.affordance_alignment_loss()
+        if align is not None:
+            losses["affordance_align"] = align
+
+        if self.last_attn is not None:
+            # Penalize overlapping attention maps across slots to avoid all slots
+            # collapsing onto the same high-affordance region.
+            attn = F.normalize(self.last_attn, p=2, dim=-1)
+            sim = torch.einsum("bkn,bmn->bkm", attn, attn)
+            eye = torch.eye(self.num_slots, device=sim.device, dtype=torch.bool).unsqueeze(0)
+            losses["slot_diversity"] = sim.masked_fill(eye, 0.0).sum(dim=(1, 2)) / max(self.num_slots * (self.num_slots - 1), 1)
+
+        if self.last_tao_weights is not None:
+            # Reportable regularizer: encourages non-degenerate task-affordance
+            # object selection. Use a small scale in config.
+            w = self.last_tao_weights.clamp_min(1e-8)
+            losses["tao_entropy"] = -(w * torch.log(w)).sum(dim=-1)
+        return losses
+
     def affordance_alignment_loss(self):
         if not hasattr(self, "last_attn") or self.last_attn is None:
             return None
@@ -563,8 +661,17 @@ class MultiEncoder(nn.Module):
         slot_dim=128,
         slot_iters=3,
         affordance_keys="heatmap",
+        task_embed_keys="task_embed",
         affordance_bias=1.0,
         slot_use_coords=True,
+        task_embed_dim=512,
+        tao_include_flat=True,
+        tao_include_global=True,
+        tao_include_affordance=True,
+        tao_include_task=True,
+        tao_affordance_weight=1.0,
+        tao_task_weight=1.0,
+        tao_temperature=5.0,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -593,6 +700,10 @@ class MultiEncoder(nn.Module):
             k for k, v in shapes.items()
             if len(v) == 3 and re.match(affordance_keys, k)
         ]
+        self.task_embed_keys = [
+            k for k, v in shapes.items()
+            if len(v) == 1 and re.match(task_embed_keys, k)
+        ]
 
         self.affordance_shapes = {
             k: shapes[k] for k in self.affordance_keys
@@ -615,6 +726,14 @@ class MultiEncoder(nn.Module):
                     slot_iters=slot_iters,
                     affordance_bias=affordance_bias,
                     use_coords=slot_use_coords,
+                    task_embed_dim=task_embed_dim,
+                    tao_include_flat=tao_include_flat,
+                    tao_include_global=tao_include_global,
+                    tao_include_affordance=tao_include_affordance,
+                    tao_include_task=tao_include_task,
+                    tao_affordance_weight=tao_affordance_weight,
+                    tao_task_weight=tao_task_weight,
+                    tao_temperature=tao_temperature,
                 )
             else:
                 self._cnn = ConvEncoder(
@@ -648,7 +767,12 @@ class MultiEncoder(nn.Module):
                     if key in obs:
                         affordance = obs[key]
                         break
-                outputs.append(self._cnn(inputs, affordance))
+                task_embed = None
+                for key in self.task_embed_keys:
+                    if key in obs:
+                        task_embed = obs[key]
+                        break
+                outputs.append(self._cnn(inputs, affordance, task_embed))
             else:
                 outputs.append(self._cnn(inputs))
 

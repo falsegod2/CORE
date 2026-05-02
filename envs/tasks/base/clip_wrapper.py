@@ -3,7 +3,7 @@ import torch as th
 
 
 class ClipWrapper(Wrapper):
-    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', **kwargs):
+    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', add_to_reward=False, **kwargs):
         super().__init__(env)
         self.clip = clip # ClipReward
         self.wrapper_name = "ClipWrapper"
@@ -13,6 +13,7 @@ class ClipWrapper(Wrapper):
         self.expl_prompt = [f"Explore the widest possible area to find {target_object}"]
         self.dense_reward = dense_reward
         self.smoothing = smoothing
+        self.add_to_reward = add_to_reward
         
         self.buffer = None
         self._clip_state = None, None
@@ -57,8 +58,11 @@ class ClipWrapper(Wrapper):
             obs['intrinsic'] = 0.0
             obs['score'] = 0.0
         
-        # 【唯一的改动】：将算好的 obs['intrinsic'] 累加到环境真实 reward 中
-        reward += obs['intrinsic']
+        # Keep MineCLIP as an auxiliary/progress signal by default. For fair
+        # Dreamer-style comparisons, do not inject it into the real environment
+        # reward unless explicitly requested in task_specs.yaml.
+        if self.add_to_reward:
+            reward += obs['intrinsic']
 
         # 探索目标的 CLIP 分数计算
         if len(self.expl_prompt) > 0:

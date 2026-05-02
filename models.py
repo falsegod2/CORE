@@ -418,9 +418,10 @@ class WorldModel(nn.Module):
                 
                 embed = self.encoder(data)
 
-                aff_loss = None
-                if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "affordance_alignment_loss"):
-                    aff_loss = self.encoder._cnn.affordance_alignment_loss()
+                object_aux = {}
+                if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "object_aux_losses"):
+                    object_aux = self.encoder._cnn.object_aux_losses()
+                aff_loss = object_aux.get("affordance_align", None)
 
                 # process original data
                 post, prior = self.dynamics.observe(
@@ -465,6 +466,20 @@ class WorldModel(nn.Module):
                     aff_loss = aff_loss.reshape(embed.shape[:2])
                     model_loss = model_loss + self._config.affordance_align_scale * aff_loss
 
+                if "slot_diversity" in object_aux:
+                    div_loss = object_aux["slot_diversity"].reshape(embed.shape[:2])
+                    model_loss = model_loss + self._config.slot_diversity_scale * div_loss
+                else:
+                    div_loss = None
+
+                if "tao_entropy" in object_aux:
+                    tao_entropy = object_aux["tao_entropy"].reshape(embed.shape[:2])
+                    # Negative scale encourages focused object selection; positive
+                    # scale encourages exploration. Default is small and negative.
+                    model_loss = model_loss + self._config.tao_entropy_scale * tao_entropy
+                else:
+                    tao_entropy = None
+
             metrics = self._model_opt(torch.mean(model_loss), self.parameters())
 
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
@@ -477,6 +492,10 @@ class WorldModel(nn.Module):
         metrics["model_loss"] = to_np(torch.mean(model_loss))
         if aff_loss is not None:
             metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
+        if div_loss is not None:
+            metrics["slot_diversity_loss"] = to_np(torch.mean(div_loss))
+        if tao_entropy is not None:
+            metrics["tao_entropy"] = to_np(torch.mean(tao_entropy))
 
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(

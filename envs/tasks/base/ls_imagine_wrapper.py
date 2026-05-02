@@ -67,6 +67,7 @@ class LSImagineWrapper(Wrapper, ABC):
             {
                 'image': spaces.Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8),
                 'heatmap': spaces.Box(low=0, high=255, shape=(64, 64, 1), dtype=np.uint8),
+                'task_embed': spaces.Box(-np.inf, np.inf, (512,), dtype=np.float32),
                 'jump': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 #'is_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 #'is_calculated': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
@@ -92,6 +93,19 @@ class LSImagineWrapper(Wrapper, ABC):
         self._sticky_jump_counter = 0
         self._pitch_limit = pitch_limit
         self._pitch = 0
+
+    def _as_box_array(self, value, shape, dtype):
+        arr = np.asarray(value, dtype=dtype)
+        if arr.shape == shape:
+            return arr
+        if shape == (1,) and arr.shape == ():
+            return arr.reshape(1)
+        if arr.size == 0:
+            return np.zeros(shape, dtype=dtype)
+        try:
+            return arr.reshape(shape).astype(dtype)
+        except ValueError:
+            return np.zeros(shape, dtype=dtype)
 
     def reset(self):
         obs = self.env.reset()
@@ -169,16 +183,17 @@ class LSImagineWrapper(Wrapper, ABC):
         obs = {
             'image': image,
             'heatmap': heatmap,
-            'jump': obs['jump'] if 'jump' in obs else False,
+            'task_embed': self._as_box_array(obs.get('task_embed', np.zeros(512)), (512,), np.float32),
+            'jump': self._as_box_array(obs.get('jump', False), (1,), np.uint8),
             #'is_zoomed': obs['is_zoomed'] if 'is_zoomed' in obs else False,
             #'is_calculated': obs['is_calculated'] if 'is_calculated' in obs else False,
-            'is_first': obs['is_first'],
-            'is_last': obs['is_last'],
-            'is_terminal': obs['is_terminal'],
+            'is_first': self._as_box_array(obs['is_first'], (1,), np.uint8),
+            'is_last': self._as_box_array(obs['is_last'], (1,), np.uint8),
+            'is_terminal': self._as_box_array(obs['is_terminal'], (1,), np.uint8),
             #'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
-            'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
+            'intrinsic': self._as_box_array(obs.get('intrinsic', 0.0), (1,), np.float32),
             #'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
-            'score': obs['score'] if 'score' in obs else 0.0,
+            'score': self._as_box_array(obs.get('score', 0.0), (1,), np.float32),
             #'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
             #'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
             #'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,

@@ -21,6 +21,20 @@ class ConcentrationWrapper(Wrapper):
 
         self.max_steps = max_steps
 
+    def _task_embed(self):
+        feat = getattr(self.concentration, "text_feature", None)
+        if feat is None:
+            return None
+        # text_feature is [num_prompts, 512]. Use the positive prompt.
+        feat = feat[0].detach().float().cpu().numpy()
+        return feat
+
+    def _attach_task_embed(self, obs):
+        feat = self._task_embed()
+        if feat is not None:
+            obs["task_embed"] = feat
+        return obs
+
     def reset(self, **kwargs):
         self.episode += 1
         self.steps = 0
@@ -72,6 +86,7 @@ class ConcentrationWrapper(Wrapper):
         else:
             obs['heatmap_on_zoomed'] = obs['heatmap']
         
+        obs = self._attach_task_embed(obs)
         return obs
     
     def step(self, action):
@@ -121,7 +136,8 @@ class ConcentrationWrapper(Wrapper):
                 obs['heatmap_on_zoomed'] = self.concentration.get_heatmap(is_zoomed=True)
             else:
                 obs['heatmap_on_zoomed'] = obs['heatmap']
-                
+
+        obs = self._attach_task_embed(obs)
         return obs, reward, done, info
         
 
