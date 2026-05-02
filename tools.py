@@ -398,20 +398,148 @@ def simulate(
     return (step - steps, episode - episodes, done, length, obs, agent_state, reward, information)
 
 
-def add_to_cache(cache, id, transition):
-    if id not in cache:
-        cache[id] = dict()
-        for key, val in transition.items():
-            cache[id][key] = [convert(val)]
-    else:
-        for key, val in transition.items():
-            if key not in cache[id]:
-                # fill missing data(action, etc.) at second time
-                cache[id][key] = [convert(0 * val)]
-                cache[id][key].append(convert(val))
-            else:
-                cache[id][key].append(convert(val))
+_FLAG_KEYS = {"is_first", "is_last", "is_terminal"}
 
+
+def _safe_asarray(value):
+    try:
+        return np.asarray(value)
+    except Exception:
+        return np.asarray(value, dtype=object)
+
+
+def _scalar_bool(value):
+    arr = _safe_asarray(value)
+    if arr.size == 0:
+        return False
+    try:
+        return bool(arr.reshape(-1)[0])
+    except Exception:
+        return bool(list(arr.reshape(-1))[0])
+
+
+def _standardize_step_value(key, value):
+    """Normalize one transition value before inserting into replay cache."""
+    value = convert(value)
+    if key in _FLAG_KEYS:
+        return np.asarray(_scalar_bool(value), dtype=np.bool_)
+    return value
+
+
+def _standardize_sequence_value(key, value):
+    """Normalize one sampled sequence before batching."""
+    if key not in _FLAG_KEYS:
+        return value
+
+    arr = _safe_asarray(value)
+
+    # Normal numeric/bool array, e.g. (32,), (32, 1).
+    if arr.dtype != object:
+        if arr.ndim == 0:
+            return np.asarray(arr, dtype=np.bool_)
+        if arr.ndim >= 2 and arr.shape[-1] == 1:
+            arr = np.squeeze(arr, axis=-1)
+        return arr.astype(np.bool_)
+
+    # Object/mixed sequence, e.g. [False, array([False]), ...].
+    vals = []
+    for item in list(value):
+        vals.append(_scalar_bool(item))
+    return np.asarray(vals, dtype=np.bool_)
+
+
+def _debug_value_shape(value):
+    try:
+        arr = np.asarray(value)
+        return f"shape={arr.shape}, dtype={arr.dtype}"
+    except Exception:
+        try:
+            items = list(value)
+            elem_shapes = []
+            for item in items[:8]:
+                try:
+                    elem_shapes.append(np.asarray(item).shape)
+                except Exception:
+                    elem_shapes.append("bad")
+            return f"len={len(items)}, elem_shapes={elem_shapes}"
+        except Exception:
+            return f"type={type(value)}"
+
+
+def add_to_cache(cache, id, transition):
+    transition = {
+        key: _standardize_step_value(key, val)
+        for key, val in transition.items()
+        if val is not None
+    }
+
+    if id not in cache:
+        cache[id] = {}
+        for key, val in transition.items():
+            cache[id][key] = [val]
+        return
+
+    prev_len = len(next(iter(cache[id].values())))
+
+    # If a new key appears after the first step, backfill previous steps.
+    for key, val in transition.items():
+        if key not in cache[id]:
+            cache[id][key] = [np.zeros_like(val) for _ in range(prev_len)]
+
+    # If an existing key is missing in this step, append zero placeholder.
+    for key in list(cache[id].keys()):
+        if key in transition:
+            cache[id][key].append(transition[key])
+        else:
+            cache[id][key].append(np.zeros_like(cache[id][key][-1]))
+
+def sanitize_episode_for_save(episode):
+    lengths = []
+    for key, value in episode.items():
+        if isinstance(value, list):
+            lengths.append(len(value))
+
+    if not lengths:
+        return episode
+
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    if min_len != max_len:
+        print(
+            f"[sanitize_episode_for_save] Inconsistent episode lengths: "
+            f"min={min_len}, max={max_len}. Cropping to min_len."
+        )
+        for key, value in episode.items():
+            if isinstance(value, list):
+                print(f"  key={key}, len={len(value)}")
+
+    clean = {}
+
+    for key, value in episode.items():
+        if isinstance(value, list):
+            vals = [
+                _standardize_step_value(key, v)
+                for v in value[:min_len]
+            ]
+
+            if key in _FLAG_KEYS:
+                clean[key] = _standardize_sequence_value(key, vals)
+                continue
+
+            try:
+                clean[key] = np.stack(vals, axis=0)
+            except Exception as e:
+                print(f"\n[sanitize_episode_for_save] Failed to stack key={key}")
+                for i, v in enumerate(vals[:20]):
+                    print(
+                        f"  item[{i}]: type={type(v)}, {_debug_value_shape(v)}"
+                    )
+                raise e
+        else:
+            clean[key] = _standardize_step_value(key, value)
+
+    return clean
 
 def erase_over_episodes(cache, dataset_size):
     step_in_dataset = 0
@@ -462,6 +590,8 @@ def save_episodes(directory, episodes):
     directory = pathlib.Path(directory).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
     for filename, episode in episodes.items():
+        episode = sanitize_episode_for_save(episode)
+
         length = len(episode["reward"])
         filename = directory / f"{filename}-{length}.npz"
         with io.BytesIO() as f1:
@@ -515,10 +645,18 @@ def from_generator(generator, batch_size):
             values = []
             for i in range(batch_size):
                 if key not in batch[i]:
-                    print(f"[from_generator] Missing key={key} in batch[{i}], using zeros_like batch[0].")
+                    print(
+                        f"[from_generator] Missing key={key} in batch[{i}], "
+                        f"using zeros_like batch[0]."
+                    )
                     values.append(np.zeros_like(batch[0][key]))
                 else:
                     values.append(batch[i][key])
+
+            values = [
+                _standardize_sequence_value(key, value)
+                for value in values
+            ]
 
             try:
                 data[key] = np.stack(values, 0)
@@ -527,23 +665,15 @@ def from_generator(generator, batch_size):
                 print(f"[from_generator] batch_size={batch_size}")
 
                 for i, value in enumerate(values[:32]):
-                    arr = np.asarray(value)
                     print(
                         f"  batch[{i}] key={key}: "
-                        f"type={type(value)}, "
-                        f"shape={getattr(value, 'shape', None)}, "
-                        f"asarray_shape={arr.shape}, "
-                        f"dtype={getattr(arr, 'dtype', None)}"
+                        f"type={type(value)}, {_debug_value_shape(value)}"
                     )
 
                 print("\n[from_generator] All keys in batch[0]:")
                 for k, v in batch[0].items():
-                    arr = np.asarray(v)
                     print(
-                        f"  {k}: type={type(v)}, "
-                        f"shape={getattr(v, 'shape', None)}, "
-                        f"asarray_shape={arr.shape}, "
-                        f"dtype={getattr(arr, 'dtype', None)}"
+                        f"  {k}: type={type(v)}, {_debug_value_shape(v)}"
                     )
 
                 raise e
