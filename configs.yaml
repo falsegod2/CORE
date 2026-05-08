@@ -42,7 +42,7 @@ defaults:
   dyn_min_std: 0.1
   #修改 grad_heads：将末尾的 3 个跳跃头删掉。
   #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  grad_heads: ['decoder', 'reward', 'end', 'score']
+  grad_heads: ['decoder', 'reward', 'end']
   units: 512
   act: 'SiLU'
   norm: True
@@ -96,8 +96,6 @@ defaults:
    # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   #accumulated_reward_head:
   #  {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  score_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 0.5, outscale: 0.0}
 
   dyn_scale: 0.5
   rep_scale: 0.1
@@ -118,8 +116,6 @@ defaults:
   grad_clip: 1000
   dataset_size: 1000000
   opt: 'adam'
-  clip_score_imag_scale: 0.1
-  clip_score_use_delta: False
   affordance_align_scale: 0.1
   slot_diversity_scale: 0.01
   tao_entropy_scale: -0.002
@@ -213,7 +209,6 @@ minedojo:
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000
-  clip_score_use_delta: False
   affordance_align_scale: 0.1
   slot_diversity_scale: 0.01
   tao_entropy_scale: -0.002

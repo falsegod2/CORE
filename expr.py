@@ -120,16 +120,6 @@ class LS_Imagine(nn.Module):
             feat = self._wm.dynamics.get_feat(s)
             rew = self._wm.heads["reward"](feat).mode()
 
-            if "score" in self._wm.heads and self._config.clip_score_imag_scale != 0:
-                clip_score = self._wm.heads["score"](feat).mode()
-                if getattr(self._config, "clip_score_use_delta", True) and clip_score.shape[0] > 1:
-                    progress = torch.zeros_like(clip_score)
-                    progress[:-1] = clip_score[1:] - clip_score[:-1]
-                    clip_bonus = progress
-                else:
-                    clip_bonus = clip_score
-                rew = rew + self._config.clip_score_imag_scale * clip_bonus
-
             return rew
 
         '''
