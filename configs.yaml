@@ -204,7 +204,6 @@ minedojo:
   #accumulated_reward_head: {layers: 5}
   end_head: {layers: 5}
   #jump_head: {layers: 5}
-  score_head: {layers: 5}
 
   imag_gradient: 'reinforce'
   break_speed: 100.0
