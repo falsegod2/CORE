@@ -161,14 +161,14 @@ defaults:
   opt: 'adam'
 
   # AGOC representation losses
-  affordance_align_scale: 0.1
-  slot_diversity_scale: 0.01
+  affordance_align_scale: 0.2
+  slot_diversity_scale: 0.03
   tao_entropy_scale: 0.0
 
   # Dyn-O style object dynamics auxiliary loss
-  object_dyn_scale: 0.05
-  object_dyn_aff_weight: 1.0
-  object_dyn_match_temp: 0.1
+  object_dyn_scale: 0.2
+  object_dyn_aff_weight: 1.5
+  object_dyn_match_temp: 0.2
   object_dyn_hidden: 256
   object_dyn_heads: 4
   object_dyn_layers: 1
