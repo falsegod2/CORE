@@ -84,7 +84,7 @@ defaults:
     tao_include_task: False
     tao_affordance_weight: 1.0
     tao_task_weight: 0.0
-    tao_temperature: 8.0
+    tao_temperature: 4.0
 
   decoder:
     mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath'
@@ -132,7 +132,7 @@ defaults:
     outscale: 1.0
 
   critic:
-    layers: 2
+    layers: 5
     dist: 'symlog_disc'
     slow_target: True
     slow_target_update: 1
@@ -161,7 +161,7 @@ defaults:
   opt: 'adam'
 
   # AGOC representation losses
-  affordance_align_scale: 0.2
+  affordance_align_scale: 0.3
   slot_diversity_scale: 0.03
   tao_entropy_scale: 0.0
 
