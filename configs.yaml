@@ -1,5 +1,5 @@
 defaults:
-
+  # ===== Basic =====
   use_wandb: False
   wandb_key: None
   logdir: null
@@ -9,129 +9,180 @@ defaults:
   offline_evaldir: ''
   seed: 0
   deterministic_run: False
-  steps: 1e6
+  steps: 1000000
   parallel: False
-  eval_every: 20000
-  eval_episode_num: 10
-  log_every: 20000
-  reset_every: 0
   device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
   video_pred_log: True
 
-  # Environment
+  # ===== Environment: MineDojo only =====
   task: 'minedojo'
   size: [64, 64]
   envs: 1
   action_repeat: 1
-  time_limit: 1000
+  time_limit: 36000
   grayscale: False
   prefill: 2500
   reward_EMA: True
+  eval_every: 10000
+  eval_episode_num: 3
+  log_every: 20000
+  reset_every: 0
 
-  # Model
-  dyn_hidden: 512
-  dyn_deter: 512
+  # ===== MineDojo rollout / affordance map dataset =====
+  is_random: True
+  agent_checkpoint_dir: ''
+  rollout_image_num: 2000
+  results_dir: './results'
+  name: 'test'
+  target_item: 'log'
+  break_speed: 100.0
+
+  # ===== RSSM / World Model =====
+  dyn_hidden: 1024
+  dyn_deter: 4096
   dyn_stoch: 32
   dyn_discrete: 32
   dyn_rec_depth: 1
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  #修改 grad_heads：将末尾的 3 个跳跃头删掉。
-  #grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  grad_heads: ['decoder', 'reward', 'end']
-  units: 512
+  units: 1024
   act: 'SiLU'
   norm: True
-  encoder:
-    {
-      mlp_keys: '$^',
-      cnn_keys: 'image',
-      act: 'SiLU',
-      norm: True,
-      cnn_depth: 32,
-      kernel_size: 4,
-      minres: 4,
-      mlp_layers: 5,
-      mlp_units: 1024,
-      symlog_inputs: True,
+  grad_heads: ['decoder', 'reward', 'end']
 
-      use_slots: True,
-      num_slots: 16,
-      slot_dim: 128,
-      slot_iters: 3,
-      affordance_keys: 'heatmap',
-      task_embed_keys: '__no_task_embed__',
-      affordance_bias: 2.0,
-      slot_use_coords: True,
-      task_embed_dim: 512,
-      tao_include_flat: True,
-      tao_include_global: True,
-      tao_include_affordance: True,
-      tao_include_task: False,
-      tao_affordance_weight: 1.0,
-      tao_task_weight: 0.0,
-      tao_temperature: 8.0
-    }
+  encoder:
+    mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward'
+    cnn_keys: 'image'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 96
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 5
+    mlp_units: 1024
+    symlog_inputs: True
+
+    # AGOC object-centric encoder
+    use_slots: True
+    num_slots: 8
+    slot_dim: 128
+    slot_iters: 3
+    slot_use_coords: True
+
+    # Affordance-only object selection. No task_scores.
+    affordance_keys: 'heatmap'
+    task_embed_keys: '__no_task_embed__'
+    task_embed_dim: 512
+    affordance_bias: 2.0
+    tao_include_flat: True
+    tao_include_global: True
+    tao_include_affordance: True
+    tao_include_task: False
+    tao_affordance_weight: 1.0
+    tao_task_weight: 0.0
+    tao_temperature: 8.0
+
   decoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  actor:
-    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic:
-    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+    mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath'
+    cnn_keys: 'image|heatmap'
+    act: 'SiLU'
+    norm: True
+    cnn_depth: 96
+    kernel_size: 4
+    minres: 4
+    mlp_layers: 5
+    mlp_units: 1024
+    cnn_sigmoid: False
+    image_dist: mse
+    vector_dist: symlog_mse
+    outscale: 1.0
+
   reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    layers: 5
+    dist: 'symlog_disc'
+    loss_scale: 1.0
+    outscale: 0.0
+
   end_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  #jump_head:
-   # {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  #concentration_score_head:
-   # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  intrinsic_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  #jumping_steps_head:
-   # {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  #accumulated_reward_head:
-  #  {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    layers: 5
+    loss_scale: 1.0
+    outscale: 1.0
+
+  # Kept for compatibility with codebases that still read config.value.
+  # If your code only uses config.critic, this block is ignored.
+  value:
+    layers: 5
+
+  actor:
+    layers: 5
+    dist: 'onehot'
+    entropy: 3e-4
+    unimix_ratio: 0.01
+    std: 'none'
+    min_std: 0.1
+    max_std: 1.0
+    temp: 0.1
+    lr: 3e-5
+    eps: 1e-5
+    grad_clip: 100.0
+    outscale: 1.0
+
+  critic:
+    layers: 2
+    dist: 'symlog_disc'
+    slow_target: True
+    slow_target_update: 1
+    slow_target_fraction: 0.02
+    lr: 3e-5
+    eps: 1e-5
+    grad_clip: 100.0
+    outscale: 0.0
 
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
-  #img_weight: 1.0
-  #jmp_weight: 1.0
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
 
-  # Training
+  # ===== Training =====
   batch_size: 16
   batch_length: 32
-  train_ratio: 512
+  train_ratio: 16
   pretrain: 100
   model_lr: 1e-4
   opt_eps: 1e-8
   grad_clip: 1000
   dataset_size: 1000000
   opt: 'adam'
+
+  # AGOC representation losses
   affordance_align_scale: 0.1
   slot_diversity_scale: 0.01
-  tao_entropy_scale: -0.002
+  tao_entropy_scale: 0.0
 
-  # Behavior.
+  # Dyn-O style object dynamics auxiliary loss
+  object_dyn_scale: 0.05
+  object_dyn_aff_weight: 1.0
+  object_dyn_match_temp: 0.1
+  object_dyn_hidden: 256
+  object_dyn_heads: 4
+  object_dyn_layers: 1
+
+  # ===== Behavior Learning =====
   discount: 0.997
   discount_lambda: 0.95
-  #jump_prob: 0.7
-  #jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
-  imag_gradient: 'dynamics'
+  imag_gradient: 'reinforce'
   imag_gradient_mix: 0.0
   eval_state_mean: False
 
-  # Exploration
+  # ===== Exploration =====
   expl_behavior: 'greedy'
   expl_until: 0
   expl_extr_scale: 0.0
@@ -144,73 +195,9 @@ defaults:
   disag_units: 400
   disag_action_cond: False
 
-minedojo:
-
-  #long_term_branch_weight: 1.0
-  #gaussian_reward_weight: 1.0
-  #gaussian_sigma_weight: 0.5
-
-  # rollout
-  is_random: True
-  agent_checkpoint_dir: ""
-  rollout_image_num: 2000
-
-  #unet_batch_size: 64
-  results_dir: "./results"
-  name: "test"
-  target_item: "log"
-  steps: 1e6
-  parallel: False
-  envs: 1
-  eval_episode_num: 3
-  eval_every: 10000
-  action_repeat: 1
-  train_ratio: 16
-  video_pred_log: true
-  dyn_hidden: 1024
-  dyn_deter: 4096
-  units: 1024
-  encoder:
-    {
-      mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward',
-      cnn_keys: 'image',
-      cnn_depth: 96,
-      mlp_layers: 5,
-      mlp_units: 1024,
-
-      use_slots: True,
-      num_slots: 16,
-      slot_dim: 128,
-      slot_iters: 3,
-      affordance_keys: 'heatmap',
-      task_embed_keys: '__no_task_embed__',
-      affordance_bias: 2.0,
-      slot_use_coords: True,
-      task_embed_dim: 512,
-      tao_include_flat: True,
-      tao_include_global: True,
-      tao_include_affordance: True,
-      tao_include_task: False,
-      tao_affordance_weight: 1.0,
-      tao_task_weight: 0.0,
-      tao_temperature: 8.0
-    }
-  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: 'image|heatmap', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  actor: {layers: 5, dist: 'onehot', std: 'none'}
-  value: {layers: 5}
-  reward_head: {layers: 5}
-  intrinsic_head: {layers: 5}
-  #jumping_steps_head: {layers: 5}
-  #accumulated_reward_head: {layers: 5}
-  end_head: {layers: 5}
-  #jump_head: {layers: 5}
-
-  imag_gradient: 'reinforce'
-  break_speed: 100.0
-  time_limit: 36000
-  affordance_align_scale: 0.1
-  slot_diversity_scale: 0.01
-  tao_entropy_scale: -0.002
+# The training code usually loads defaults and then updates with the selected task.
+# Since this project only uses MineDojo, all active settings are already in defaults.
+minedojo: {}
 
 debug:
   debug: True

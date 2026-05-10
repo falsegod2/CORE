@@ -406,7 +406,68 @@ class SlotAttention(nn.Module):
             slots = slots + self.mlp(self.norm_mlp(slots))
 
         return slots, attn
+    
+class ObjectDynamics(nn.Module):
+    """
+    Dyn-O style object-level dynamics module.
 
+    Input:
+        slots:  [B, K, D]
+        action: [B, A]
+    Output:
+        pred_next_slots: [B, K, D]
+    """
+
+    def __init__(
+        self,
+        slot_dim,
+        action_dim,
+        hidden_dim=256,
+        num_heads=4,
+        num_layers=1,
+    ):
+        super().__init__()
+        self.slot_dim = slot_dim
+        self.action_proj = nn.Linear(action_dim, slot_dim)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=slot_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.interaction = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        self.pred = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+
+        self.apply(tools.weight_init)
+
+    def forward(self, slots, action):
+        # slots: [B, K, D]
+        # action: [B, A]
+        action_token = self.action_proj(action).unsqueeze(1)
+
+        # 把 action 作为一个额外 token，让 object slots 可以读取动作信息。
+        x = torch.cat([slots, action_token], dim=1)
+
+        # 对象之间做 self-attention，动作 token 也参与交互。
+        x = self.interaction(x)
+
+        # 只取前 K 个 object tokens，最后一个 action token 丢掉。
+        obj_hidden = x[:, :-1]
+
+        # residual prediction：预测 slot 的变化量，而不是完全重建 slot。
+        delta = self.pred(obj_hidden)
+        pred_next_slots = slots + delta
+        return pred_next_slots
+    
 class ObjectCentricConvEncoder(nn.Module):
     """
     CNN -> spatial tokens -> affordance-biased Slot Attention -> flat Dreamer embedding.
@@ -510,6 +571,8 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_aff_scores = None
         self.last_task_scores = None
         self.last_tao_weights = None
+        self.last_slots = None
+        self.last_lead_shape = None
 
     def _coords(self, b, h, w, device, dtype):
         ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
@@ -542,8 +605,11 @@ class ObjectCentricConvEncoder(nn.Module):
             aff = aff.reshape(b, h * w)
 
         slots, attn = self.slot_attention(tokens, aff)
+        self.last_slots = slots
+        self.last_lead_shape = lead_shape
         self.last_attn = attn
         self.last_affordance = aff
+
 
         # Slot-level affordance score: how much each object slot attends to
         # high-affordance image patches. Shape: [B*T, K].

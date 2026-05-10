@@ -67,6 +67,17 @@ class WorldModel(nn.Module):
             config.device,
         )
 
+        enc_cfg = config.encoder
+        slot_dim = enc_cfg["slot_dim"] if isinstance(enc_cfg, dict) else enc_cfg.slot_dim
+
+        self.object_dynamics = networks.ObjectDynamics(
+            slot_dim=slot_dim,
+            action_dim=config.num_actions,
+            hidden_dim=getattr(config, "object_dyn_hidden", 256),
+            num_heads=getattr(config, "object_dyn_heads", 4),
+            num_layers=getattr(config, "object_dyn_layers", 1),
+        )
+
         self.heads = nn.ModuleDict()
 
         if config.dyn_discrete:
@@ -395,6 +406,28 @@ class WorldModel(nn.Module):
         else:
             return post, None, context, metrics
     '''
+
+    def _soft_slot_matching_loss(self, pred_slots, target_slots, temperature=0.1):
+        """
+        pred_slots:   [B, K, D]
+        target_slots: [B, K, D]
+        return:       [B, K]
+        """
+        pred_norm = torch.nn.functional.normalize(pred_slots, dim=-1)
+        target_norm = torch.nn.functional.normalize(target_slots.detach(), dim=-1)
+
+        sim = torch.einsum("bkd,bmd->bkm", pred_norm, target_norm) / temperature
+        assign = torch.softmax(sim, dim=-1)
+
+        matched_target = torch.einsum(
+            "bkm,bmd->bkd",
+            assign,
+            target_slots.detach(),
+        )
+
+        loss = ((pred_slots - matched_target) ** 2).mean(dim=-1)
+        return loss
+
     def _train(self, data_origin):
         
         data = self.preprocess(data_origin)
@@ -403,6 +436,54 @@ class WorldModel(nn.Module):
             with torch.cuda.amp.autocast(self._use_amp):
                 
                 embed = self.encoder(data)
+
+                obj_dyn_loss = None
+
+                if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "last_slots"):
+                    slots_flat = self.encoder._cnn.last_slots
+                    aff_scores_flat = self.encoder._cnn.last_aff_scores
+
+                    if slots_flat is not None:
+                        B, T = embed.shape[:2]
+                        K = self.encoder._cnn.num_slots
+                        D = self.encoder._cnn.slot_dim
+
+                        slots = slots_flat.reshape(B, T, K, D)
+
+                        if aff_scores_flat is not None:
+                            aff_scores = aff_scores_flat.reshape(B, T, K)
+                        else:
+                            aff_scores = torch.zeros(B, T, K, device=slots.device, dtype=slots.dtype)
+
+                        if T > 1:
+                            slots_t = slots[:, :-1]
+                            slots_tp1 = slots[:, 1:]
+                            actions_t = data["action"][:, :-1]
+
+                            BT = B * (T - 1)
+
+                            pred_slots = self.object_dynamics(
+                                slots_t.reshape(BT, K, D),
+                                actions_t.reshape(BT, -1),
+                            )
+
+                            target_slots = slots_tp1.reshape(BT, K, D)
+
+                            per_slot_loss = self._soft_slot_matching_loss(
+                                pred_slots,
+                                target_slots,
+                                temperature=getattr(self._config, "object_dyn_match_temp", 0.1),
+                            )
+
+                            # 不跨 episode 边界预测。
+                            valid = (1.0 - data["is_first"][:, 1:].float()).reshape(BT, 1)
+
+                            # 让高 affordance 的 slots 动态预测更重要，但这不是 reward。
+                            weight = 1.0 + getattr(self._config, "object_dyn_aff_weight", 1.0) * aff_scores[:, :-1].reshape(BT, K).detach()
+
+                            obj_dyn_loss = (per_slot_loss * weight * valid).sum() / (
+                                valid.sum() * K + 1e-8
+                            )
 
                 object_aux = {}
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "object_aux_losses"):
@@ -448,6 +529,8 @@ class WorldModel(nn.Module):
                     
                 model_loss = sum(scaled.values()) + kl_loss
 
+                if obj_dyn_loss is not None:
+                    model_loss = model_loss + self._config.object_dyn_scale * obj_dyn_loss
                 if aff_loss is not None:
                     aff_loss = aff_loss.reshape(embed.shape[:2])
                     model_loss = model_loss + self._config.affordance_align_scale * aff_loss
@@ -476,6 +559,8 @@ class WorldModel(nn.Module):
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(torch.mean(model_loss))
+        if obj_dyn_loss is not None:
+            metrics["object_dyn_loss"] = to_np(obj_dyn_loss) 
         if aff_loss is not None:
             metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
         if div_loss is not None:
