@@ -490,6 +490,42 @@ class WorldModel(nn.Module):
                     object_aux = self.encoder._cnn.object_aux_losses()
                 aff_loss = object_aux.get("affordance_align", None)
 
+                agoc_debug = {}
+
+                if hasattr(self.encoder, "_cnn"):
+                    aff_scores = getattr(self.encoder._cnn, "last_aff_scores", None)
+                    tao_weights = getattr(self.encoder._cnn, "last_tao_weights", None)
+
+                    if aff_scores is not None:
+                        aff = aff_scores.detach().float()
+
+                        agoc_debug["agoc_aff_mean"] = aff.mean()
+                        agoc_debug["agoc_aff_std"] = aff.std()
+                        agoc_debug["agoc_aff_min"] = aff.min()
+                        agoc_debug["agoc_aff_max"] = aff.max()
+
+                        # 每个 slot 的平均 affordance score，看 slots 是否有明显分化
+                        aff_slot_mean = aff.mean(dim=0)
+                        agoc_debug["agoc_aff_slot_mean_std"] = aff_slot_mean.std()
+                        agoc_debug["agoc_aff_slot_mean_max"] = aff_slot_mean.max()
+                        agoc_debug["agoc_aff_slot_mean_min"] = aff_slot_mean.min()
+
+                    if tao_weights is not None:
+                        tao = tao_weights.detach().float()
+
+                        agoc_debug["agoc_tao_mean"] = tao.mean()
+                        agoc_debug["agoc_tao_std"] = tao.std()
+                        agoc_debug["agoc_tao_min"] = tao.min()
+                        agoc_debug["agoc_tao_max"] = tao.max()
+
+                        # 每个样本里最大权重的平均值。
+                        # 如果 num_slots=8，完全均匀时大约是 0.125。
+                        agoc_debug["agoc_tao_top1_mean"] = tao.max(dim=-1).values.mean()
+
+                        # 手动算一次 entropy，方便和 tao_entropy 对照。
+                        tao_entropy = -(tao.clamp_min(1e-8) * torch.log(tao.clamp_min(1e-8))).sum(dim=-1)
+                        agoc_debug["agoc_tao_entropy_mean"] = tao_entropy.mean()
+
                 # process original data
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
@@ -567,6 +603,9 @@ class WorldModel(nn.Module):
             metrics["slot_diversity_loss"] = to_np(torch.mean(div_loss))
         if tao_entropy is not None:
             metrics["tao_entropy"] = to_np(torch.mean(tao_entropy))
+
+        for key, value in agoc_debug.items():
+            metrics[key] = to_np(value)
 
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
