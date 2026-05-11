@@ -494,6 +494,8 @@ class WorldModel(nn.Module):
 
                 if hasattr(self.encoder, "_cnn"):
                     aff_scores = getattr(self.encoder._cnn, "last_aff_scores", None)
+                    aff_scores_norm = getattr(self.encoder._cnn, "last_aff_scores_norm", None)
+
                     tao_weights = getattr(self.encoder._cnn, "last_tao_weights", None)
 
                     if aff_scores is not None:
@@ -525,6 +527,13 @@ class WorldModel(nn.Module):
                         # 手动算一次 entropy，方便和 tao_entropy 对照。
                         tao_entropy = -(tao.clamp_min(1e-8) * torch.log(tao.clamp_min(1e-8))).sum(dim=-1)
                         agoc_debug["agoc_tao_entropy_mean"] = tao_entropy.mean()
+
+                    if aff_scores_norm is not None:
+                        affn = aff_scores_norm.detach().float()
+                        agoc_debug["agoc_aff_norm_mean"] = affn.mean()
+                        agoc_debug["agoc_aff_norm_std"] = affn.std()
+                        agoc_debug["agoc_aff_norm_min"] = affn.min()
+                        agoc_debug["agoc_aff_norm_max"] = affn.max()
 
                 # process original data
                 post, prior = self.dynamics.observe(

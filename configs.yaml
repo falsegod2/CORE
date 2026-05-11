@@ -77,14 +77,14 @@ defaults:
     affordance_keys: 'heatmap'
     task_embed_keys: '__no_task_embed__'
     task_embed_dim: 512
-    affordance_bias: 2.0
+    affordance_bias: 1.0
     tao_include_flat: True
     tao_include_global: True
     tao_include_affordance: True
     tao_include_task: False
     tao_affordance_weight: 1.0
     tao_task_weight: 0.0
-    tao_temperature: 4.0
+    tao_temperature: 1.0
 
   decoder:
     mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath'

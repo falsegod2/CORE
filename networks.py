@@ -569,6 +569,7 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_attn = None
         self.last_affordance = None
         self.last_aff_scores = None
+        self.last_aff_scores_norm = None
         self.last_task_scores = None
         self.last_tao_weights = None
         self.last_slots = None
@@ -618,6 +619,13 @@ class ObjectCentricConvEncoder(nn.Module):
         else:
             aff_scores = torch.zeros(b, self.num_slots, device=slots.device, dtype=slots.dtype)
 
+        # 关键修改：TAO 关心的是同一帧内不同 slots 的相对差异。
+        # 原始 aff_scores 的 slot-wise 差距太小，softmax 会一直接近均匀。
+        aff_mean = aff_scores.mean(dim=-1, keepdim=True)
+        aff_std = aff_scores.std(dim=-1, keepdim=True, unbiased=False)
+        aff_scores_norm = (aff_scores - aff_mean) / (aff_std + 1e-4)
+        aff_scores_norm = aff_scores_norm.clamp(-5.0, 5.0)
+
         # Slot-level MineCLIP/task relevance. The environment wrapper can provide
         # the prompt embedding cached by the affordance/MineCLIP module.
         if task_embed is not None:
@@ -626,17 +634,21 @@ class ObjectCentricConvEncoder(nn.Module):
             slot_sem = F.normalize(self.slot_task_proj(slots), dim=-1)
             task_scores = torch.einsum("bkd,bd->bk", slot_sem, task)
         else:
-            task_scores = torch.zeros_like(aff_scores)
+            task_scores = torch.zeros_like(aff_scores_norm)
 
         tao_logits = (
-            self.tao_affordance_weight * aff_scores
+            self.tao_affordance_weight * aff_scores_norm
             + self.tao_task_weight * task_scores
         ) * self.tao_temperature
+
         tao_weights = torch.softmax(tao_logits, dim=-1)
 
         global_slot = slots.mean(dim=1)
-        affordance_slot = torch.einsum("bk,bkd->bd", torch.softmax(aff_scores * self.tao_temperature, dim=-1), slots)
-        task_slot = torch.einsum("bk,bkd->bd", tao_weights, slots)
+        affordance_slot = torch.einsum("bk,bkd->bd", tao_weights, slots)
+        task_slot = affordance_slot if not self.tao_include_task else torch.einsum(
+            "bk,bkd->bd", tao_weights, slots
+)
+
 
         pieces = []
         if self.tao_include_flat:
@@ -644,7 +656,7 @@ class ObjectCentricConvEncoder(nn.Module):
         if self.tao_include_global:
             pieces.append(global_slot)
         if self.tao_include_affordance:
-            pieces.extend([affordance_slot, aff_scores])
+            pieces.extend([affordance_slot, aff_scores_norm])
         if self.tao_include_task:
             pieces.extend([task_slot, task_scores])
         out = torch.cat(pieces, dim=-1)
@@ -653,6 +665,7 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_attn_vis = attn.detach()
         self.last_aff_vis = aff.detach() if aff is not None else None
         self.last_aff_scores = aff_scores
+        self.last_aff_scores_norm = aff_scores_norm
         self.last_task_scores = task_scores
         self.last_tao_weights = tao_weights
 
