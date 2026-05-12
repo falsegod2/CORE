@@ -438,10 +438,11 @@ class WorldModel(nn.Module):
                 embed = self.encoder(data)
 
                 obj_dyn_loss = None
+                obj_dyn_pred_delta = None
 
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "last_slots"):
                     slots_flat = self.encoder._cnn.last_slots
-                    aff_scores_flat = self.encoder._cnn.last_aff_scores
+                    tao_weights_flat = getattr(self.encoder._cnn, "last_tao_weights", None)
 
                     if slots_flat is not None:
                         B, T = embed.shape[:2]
@@ -450,40 +451,44 @@ class WorldModel(nn.Module):
 
                         slots = slots_flat.reshape(B, T, K, D)
 
-                        if aff_scores_flat is not None:
-                            aff_scores = aff_scores_flat.reshape(B, T, K)
-                        else:
-                            aff_scores = torch.zeros(B, T, K, device=slots.device, dtype=slots.dtype)
-
                         if T > 1:
-                            slots_t = slots[:, :-1]
-                            slots_tp1 = slots[:, 1:]
-                            actions_t = data["action"][:, :-1]
+                            slots_t = slots[:, :-1]              # [B, T-1, K, D]
+                            slots_tp1 = slots[:, 1:]             # [B, T-1, K, D]
+                            actions_t = data["action"][:, :-1]    # [B, T-1, A]
+
+                            pred_slots_seq = self.object_dynamics(slots_t, actions_t)
 
                             BT = B * (T - 1)
-
-                            pred_slots = self.object_dynamics(
-                                slots_t.reshape(BT, K, D),
-                                actions_t.reshape(BT, -1),
-                            )
-
+                            pred_slots = pred_slots_seq.reshape(BT, K, D)
                             target_slots = slots_tp1.reshape(BT, K, D)
 
                             per_slot_loss = self._soft_slot_matching_loss(
                                 pred_slots,
                                 target_slots,
-                                temperature=getattr(self._config, "object_dyn_match_temp", 0.1),
+                                temperature=getattr(self._config, "object_dyn_match_temp", 0.2),
                             )
 
                             # 不跨 episode 边界预测。
                             valid = (1.0 - data["is_first"][:, 1:].float()).reshape(BT, 1)
 
-                            # 让高 affordance 的 slots 动态预测更重要，但这不是 reward。
-                            weight = 1.0 + getattr(self._config, "object_dyn_aff_weight", 1.0) * aff_scores[:, :-1].reshape(BT, K).detach()
+                            # Dyn-O style: emphasize objects that TAO actually selects.
+                            # Multiplying by K keeps the average scale near 1.0.
+                            if tao_weights_flat is not None:
+                                tao_weights_seq = tao_weights_flat.reshape(B, T, K)
+                                dyn_weight = 1.0 + getattr(self._config, "object_dyn_aff_weight", 1.0) * (
+                                    K * tao_weights_seq[:, :-1].reshape(BT, K).detach()
+                                )
+                            else:
+                                dyn_weight = torch.ones(BT, K, device=slots.device, dtype=slots.dtype)
 
-                            obj_dyn_loss = (per_slot_loss * weight * valid).sum() / (
+                            obj_dyn_loss = (per_slot_loss * dyn_weight * valid).sum() / (
                                 valid.sum() * K + 1e-8
                             )
+
+                            with torch.no_grad():
+                                obj_dyn_pred_delta = (
+                                    pred_slots - slots_t.reshape(BT, K, D)
+                                ).norm(dim=-1).mean()
 
                 object_aux = {}
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "object_aux_losses"):
