@@ -468,6 +468,90 @@ class ObjectDynamics(nn.Module):
         pred_next_slots = slots + delta
         return pred_next_slots
     
+
+class ObjectSSMDynamics(nn.Module):
+    """
+    Dyn-O style shared object SSM with action-conditioned object interaction.
+
+    This module is used as an auxiliary world-model objective. It does not
+    provide extra reward. It encourages AGOC slots to be temporally predictable
+    under actions.
+
+    Input:
+        slots_seq:  [B, T, K, D]
+        action_seq: [B, T, A]
+    Output:
+        pred_next_slots: [B, T, K, D]
+    """
+
+    def __init__(
+        self,
+        slot_dim,
+        action_dim,
+        hidden_dim=256,
+        num_heads=4,
+        num_layers=1,
+    ):
+        super().__init__()
+        self.slot_dim = slot_dim
+        self.action_proj = nn.Linear(action_dim, slot_dim)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=slot_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.interaction = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+        # A shared recurrent state-space transition for all object slots.
+        # This is a lightweight SSM; it can later be replaced by Mamba/S4.
+        self.ssm_cell = nn.GRUCell(slot_dim, slot_dim)
+
+        self.pred = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, slot_dim),
+        )
+
+        self.apply(tools.weight_init)
+
+    def forward(self, slots_seq, action_seq):
+        # slots_seq:  [B, T, K, D]
+        # action_seq: [B, T, A]
+        b, t, k, d = slots_seq.shape
+        assert d == self.slot_dim, (d, self.slot_dim)
+
+        h = torch.zeros(
+            b * k,
+            d,
+            device=slots_seq.device,
+            dtype=slots_seq.dtype,
+        )
+        preds = []
+
+        for i in range(t):
+            slots_i = slots_seq[:, i]      # [B, K, D]
+            action_i = action_seq[:, i]    # [B, A]
+
+            action_token = self.action_proj(action_i).unsqueeze(1)  # [B, 1, D]
+
+            # Object-object interaction plus action conditioning.
+            x = torch.cat([slots_i, action_token], dim=1)           # [B, K+1, D]
+            x = self.interaction(x)
+            obj_input = x[:, :k]                                    # [B, K, D]
+
+            obj_input = obj_input.reshape(b * k, d)
+            h = self.ssm_cell(obj_input, h)
+
+            delta = self.pred(h).reshape(b, k, d)
+            preds.append(slots_i + delta)
+
+        return torch.stack(preds, dim=1)
+
 class ObjectCentricConvEncoder(nn.Module):
     """
     CNN -> spatial tokens -> affordance-biased Slot Attention -> flat Dreamer embedding.

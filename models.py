@@ -70,7 +70,7 @@ class WorldModel(nn.Module):
         enc_cfg = config.encoder
         slot_dim = enc_cfg["slot_dim"] if isinstance(enc_cfg, dict) else enc_cfg.slot_dim
 
-        self.object_dynamics = networks.ObjectDynamics(
+        self.object_dynamics = networks.ObjectSSMDynamics(
             slot_dim=slot_dim,
             action_dim=config.num_actions,
             hidden_dim=getattr(config, "object_dyn_hidden", 256),
@@ -610,7 +610,9 @@ class WorldModel(nn.Module):
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(torch.mean(model_loss))
         if obj_dyn_loss is not None:
-            metrics["object_dyn_loss"] = to_np(obj_dyn_loss) 
+            metrics["object_dyn_loss"] = to_np(obj_dyn_loss)
+        if obj_dyn_pred_delta is not None:
+            metrics["object_dyn_pred_delta"] = to_np(obj_dyn_pred_delta)
         if aff_loss is not None:
             metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
         if div_loss is not None:

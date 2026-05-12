@@ -165,8 +165,8 @@ defaults:
   slot_diversity_scale: 0.03
   tao_entropy_scale: 0.0
 
-  # Dyn-O style object dynamics auxiliary loss
-  object_dyn_scale: 0.2
+  # Dyn-O style shared object SSM auxiliary loss
+  object_dyn_scale: 0.1
   object_dyn_aff_weight: 1.5
   object_dyn_match_temp: 0.2
   object_dyn_hidden: 256
