@@ -454,7 +454,7 @@ class WorldModel(nn.Module):
                         if T > 1:
                             slots_t = slots[:, :-1]              # [B, T-1, K, D]
                             slots_tp1 = slots[:, 1:]             # [B, T-1, K, D]
-                            actions_t = data["action"][:, :-1]    # [B, T-1, A]
+                            actions_t = data["action"][:, :-1].detach().clone()    # [B, T-1, A]
 
                             pred_slots_seq = self.object_dynamics(slots_t, actions_t)
 

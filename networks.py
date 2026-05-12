@@ -197,45 +197,82 @@ class RSSM(nn.Module):
         return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        '''清理 obs_step 中的动作维度强行对齐补丁
-        if prev_action is not None and prev_action.shape[-1] != self._num_actions:
-            shape = prev_action.shape
-            new_shape = list(shape[:-1]) + [1]
-            zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
-            prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
-        '''
+        """
+        RSSM posterior update.
 
-        if prev_state == None or torch.sum(is_first) == len(is_first):
-            prev_state = self.initial(len(is_first))
-            prev_action = torch.zeros((len(is_first), self._num_actions)).to(
-                self._device
+        修改重点：
+        1. 去掉 prev_action *= ... 这种 inplace 操作。
+        2. 不再原地修改 prev_state 字典，而是构造 new_prev_state。
+        3. 保持原始逻辑：episode 第一帧使用 initial state 和 zero action。
+        """
+
+        batch_size = len(is_first)
+
+        # is_first 可能是 bool，也可能是 float，这里统一成 bool 判断 reset。
+        is_first = is_first.to(embed.device)
+        is_first_bool = is_first.bool()
+
+        if prev_state is None or torch.all(is_first_bool):
+            prev_state = self.initial(batch_size)
+
+            prev_action = torch.zeros(
+                (batch_size, self._num_actions),
+                device=self._device,
+                dtype=embed.dtype,
             )
-            # prev_action.requires_grad_()
-        # overwrite the prev_state only where is_first=True
-        elif torch.sum(is_first) > 0:
-            is_first = is_first[:, None]
-            prev_action *= 1.0 - is_first
-            init_state = self.initial(len(is_first))
+
+        elif torch.any(is_first_bool):
+            # reset mask: [B, 1]
+            reset = is_first_bool[:, None].to(embed.dtype)
+
+            # 关键修正：
+            # 原来是 prev_action *= 1.0 - is_first
+            # 这里改成非原地操作，避免 autograd version mismatch。
+            prev_action = prev_action.to(embed.device, dtype=embed.dtype)
+            prev_action = prev_action * (1.0 - reset)
+
+            init_state = self.initial(batch_size)
+
+            new_prev_state = {}
             for key, val in prev_state.items():
-                is_first_r = torch.reshape(
-                    is_first,
-                    is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+                reset_r = torch.reshape(
+                    reset,
+                    reset.shape + (1,) * (len(val.shape) - len(reset.shape)),
                 )
-                prev_state[key] = (
-                    val * (1.0 - is_first_r) + init_state[key] * is_first_r
+
+                init_val = init_state[key].to(device=val.device, dtype=val.dtype)
+
+                # 不要写 prev_state[key] = ... 原地覆盖旧 state，
+                # 构造一个新的 state 字典更安全。
+                new_prev_state[key] = (
+                    val * (1.0 - reset_r)
+                    + init_val * reset_r
                 )
+
+            prev_state = new_prev_state
+
+        else:
+            # 没有 reset，也要确保 dtype/device 一致。
+            prev_action = prev_action.to(embed.device, dtype=embed.dtype)
 
         prior = self.img_step(prev_state, prev_action)
+
         x = torch.cat([prior["deter"], embed], -1)
-        # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
-        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
+
         stats = self._suff_stats_layer("obs", x)
+
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
-        post = {"stoch": stoch, "deter": prior["deter"], **stats}
+
+        post = {
+            "stoch": stoch,
+            "deter": prior["deter"],
+            **stats,
+        }
+
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
