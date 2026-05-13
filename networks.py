@@ -197,45 +197,82 @@ class RSSM(nn.Module):
         return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        '''清理 obs_step 中的动作维度强行对齐补丁
-        if prev_action is not None and prev_action.shape[-1] != self._num_actions:
-            shape = prev_action.shape
-            new_shape = list(shape[:-1]) + [1]
-            zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
-            prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
-        '''
+        """
+        RSSM posterior update.
 
-        if prev_state == None or torch.sum(is_first) == len(is_first):
-            prev_state = self.initial(len(is_first))
-            prev_action = torch.zeros((len(is_first), self._num_actions)).to(
-                self._device
+        修改重点：
+        1. 去掉 prev_action *= ... 这种 inplace 操作。
+        2. 不再原地修改 prev_state 字典，而是构造 new_prev_state。
+        3. 保持原始逻辑：episode 第一帧使用 initial state 和 zero action。
+        """
+
+        batch_size = len(is_first)
+
+        # is_first 可能是 bool，也可能是 float，这里统一成 bool 判断 reset。
+        is_first = is_first.to(embed.device)
+        is_first_bool = is_first.bool()
+
+        if prev_state is None or torch.all(is_first_bool):
+            prev_state = self.initial(batch_size)
+
+            prev_action = torch.zeros(
+                (batch_size, self._num_actions),
+                device=self._device,
+                dtype=embed.dtype,
             )
-            # prev_action.requires_grad_()
-        # overwrite the prev_state only where is_first=True
-        elif torch.sum(is_first) > 0:
-            is_first = is_first[:, None]
-            prev_action *= 1.0 - is_first
-            init_state = self.initial(len(is_first))
+
+        elif torch.any(is_first_bool):
+            # reset mask: [B, 1]
+            reset = is_first_bool[:, None].to(embed.dtype)
+
+            # 关键修正：
+            # 原来是 prev_action *= 1.0 - is_first
+            # 这里改成非原地操作，避免 autograd version mismatch。
+            prev_action = prev_action.to(embed.device, dtype=embed.dtype)
+            prev_action = prev_action * (1.0 - reset)
+
+            init_state = self.initial(batch_size)
+
+            new_prev_state = {}
             for key, val in prev_state.items():
-                is_first_r = torch.reshape(
-                    is_first,
-                    is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+                reset_r = torch.reshape(
+                    reset,
+                    reset.shape + (1,) * (len(val.shape) - len(reset.shape)),
                 )
-                prev_state[key] = (
-                    val * (1.0 - is_first_r) + init_state[key] * is_first_r
+
+                init_val = init_state[key].to(device=val.device, dtype=val.dtype)
+
+                # 不要写 prev_state[key] = ... 原地覆盖旧 state，
+                # 构造一个新的 state 字典更安全。
+                new_prev_state[key] = (
+                    val * (1.0 - reset_r)
+                    + init_val * reset_r
                 )
+
+            prev_state = new_prev_state
+
+        else:
+            # 没有 reset，也要确保 dtype/device 一致。
+            prev_action = prev_action.to(embed.device, dtype=embed.dtype)
 
         prior = self.img_step(prev_state, prev_action)
+
         x = torch.cat([prior["deter"], embed], -1)
-        # (batch_size, prior_deter + embed) -> (batch_size, hidden)
         x = self._obs_out_layers(x)
-        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
+
         stats = self._suff_stats_layer("obs", x)
+
         if sample:
             stoch = self.get_dist(stats).sample()
         else:
             stoch = self.get_dist(stats).mode()
-        post = {"stoch": stoch, "deter": prior["deter"], **stats}
+
+        post = {
+            "stoch": stoch,
+            "deter": prior["deter"],
+            **stats,
+        }
+
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
@@ -731,18 +768,39 @@ class ObjectCentricConvEncoder(nn.Module):
         affordance_slot = torch.einsum("bk,bkd->bd", tao_weights, slots)
         task_slot = affordance_slot if not self.tao_include_task else torch.einsum(
             "bk,bkd->bd", tao_weights, slots
-)
+        )
 
 
         pieces = []
+
         if self.tao_include_flat:
-            pieces.append(slots.reshape(b, self.num_slots * self.slot_dim))
+            # Residual TAO-gated flat slots.
+            # 保留完整 slots，但让 TAO 认为重要的 slots 在 RSSM 输入中更突出。
+            #
+            # tao_weights: [B, K]
+            # slots:       [B, K, D]
+            #
+            # 乘以 num_slots 是为了保持平均尺度：
+            # 如果 tao_weights 完全均匀，slot_gate = 1，不改变原始 flat slots。
+            slot_gate = self.num_slots * tao_weights.detach()
+            slot_gate = slot_gate.clamp(0.0, 3.0)
+
+            # 残差门控，避免低权重 slots 被完全压死。
+            gate_strength = 0.5
+            slot_gate = (1.0 - gate_strength) + gate_strength * slot_gate
+
+            weighted_slots = slots * slot_gate.unsqueeze(-1)
+            pieces.append(weighted_slots.reshape(b, self.num_slots * self.slot_dim))
+
         if self.tao_include_global:
             pieces.append(global_slot)
+
         if self.tao_include_affordance:
             pieces.extend([affordance_slot, aff_scores_norm])
+
         if self.tao_include_task:
             pieces.extend([task_slot, task_scores])
+
         out = torch.cat(pieces, dim=-1)
         out = out.reshape(lead_shape + [self.outdim])
 
@@ -785,23 +843,63 @@ class ObjectCentricConvEncoder(nn.Module):
         return losses
 
     def affordance_alignment_loss(self):
-        if not hasattr(self, "last_attn") or self.last_attn is None:
-            return None
-        if not hasattr(self, "last_affordance") or self.last_affordance is None:
-            return None
+        """
+        Align TAO-selected slot attention coverage with affordance map.
 
+        Compared with all-slot coverage alignment, this version only requires
+        the slots selected by TAO to cover high-affordance regions.
+        This is more consistent with AGOC-Dyn / AGOC-Dyn-SSM.
+        """
         attn = self.last_attn
         aff = self.last_affordance
 
-        # attn: [B*T, K, N]
-        # aff:  [B*T, N]
-        slot_cover = attn.sum(dim=1)
+        if attn is None or aff is None:
+            return None
+
+        # attn: [B, K, N]
+        # aff:  [B, N]
+        attn = attn.float()
+        aff = aff.float().clamp(0.0, 1.0)
+
+        # 如果 heatmap 全 0，避免归一化出问题。
+        aff_sum = aff.sum(dim=-1, keepdim=True)
+
+        # 轻微 sharpen affordance target。
+        # 如果不 sharpen，4x4 heatmap 很容易接近均匀，loss 会长期接近 log(16)。
+        aff_target = aff ** 2
+        aff_target = aff_target / (aff_target.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # 如果某些样本 heatmap 近似全 0，则退化为原始 aff 的安全归一化。
+        aff_safe = aff / (aff_sum + 1e-8)
+        aff_target = torch.where(
+            aff_sum > 1e-6,
+            aff_target,
+            torch.ones_like(aff_target) / aff_target.shape[-1],
+        )
+
+        tao_weights = getattr(self, "last_tao_weights", None)
+
+        if tao_weights is not None:
+            # tao_weights: [B, K]
+            # detach 是为了让这个 loss 主要训练 attention 覆盖，
+            # 而不是通过改变 tao_weights 来投机降低 loss。
+            w = tao_weights.detach().float()
+
+            # TAO-selected coverage: [B, N]
+            slot_cover = torch.einsum("bk,bkn->bn", w, attn)
+        else:
+            # fallback: 如果没有 TAO，就用所有 slots 的平均 coverage。
+            slot_cover = attn.mean(dim=1)
+
+        slot_cover = slot_cover.clamp_min(1e-8)
         slot_cover = slot_cover / (slot_cover.sum(dim=-1, keepdim=True) + 1e-8)
 
-        aff = aff.clamp(0.0, 1.0)
-        aff = aff / (aff.sum(dim=-1, keepdim=True) + 1e-8)
+        loss = -(aff_target * torch.log(slot_cover + 1e-8)).sum(dim=-1)
 
-        loss = -(aff * torch.log(slot_cover + 1e-8)).sum(dim=-1)
+        # 如果 heatmap 全 0，这个 loss 没有意义，直接置 0。
+        valid = (aff_sum.squeeze(-1) > 1e-6).float()
+        loss = loss * valid
+
         return loss
 
 
