@@ -822,23 +822,63 @@ class ObjectCentricConvEncoder(nn.Module):
         return losses
 
     def affordance_alignment_loss(self):
-        if not hasattr(self, "last_attn") or self.last_attn is None:
-            return None
-        if not hasattr(self, "last_affordance") or self.last_affordance is None:
-            return None
+        """
+        Align TAO-selected slot attention coverage with affordance map.
 
+        Compared with all-slot coverage alignment, this version only requires
+        the slots selected by TAO to cover high-affordance regions.
+        This is more consistent with AGOC-Dyn / AGOC-Dyn-SSM.
+        """
         attn = self.last_attn
         aff = self.last_affordance
 
-        # attn: [B*T, K, N]
-        # aff:  [B*T, N]
-        slot_cover = attn.sum(dim=1)
+        if attn is None or aff is None:
+            return None
+
+        # attn: [B, K, N]
+        # aff:  [B, N]
+        attn = attn.float()
+        aff = aff.float().clamp(0.0, 1.0)
+
+        # 如果 heatmap 全 0，避免归一化出问题。
+        aff_sum = aff.sum(dim=-1, keepdim=True)
+
+        # 轻微 sharpen affordance target。
+        # 如果不 sharpen，4x4 heatmap 很容易接近均匀，loss 会长期接近 log(16)。
+        aff_target = aff ** 2
+        aff_target = aff_target / (aff_target.sum(dim=-1, keepdim=True) + 1e-8)
+
+        # 如果某些样本 heatmap 近似全 0，则退化为原始 aff 的安全归一化。
+        aff_safe = aff / (aff_sum + 1e-8)
+        aff_target = torch.where(
+            aff_sum > 1e-6,
+            aff_target,
+            torch.ones_like(aff_target) / aff_target.shape[-1],
+        )
+
+        tao_weights = getattr(self, "last_tao_weights", None)
+
+        if tao_weights is not None:
+            # tao_weights: [B, K]
+            # detach 是为了让这个 loss 主要训练 attention 覆盖，
+            # 而不是通过改变 tao_weights 来投机降低 loss。
+            w = tao_weights.detach().float()
+
+            # TAO-selected coverage: [B, N]
+            slot_cover = torch.einsum("bk,bkn->bn", w, attn)
+        else:
+            # fallback: 如果没有 TAO，就用所有 slots 的平均 coverage。
+            slot_cover = attn.mean(dim=1)
+
+        slot_cover = slot_cover.clamp_min(1e-8)
         slot_cover = slot_cover / (slot_cover.sum(dim=-1, keepdim=True) + 1e-8)
 
-        aff = aff.clamp(0.0, 1.0)
-        aff = aff / (aff.sum(dim=-1, keepdim=True) + 1e-8)
+        loss = -(aff_target * torch.log(slot_cover + 1e-8)).sum(dim=-1)
 
-        loss = -(aff * torch.log(slot_cover + 1e-8)).sum(dim=-1)
+        # 如果 heatmap 全 0，这个 loss 没有意义，直接置 0。
+        valid = (aff_sum.squeeze(-1) > 1e-6).float()
+        loss = loss * valid
+
         return loss
 
 
