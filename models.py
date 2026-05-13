@@ -129,7 +129,7 @@ class WorldModel(nn.Module):
             name="Jump",
         )
         '''
-        '''
+        
         self.heads["intrinsic"] = networks.MLP(
             feat_size,
             (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
@@ -142,7 +142,7 @@ class WorldModel(nn.Module):
             device=config.device,
             name="Intrinsic",
         )
-        '''
+        
         '''
         self.heads["jumping_steps"] = networks.MLP(
             feat_size * 2,
@@ -195,7 +195,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
             #jump=config.jump_head["loss_scale"],
-            #intrinsic=config.intrinsic_head["loss_scale"],
+            intrinsic=config.intrinsic_head["loss_scale"],
             #jumping_steps=config.jumping_steps_head["loss_scale"],
             #accumulated_reward=config.accumulated_reward_head["loss_scale"],
         )
@@ -707,6 +707,9 @@ class WorldModel(nn.Module):
         # 'is_terminal' is necesarry to train end_head
         assert "is_terminal" in obs
 
+        if "intrinsic" not in obs:
+            obs["intrinsic"] = np.zeros_like(obs["reward"], dtype=np.float32)
+
         obs["end"] = torch.Tensor(obs["is_terminal"]).unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
@@ -1002,7 +1005,7 @@ class ImagBehavior(nn.Module):
         start,
         #start_zoomed,
         objective,
-        #intrinsic_objective,
+        intrinsic_objective,
         #jumping_steps_predictor,
         #accumulated_reward_predictor,
         #jump_indicator,
@@ -1023,7 +1026,10 @@ class ImagBehavior(nn.Module):
                 ) # [L, N, xx, xx]
 
                 reward = objective(imag_feat, imag_state, imag_action)
-                #intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                intrinsic_scale = getattr(self._config, "intrinsic_reward_scale", 1.0)
+                reward = reward + intrinsic_scale * intrinsic_reward
+
                 #reward += intrinsic_reward
 
 
@@ -1060,6 +1066,7 @@ class ImagBehavior(nn.Module):
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
+        metrics.update(tools.tensorstats(intrinsic_reward, "imag_intrinsic"))
 
         if self._config.actor["dist"] in ["onehot"]:
             metrics.update(
