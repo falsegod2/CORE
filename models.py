@@ -102,6 +102,18 @@ class WorldModel(nn.Module):
             name="Reward",
         )
 
+        self.heads["intrinsic"] = networks.MLP(
+            feat_size,
+            (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
+            config.intrinsic_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist=config.intrinsic_head["dist"],
+            outscale=config.intrinsic_head["outscale"],
+            device=config.device,
+            name="Intrinsic",
+        )
 
         self.heads["end"] = networks.MLP(
             feat_size,
@@ -195,7 +207,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
             #jump=config.jump_head["loss_scale"],
-            #intrinsic=config.intrinsic_head["loss_scale"],
+            intrinsic=config.intrinsic_head["loss_scale"],
             #jumping_steps=config.jumping_steps_head["loss_scale"],
             #accumulated_reward=config.accumulated_reward_head["loss_scale"],
         )
@@ -707,6 +719,9 @@ class WorldModel(nn.Module):
         # 'is_terminal' is necesarry to train end_head
         assert "is_terminal" in obs
 
+        if "intrinsic" not in obs:
+            obs["intrinsic"] = np.zeros_like(obs["reward"], dtype=np.float32)
+
         obs["end"] = torch.Tensor(obs["is_terminal"]).unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
@@ -1002,7 +1017,7 @@ class ImagBehavior(nn.Module):
         start,
         #start_zoomed,
         objective,
-        #intrinsic_objective,
+        intrinsic_objective,
         #jumping_steps_predictor,
         #accumulated_reward_predictor,
         #jump_indicator,
@@ -1023,9 +1038,9 @@ class ImagBehavior(nn.Module):
                 ) # [L, N, xx, xx]
 
                 reward = objective(imag_feat, imag_state, imag_action)
-                #intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                #reward += intrinsic_reward
-
+                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                intrinsic_scale = getattr(self._config, "intrinsic_reward_scale", 1.0)
+                reward = reward + intrinsic_scale * intrinsic_reward
 
                 actor_ent = self.actor(imag_feat).entropy() 
 
