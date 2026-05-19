@@ -52,7 +52,7 @@ defaults:
   units: 1024
   act: 'SiLU'
   norm: True
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
+  grad_heads: ['decoder', 'reward', 'end']
 
   encoder:
     mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward'
@@ -110,7 +110,7 @@ defaults:
   intrinsic_head:
     layers: 5
     dist: 'symlog_disc'
-    loss_scale: 1.0
+    loss_scale: 0.0
     outscale: 0.0
 
   end_head:
@@ -192,7 +192,7 @@ defaults:
   imag_gradient: 'reinforce'
   imag_gradient_mix: 0.0
   eval_state_mean: False
-  intrinsic_reward_scale: 1.0
+  intrinsic_reward_scale: 0.0
 
   # ===== Exploration =====
   expl_behavior: 'greedy'
