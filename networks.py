@@ -508,19 +508,24 @@ class ObjectDynamics(nn.Module):
 
 class ObjectSSMDynamics(nn.Module):
     """
-    Dyn-O-inspired shared object SSM on the dynamic subspace of slots.
+    AGOC-Gate Object-RSSM branch.
 
-    Compared with the previous version that predicts the full slot vector, this
-    module first projects each slot into a smaller dynamic subspace and only
-    predicts this dynamic component. This follows the Dyn-O observation that not
-    every factor in an object slot should be action-predictable; static visual
-    appearance and context should not dominate the dynamics loss.
+    This module is intentionally not a set of K independent RSSMs. Instead, it
+    follows the Dyn-O-style object-stream idea: every slot owns its own recurrent
+    object state, but all slots share one transition/posterior/prior model. A
+    lightweight interaction transformer lets object streams and the action token
+    communicate before the shared RSSM transition.
+
+    The branch operates only on a dynamic subspace of each slot. Static visual
+    appearance and background context stay in the original AGOC-Gate embedding;
+    this branch models action-conditioned object dynamics.
 
     Input:
         slots_seq:  [B, T, K, slot_dim]
         action_seq: [B, T, A]
     Output:
         pred_next_dyn: [B, T, K, dyn_dim]
+        optional KL:   [B, T, K]
     """
 
     def __init__(
@@ -531,13 +536,14 @@ class ObjectSSMDynamics(nn.Module):
         num_heads=4,
         num_layers=1,
         dyn_dim=64,
+        min_std=0.1,
     ):
         super().__init__()
         self.slot_dim = slot_dim
         self.dyn_dim = dyn_dim
+        self.min_std = min_std
 
-        # Dynamic subspace projection. Only this part is used by the object SSM
-        # auxiliary prediction loss.
+        # Dynamic subspace projection. Object-RSSM only models this subspace.
         self.dyn_encoder = nn.Sequential(
             nn.LayerNorm(slot_dim),
             nn.Linear(slot_dim, dyn_dim),
@@ -557,8 +563,31 @@ class ObjectSSMDynamics(nn.Module):
         )
         self.interaction = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-        # Shared recurrent state-space transition for all object slots.
-        self.ssm_cell = nn.GRUCell(dyn_dim, dyn_dim)
+        # Shared deterministic transition for all object streams.
+        self.rssm_cell = nn.GRUCell(dyn_dim, dyn_dim)
+
+        # Prior p(z_t^k | h_t^k) and posterior q(z_t^k | h_t^k, x_t^k).
+        self.prior_stats = nn.Sequential(
+            nn.LayerNorm(dyn_dim),
+            nn.Linear(dyn_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * dyn_dim),
+        )
+        self.post_stats = nn.Sequential(
+            nn.LayerNorm(2 * dyn_dim),
+            nn.Linear(2 * dyn_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * dyn_dim),
+        )
+
+        # Object feature used as context for the global RSSM and as the basis for
+        # next-dynamic prediction.
+        self.feat_proj = nn.Sequential(
+            nn.LayerNorm(2 * dyn_dim),
+            nn.Linear(2 * dyn_dim, dyn_dim),
+            nn.SiLU(),
+            nn.Linear(dyn_dim, dyn_dim),
+        )
 
         self.pred = nn.Sequential(
             nn.LayerNorm(dyn_dim),
@@ -577,42 +606,172 @@ class ObjectSSMDynamics(nn.Module):
         """
         return self.dyn_encoder(slots)
 
-    def forward(self, slots_seq, action_seq):
+    def _stats(self, raw):
+        mean, std_raw = torch.chunk(raw, 2, dim=-1)
+        std = F.softplus(std_raw + 0.5) + self.min_std
+        return mean, std
+
+    def _kl_normal(self, post_mean, post_std, prior_mean, prior_std):
+        # KL(q || p), returned per slot: [B, K]
+        var_ratio = (post_std / prior_std).pow(2)
+        t1 = ((post_mean - prior_mean) / prior_std).pow(2)
+        kl = 0.5 * (var_ratio + t1 - 1.0 - torch.log(var_ratio + 1e-8))
+        return kl.mean(dim=-1)
+
+    def _zero_state(self, batch_size, num_slots, device, dtype):
+        h = torch.zeros(batch_size, num_slots, self.dyn_dim, device=device, dtype=dtype)
+        z = torch.zeros(batch_size, num_slots, self.dyn_dim, device=device, dtype=dtype)
+        return {"h": h, "z": z}
+
+    def _normalize_state(self, state, batch_size, num_slots, device, dtype):
+        if state is None:
+            return self._zero_state(batch_size, num_slots, device, dtype)
+        if isinstance(state, dict):
+            h = state.get("h", None)
+            z = state.get("z", None)
+            if h is None:
+                h = torch.zeros(batch_size, num_slots, self.dyn_dim, device=device, dtype=dtype)
+            else:
+                h = h.to(device=device, dtype=dtype)
+            if z is None:
+                z = torch.zeros_like(h)
+            else:
+                z = z.to(device=device, dtype=dtype)
+            return {"h": h, "z": z}
+        # Backward compatibility with v2 checkpoints where state was only h.
+        h = state.to(device=device, dtype=dtype)
+        z = torch.zeros_like(h)
+        return {"h": h, "z": z}
+
+    def _apply_reset(self, state, reset):
+        if reset is None:
+            return state
+        reset = reset.float()
+        if reset.ndim == 1:
+            reset = reset[:, None, None]
+        elif reset.ndim == 2:
+            reset = reset[:, :, None]
+        state = {
+            "h": state["h"] * (1.0 - reset),
+            "z": state["z"] * (1.0 - reset),
+        }
+        return state
+
+    def _transition(self, dyn_i, action_i, state):
+        """One shared Object-RSSM transition.
+
+        Args:
+            dyn_i:    [B, K, dyn_dim], current observed dynamic slot component.
+            action_i: [B, A], action conditioning obs_t -> obs_{t+1}.
+            state:    dict with h,z, each [B, K, dyn_dim].
+        Returns:
+            new_state, pred_next_dyn, kl_per_slot, object_feat
+        """
+        b, k, dd = dyn_i.shape
+        h_prev, z_prev = state["h"], state["z"]
+
+        action_token = self.action_proj(action_i).unsqueeze(1)  # [B, 1, dyn_dim]
+
+        # Slots communicate through the previous stochastic object state and an
+        # action token. This is the object-stream analogue of a shared RSSM prior.
+        x = torch.cat([z_prev, action_token], dim=1)             # [B, K+1, dyn_dim]
+        x = self.interaction(x)
+        obj_input = x[:, :k]                                    # [B, K, dyn_dim]
+
+        h = self.rssm_cell(
+            obj_input.reshape(b * k, dd),
+            h_prev.reshape(b * k, dd),
+        ).reshape(b, k, dd)
+
+        prior_mean, prior_std = self._stats(self.prior_stats(h))
+        post_inp = torch.cat([h, dyn_i], dim=-1)
+        post_mean, post_std = self._stats(self.post_stats(post_inp))
+
+        # Use posterior mode for stability. The branch remains stochastic via KL,
+        # but avoids adding sampling noise to the global RSSM input.
+        z = post_mean
+        kl = self._kl_normal(post_mean, post_std, prior_mean, prior_std)
+
+        object_feat = self.feat_proj(torch.cat([h, z], dim=-1))
+        delta = self.pred(object_feat)
+        pred_next_dyn = dyn_i + delta
+
+        new_state = {"h": h, "z": z}
+        return new_state, pred_next_dyn, kl, object_feat
+
+    def context_sequence(self, slots_seq, action_seq, tao_weights=None, is_first=None, init_state=None):
+        """Run Object-RSSM over a sequence and return TAO-weighted context.
+
+        Args:
+            slots_seq:   [B, T, K, slot_dim]
+            action_seq:  [B, T, A]
+            tao_weights: [B, T, K] or None
+            is_first:    [B, T] or [B, T, 1]
+            init_state:  dict or None
+        Returns:
+            context_seq: [B, T, dyn_dim]
+            final_state: dict with h,z
+        """
+        b, t, k, d = slots_seq.shape
+        assert d == self.slot_dim, (d, self.slot_dim)
+
+        dyn_seq = self.encode_dynamic(slots_seq)
+        state = self._normalize_state(init_state, b, k, slots_seq.device, slots_seq.dtype)
+
+        contexts = []
+        for i in range(t):
+            reset_i = is_first[:, i] if is_first is not None else None
+            state = self._apply_reset(state, reset_i)
+            state, _, _, object_feat = self._transition(dyn_seq[:, i], action_seq[:, i], state)
+
+            if tao_weights is not None:
+                w = tao_weights[:, i].detach().to(dtype=object_feat.dtype)
+                context = torch.einsum("bk,bkd->bd", w, object_feat)
+            else:
+                context = object_feat.mean(dim=1)
+            contexts.append(context)
+
+        return torch.stack(contexts, dim=1), state
+
+    def step_context(self, slots, action, state=None, tao_weights=None, is_first=None):
+        """Online one-step Object-RSSM context update for Agent._policy()."""
+        b, k, d = slots.shape
+        assert d == self.slot_dim, (d, self.slot_dim)
+
+        dyn = self.encode_dynamic(slots)
+        state = self._normalize_state(state, b, k, slots.device, slots.dtype)
+        state = self._apply_reset(state, is_first)
+        state, _, _, object_feat = self._transition(dyn, action, state)
+
+        if tao_weights is not None:
+            w = tao_weights.detach().to(dtype=object_feat.dtype)
+            context = torch.einsum("bk,bkd->bd", w, object_feat)
+        else:
+            context = object_feat.mean(dim=1)
+        return context, state
+
+    def forward(self, slots_seq, action_seq, is_first=None, return_kl=False):
         # slots_seq:  [B, T, K, slot_dim]
         # action_seq: [B, T, A]
         b, t, k, d = slots_seq.shape
         assert d == self.slot_dim, (d, self.slot_dim)
 
-        dyn_seq = self.encode_dynamic(slots_seq)  # [B, T, K, dyn_dim]
-        dd = self.dyn_dim
-
-        h = torch.zeros(
-            b * k,
-            dd,
-            device=slots_seq.device,
-            dtype=slots_seq.dtype,
-        )
+        dyn_seq = self.encode_dynamic(slots_seq)
+        state = self._zero_state(b, k, slots_seq.device, slots_seq.dtype)
         preds = []
+        kls = []
 
         for i in range(t):
-            dyn_i = dyn_seq[:, i]          # [B, K, dyn_dim]
-            action_i = action_seq[:, i]    # [B, A]
+            reset_i = is_first[:, i] if is_first is not None else None
+            state = self._apply_reset(state, reset_i)
+            state, pred_next_dyn, kl, _ = self._transition(dyn_seq[:, i], action_seq[:, i], state)
+            preds.append(pred_next_dyn)
+            kls.append(kl)
 
-            action_token = self.action_proj(action_i).unsqueeze(1)  # [B, 1, dyn_dim]
-
-            # Object-object interaction plus action conditioning in dynamic space.
-            x = torch.cat([dyn_i, action_token], dim=1)             # [B, K+1, dyn_dim]
-            x = self.interaction(x)
-            obj_input = x[:, :k]                                    # [B, K, dyn_dim]
-
-            obj_input = obj_input.reshape(b * k, dd)
-            h = self.ssm_cell(obj_input, h)
-
-            # Residual prediction in dynamic space.
-            delta = self.pred(h).reshape(b, k, dd)
-            preds.append(dyn_i + delta)
-
-        return torch.stack(preds, dim=1)  # [B, T, K, dyn_dim]
+        pred_seq = torch.stack(preds, dim=1)  # [B, T, K, dyn_dim]
+        if return_kl:
+            return pred_seq, torch.stack(kls, dim=1)  # [B, T, K]
+        return pred_seq
 
 class ObjectCentricConvEncoder(nn.Module):
     """

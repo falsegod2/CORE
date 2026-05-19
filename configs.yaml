@@ -171,18 +171,29 @@ defaults:
   slot_diversity_scale: 0.03
   tao_entropy_scale: 0.0
 
-  # Dyn-O style shared object SSM auxiliary loss
+  # Dyn-O-inspired shared Object-RSSM branch.
+  # This is the self-contained AGOC-Gate-ObjectRSSM version:
+  # slots -> dynamic subspace -> shared per-slot Object-RSSM -> TAO-weighted context into RSSM.
   object_dyn_scale: 0.1
   # Warm up object dynamics to avoid suppressing early exploration.
   # 0 disables warmup; 200000 means linearly increase from 0 to object_dyn_scale in first 200k env steps.
   object_dyn_warmup: 200000
-  # Dynamic subspace dimension. The Object SSM predicts this subspace rather than full slots.
+  # Dynamic subspace dimension. Object-RSSM models this subspace rather than full slots.
   object_dyn_dim: 64
+  # Inject TAO-weighted Object-RSSM context into the RSSM observation embedding.
+  object_dyn_context: True
+  # Safer default: RSSM consumes object context, while Object-RSSM is mainly optimized by its own loss.
+  # Set False only after this stable version works.
+  object_dyn_context_detach: True
+  object_dyn_context_scale: 1.0
   object_dyn_aff_weight: 1.5
   object_dyn_match_temp: 0.2
   object_dyn_hidden: 256
   object_dyn_heads: 4
   object_dyn_layers: 1
+  # KL regularization for the Object-RSSM posterior/prior. Keep small to avoid overwhelming the main RSSM.
+  object_rssm_kl_scale: 0.05
+  object_rssm_kl_free: 0.0
 
   # ===== Behavior Learning =====
   discount: 0.997

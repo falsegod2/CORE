@@ -81,11 +81,20 @@ class LS_Imagine(nn.Module):
 
     def _policy(self, obs, state, training):
         if state is None:
-            latent = action = None
+            latent = action = obj_state = None
         else:
-            latent, action = state
+            # Backward compatible with older checkpoints / older policy states.
+            if len(state) == 2:
+                latent, action = state
+                obj_state = None
+            else:
+                latent, action, obj_state = state
         obs = self._wm.preprocess(obs)
-        embed = self._wm.encoder(obs)
+        embed, obj_state = self._wm.encode_with_object_context(
+            obs,
+            prev_action=action,
+            obj_state=obj_state,
+        )
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
@@ -107,7 +116,7 @@ class LS_Imagine(nn.Module):
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
         policy_output = {"action": action, "logprob": logprob}
-        state = (latent, action)
+        state = (latent, action, obj_state)
         return policy_output, state
 
     def _train(self, data):

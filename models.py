@@ -48,7 +48,28 @@ class WorldModel(nn.Module):
         self._config = config
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
-        self.embed_size = self.encoder.outdim
+
+        enc_cfg = config.encoder
+        slot_dim = enc_cfg["slot_dim"] if isinstance(enc_cfg, dict) else enc_cfg.slot_dim
+        use_slots = enc_cfg.get("use_slots", False) if isinstance(enc_cfg, dict) else getattr(enc_cfg, "use_slots", False)
+        object_dyn_dim = int(getattr(config, "object_dyn_dim", 64))
+
+        # AGOC-Gate-DynO v2: inject a TAO-weighted Object SSM context into the
+        # RSSM observation embedding. This makes the object dynamics state part
+        # of the control path instead of using Object SSM only as an auxiliary loss.
+        self._use_object_dyn_context = bool(getattr(config, "object_dyn_context", False)) and bool(use_slots)
+        self._object_dyn_context_dim = object_dyn_dim if self._use_object_dyn_context else 0
+        self.embed_size = self.encoder.outdim + self._object_dyn_context_dim
+
+        self.object_dynamics = networks.ObjectSSMDynamics(
+            slot_dim=slot_dim,
+            action_dim=config.num_actions,
+            hidden_dim=getattr(config, "object_dyn_hidden", 256),
+            num_heads=getattr(config, "object_dyn_heads", 4),
+            num_layers=getattr(config, "object_dyn_layers", 1),
+            dyn_dim=object_dyn_dim,
+        )
+
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -65,18 +86,6 @@ class WorldModel(nn.Module):
             config.num_actions,
             self.embed_size,
             config.device,
-        )
-
-        enc_cfg = config.encoder
-        slot_dim = enc_cfg["slot_dim"] if isinstance(enc_cfg, dict) else enc_cfg.slot_dim
-
-        self.object_dynamics = networks.ObjectSSMDynamics(
-            slot_dim=slot_dim,
-            action_dim=config.num_actions,
-            hidden_dim=getattr(config, "object_dyn_hidden", 256),
-            num_heads=getattr(config, "object_dyn_heads", 4),
-            num_layers=getattr(config, "object_dyn_layers", 1),
-            dyn_dim=getattr(config, "object_dyn_dim", 64),
         )
 
         self.heads = nn.ModuleDict()
@@ -420,6 +429,105 @@ class WorldModel(nn.Module):
             return post, None, context, metrics
     '''
 
+    def encode_with_object_context(self, obs, prev_action=None, obj_state=None):
+        """Encode observations and optionally append Object SSM context.
+
+        Training case:
+            obs contains [B, T, ...] tensors and usually obs["action"]. We run
+            Object SSM over the sequence and append a TAO-weighted object context
+            [B, T, object_dyn_dim] to the normal AGOC encoder embedding.
+
+        Online policy case:
+            obs contains [B, ...] tensors. We update the recurrent Object SSM
+            state with the previous action and append [B, object_dyn_dim].
+
+        Returns:
+            embed: augmented observation embedding for RSSM
+            new_obj_state: None for sequences; recurrent state for online policy
+        """
+        embed = self.encoder(obs)
+
+        if not self._use_object_dyn_context:
+            return embed, obj_state
+        if not hasattr(self.encoder, "_cnn") or not hasattr(self.encoder._cnn, "last_slots"):
+            return embed, obj_state
+
+        slots_flat = self.encoder._cnn.last_slots
+        tao_flat = getattr(self.encoder._cnn, "last_tao_weights", None)
+        if slots_flat is None:
+            return embed, obj_state
+
+        scale = float(getattr(self._config, "object_dyn_context_scale", 1.0))
+        detach_context = bool(getattr(self._config, "object_dyn_context_detach", True))
+        K = self.encoder._cnn.num_slots
+        D = self.encoder._cnn.slot_dim
+
+        if embed.ndim == 3:
+            # Training / video prediction: [B, T, E]
+            B, T = embed.shape[:2]
+            slots = slots_flat.reshape(B, T, K, D)
+            tao = tao_flat.reshape(B, T, K) if tao_flat is not None else None
+
+            if "action" in obs:
+                actions = obs["action"].detach().clone()
+            elif prev_action is not None:
+                actions = prev_action.detach().clone()
+            else:
+                actions = torch.zeros(
+                    B, T, self._config.num_actions,
+                    device=embed.device,
+                    dtype=embed.dtype,
+                )
+
+            is_first = obs.get("is_first", None)
+            obj_context, _ = self.object_dynamics.context_sequence(
+                slots,
+                actions,
+                tao_weights=tao,
+                is_first=is_first,
+                init_state=None,
+            )
+
+            if detach_context:
+                obj_context = obj_context.detach()
+            obj_context = scale * obj_context
+            return torch.cat([embed, obj_context], dim=-1), None
+
+        if embed.ndim == 2:
+            # Online policy: [B, E]
+            B = embed.shape[0]
+            slots = slots_flat.reshape(B, K, D)
+            tao = tao_flat.reshape(B, K) if tao_flat is not None else None
+
+            if prev_action is None:
+                action = torch.zeros(
+                    B, self._config.num_actions,
+                    device=embed.device,
+                    dtype=embed.dtype,
+                )
+            else:
+                action = prev_action.detach().clone().to(device=embed.device, dtype=embed.dtype)
+
+            is_first = obs.get("is_first", None)
+            obj_context, new_obj_state = self.object_dynamics.step_context(
+                slots,
+                action,
+                state=obj_state,
+                tao_weights=tao,
+                is_first=is_first,
+            )
+
+            if detach_context:
+                obj_context = obj_context.detach()
+                if isinstance(new_obj_state, dict):
+                    new_obj_state = {k: v.detach() for k, v in new_obj_state.items()}
+                else:
+                    new_obj_state = new_obj_state.detach()
+            obj_context = scale * obj_context
+            return torch.cat([embed, obj_context], dim=-1), new_obj_state
+
+        return embed, obj_state
+
     def _soft_slot_matching_loss(self, pred_slots, target_slots, temperature=0.1):
         """
         pred_slots:   [B, K, D]
@@ -448,7 +556,7 @@ class WorldModel(nn.Module):
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 
-                embed = self.encoder(data)
+                embed, _ = self.encode_with_object_context(data)
 
                 obj_dyn_loss = None
                 obj_dyn_pred_delta = None
@@ -473,10 +581,16 @@ class WorldModel(nn.Module):
                             # conditioning input, not gradients through actions.
                             actions_t = data["action"][:, :-1].detach().clone()  # [B, T-1, A]
 
-                            # Predict only the dynamic subspace of slots, instead of the
-                            # full slot vector. This reduces interference from static
-                            # appearance/context factors.
-                            pred_dyn_seq = self.object_dynamics(slots_t, actions_t)
+                            # AGOC-Gate-ObjectRSSM v3:
+                            # Each slot owns an object-RSSM state stream, while all
+                            # slots share one transition/posterior/prior model. The
+                            # branch predicts only the dynamic subspace of slots.
+                            pred_dyn_seq, obj_rssm_kl_seq = self.object_dynamics(
+                                slots_t,
+                                actions_t,
+                                is_first=data["is_first"][:, 1:],
+                                return_kl=True,
+                            )
                             target_dyn_seq = self.object_dynamics.encode_dynamic(slots_tp1).detach()
                             curr_dyn_seq = self.object_dynamics.encode_dynamic(slots_t).detach()
 
@@ -504,9 +618,20 @@ class WorldModel(nn.Module):
                             else:
                                 dyn_weight = torch.ones(BT, K, device=slots.device, dtype=slots.dtype)
 
-                            obj_dyn_loss = (per_slot_loss * dyn_weight * valid).sum() / (
+                            dyn_pred_loss = (per_slot_loss * dyn_weight * valid).sum() / (
                                 valid.sum() * K + 1e-8
                             )
+
+                            obj_kl = obj_rssm_kl_seq.reshape(BT, K)
+                            obj_kl_free = float(getattr(self._config, "object_rssm_kl_free", 0.0))
+                            if obj_kl_free > 0:
+                                obj_kl = torch.clamp(obj_kl, min=obj_kl_free)
+                            obj_rssm_kl_loss = (obj_kl * dyn_weight * valid).sum() / (
+                                valid.sum() * K + 1e-8
+                            )
+
+                            obj_rssm_kl_scale = float(getattr(self._config, "object_rssm_kl_scale", 0.05))
+                            obj_dyn_loss = dyn_pred_loss + obj_rssm_kl_scale * obj_rssm_kl_loss
 
                             with torch.no_grad():
                                 obj_dyn_pred_delta = (
@@ -642,10 +767,15 @@ class WorldModel(nn.Module):
         metrics["model_loss"] = to_np(torch.mean(model_loss))
         if obj_dyn_loss is not None:
             metrics["object_dyn_loss"] = to_np(obj_dyn_loss)
+            if "dyn_pred_loss" in locals():
+                metrics["object_dyn_pred_loss"] = to_np(dyn_pred_loss)
+            if "obj_rssm_kl_loss" in locals():
+                metrics["object_rssm_kl_loss"] = to_np(obj_rssm_kl_loss)
         if obj_dyn_scale_current is not None:
             metrics["object_dyn_scale_current"] = obj_dyn_scale_current
         if obj_dyn_pred_delta is not None:
             metrics["object_dyn_pred_delta"] = to_np(obj_dyn_pred_delta)
+        metrics["object_dyn_context_enabled"] = float(self._use_object_dyn_context)
         if aff_loss is not None:
             metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
         if div_loss is not None:
@@ -749,7 +879,7 @@ class WorldModel(nn.Module):
 
     def video_pred(self, data):
         data = self.preprocess(data)
-        embed = self.encoder(data)
+        embed, _ = self.encode_with_object_context(data)
 
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
