@@ -113,7 +113,7 @@ class LS_Imagine(nn.Module):
     def _train(self, data):
         metrics = {}
         # 去掉 post_zoomed，只保留纯净的后验状态
-        post, _, context, mets = self._wm._train(data)
+        post, _, context, mets = self._wm._train(data, self._step)
         metrics.update(mets)
 
         def reward(f, s, a):

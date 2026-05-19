@@ -508,17 +508,19 @@ class ObjectDynamics(nn.Module):
 
 class ObjectSSMDynamics(nn.Module):
     """
-    Dyn-O style shared object SSM with action-conditioned object interaction.
+    Dyn-O-inspired shared object SSM on the dynamic subspace of slots.
 
-    This module is used as an auxiliary world-model objective. It does not
-    provide extra reward. It encourages AGOC slots to be temporally predictable
-    under actions.
+    Compared with the previous version that predicts the full slot vector, this
+    module first projects each slot into a smaller dynamic subspace and only
+    predicts this dynamic component. This follows the Dyn-O observation that not
+    every factor in an object slot should be action-predictable; static visual
+    appearance and context should not dominate the dynamics loss.
 
     Input:
-        slots_seq:  [B, T, K, D]
+        slots_seq:  [B, T, K, slot_dim]
         action_seq: [B, T, A]
     Output:
-        pred_next_slots: [B, T, K, D]
+        pred_next_dyn: [B, T, K, dyn_dim]
     """
 
     def __init__(
@@ -528,13 +530,25 @@ class ObjectSSMDynamics(nn.Module):
         hidden_dim=256,
         num_heads=4,
         num_layers=1,
+        dyn_dim=64,
     ):
         super().__init__()
         self.slot_dim = slot_dim
-        self.action_proj = nn.Linear(action_dim, slot_dim)
+        self.dyn_dim = dyn_dim
+
+        # Dynamic subspace projection. Only this part is used by the object SSM
+        # auxiliary prediction loss.
+        self.dyn_encoder = nn.Sequential(
+            nn.LayerNorm(slot_dim),
+            nn.Linear(slot_dim, dyn_dim),
+            nn.SiLU(),
+            nn.Linear(dyn_dim, dyn_dim),
+        )
+
+        self.action_proj = nn.Linear(action_dim, dyn_dim)
 
         layer = nn.TransformerEncoderLayer(
-            d_model=slot_dim,
+            d_model=dyn_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             batch_first=True,
@@ -543,51 +557,62 @@ class ObjectSSMDynamics(nn.Module):
         )
         self.interaction = nn.TransformerEncoder(layer, num_layers=num_layers)
 
-        # A shared recurrent state-space transition for all object slots.
-        # This is a lightweight SSM; it can later be replaced by Mamba/S4.
-        self.ssm_cell = nn.GRUCell(slot_dim, slot_dim)
+        # Shared recurrent state-space transition for all object slots.
+        self.ssm_cell = nn.GRUCell(dyn_dim, dyn_dim)
 
         self.pred = nn.Sequential(
-            nn.LayerNorm(slot_dim),
-            nn.Linear(slot_dim, hidden_dim),
+            nn.LayerNorm(dyn_dim),
+            nn.Linear(dyn_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, slot_dim),
+            nn.Linear(hidden_dim, dyn_dim),
         )
 
         self.apply(tools.weight_init)
 
+    def encode_dynamic(self, slots):
+        """Project full slots to the dynamic subspace.
+
+        slots can be [B, T, K, D] or [B, K, D]. The output keeps the leading
+        dimensions and replaces D by dyn_dim.
+        """
+        return self.dyn_encoder(slots)
+
     def forward(self, slots_seq, action_seq):
-        # slots_seq:  [B, T, K, D]
+        # slots_seq:  [B, T, K, slot_dim]
         # action_seq: [B, T, A]
         b, t, k, d = slots_seq.shape
         assert d == self.slot_dim, (d, self.slot_dim)
 
+        dyn_seq = self.encode_dynamic(slots_seq)  # [B, T, K, dyn_dim]
+        dd = self.dyn_dim
+
         h = torch.zeros(
             b * k,
-            d,
+            dd,
             device=slots_seq.device,
             dtype=slots_seq.dtype,
         )
         preds = []
 
         for i in range(t):
-            slots_i = slots_seq[:, i]      # [B, K, D]
+            dyn_i = dyn_seq[:, i]          # [B, K, dyn_dim]
             action_i = action_seq[:, i]    # [B, A]
 
-            action_token = self.action_proj(action_i).unsqueeze(1)  # [B, 1, D]
+            action_token = self.action_proj(action_i).unsqueeze(1)  # [B, 1, dyn_dim]
 
-            # Object-object interaction plus action conditioning.
-            x = torch.cat([slots_i, action_token], dim=1)           # [B, K+1, D]
+            # Object-object interaction plus action conditioning in dynamic space.
+            x = torch.cat([dyn_i, action_token], dim=1)             # [B, K+1, dyn_dim]
             x = self.interaction(x)
-            obj_input = x[:, :k]                                    # [B, K, D]
+            obj_input = x[:, :k]                                    # [B, K, dyn_dim]
 
-            obj_input = obj_input.reshape(b * k, d)
+            obj_input = obj_input.reshape(b * k, dd)
             h = self.ssm_cell(obj_input, h)
 
-            delta = self.pred(h).reshape(b, k, d)
-            preds.append(slots_i + delta)
+            # Residual prediction in dynamic space.
+            delta = self.pred(h).reshape(b, k, dd)
+            preds.append(dyn_i + delta)
 
-        return torch.stack(preds, dim=1)
+        return torch.stack(preds, dim=1)  # [B, T, K, dyn_dim]
 
 class ObjectCentricConvEncoder(nn.Module):
     """

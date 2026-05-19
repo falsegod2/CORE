@@ -76,6 +76,7 @@ class WorldModel(nn.Module):
             hidden_dim=getattr(config, "object_dyn_hidden", 256),
             num_heads=getattr(config, "object_dyn_heads", 4),
             num_layers=getattr(config, "object_dyn_layers", 1),
+            dyn_dim=getattr(config, "object_dyn_dim", 64),
         )
 
         self.heads = nn.ModuleDict()
@@ -214,7 +215,7 @@ class WorldModel(nn.Module):
 
 
     '''原版的 _train 为了处理 data_zoomed，写了大量的 if zoomed_num > 0: 分支和张量拼接操作。
-    def _train(self, data_origin):
+    def _train(self, data_origin, step=None):
         
         data = self.preprocess(data_origin, zoomed=False)
         data_zoomed = self.preprocess(data_origin, zoomed=True)
@@ -440,7 +441,7 @@ class WorldModel(nn.Module):
         loss = ((pred_slots - matched_target) ** 2).mean(dim=-1)
         return loss
 
-    def _train(self, data_origin):
+    def _train(self, data_origin, step=None):
         
         data = self.preprocess(data_origin)
 
@@ -466,13 +467,23 @@ class WorldModel(nn.Module):
                         if T > 1:
                             slots_t = slots[:, :-1]              # [B, T-1, K, D]
                             slots_tp1 = slots[:, 1:]             # [B, T-1, K, D]
-                            actions_t = data["action"][:, :-1]    # [B, T-1, A]
 
-                            pred_slots_seq = self.object_dynamics(slots_t, actions_t)
+                            # Do not share storage with data["action"], because RSSM may
+                            # mask/reset actions. The object SSM only needs actions as
+                            # conditioning input, not gradients through actions.
+                            actions_t = data["action"][:, :-1].detach().clone()  # [B, T-1, A]
+
+                            # Predict only the dynamic subspace of slots, instead of the
+                            # full slot vector. This reduces interference from static
+                            # appearance/context factors.
+                            pred_dyn_seq = self.object_dynamics(slots_t, actions_t)
+                            target_dyn_seq = self.object_dynamics.encode_dynamic(slots_tp1).detach()
+                            curr_dyn_seq = self.object_dynamics.encode_dynamic(slots_t).detach()
 
                             BT = B * (T - 1)
-                            pred_slots = pred_slots_seq.reshape(BT, K, D)
-                            target_slots = slots_tp1.reshape(BT, K, D)
+                            DynD = pred_dyn_seq.shape[-1]
+                            pred_slots = pred_dyn_seq.reshape(BT, K, DynD)
+                            target_slots = target_dyn_seq.reshape(BT, K, DynD)
 
                             per_slot_loss = self._soft_slot_matching_loss(
                                 pred_slots,
@@ -499,7 +510,7 @@ class WorldModel(nn.Module):
 
                             with torch.no_grad():
                                 obj_dyn_pred_delta = (
-                                    pred_slots - slots_t.reshape(BT, K, D)
+                                    pred_slots - curr_dyn_seq.reshape(BT, K, DynD)
                                 ).norm(dim=-1).mean()
 
                 object_aux = {}
@@ -591,8 +602,16 @@ class WorldModel(nn.Module):
                     
                 model_loss = sum(scaled.values()) + kl_loss
 
+                obj_dyn_scale_current = None
                 if obj_dyn_loss is not None:
-                    model_loss = model_loss + self._config.object_dyn_scale * obj_dyn_loss
+                    base_obj_dyn_scale = float(getattr(self._config, "object_dyn_scale", 0.0))
+                    warmup_steps = float(getattr(self._config, "object_dyn_warmup", 0.0))
+                    if step is not None and warmup_steps > 0:
+                        warmup = min(1.0, max(0.0, float(step)) / warmup_steps)
+                    else:
+                        warmup = 1.0
+                    obj_dyn_scale_current = base_obj_dyn_scale * warmup
+                    model_loss = model_loss + obj_dyn_scale_current * obj_dyn_loss
                 if aff_loss is not None:
                     aff_loss = aff_loss.reshape(embed.shape[:2])
                     model_loss = model_loss + self._config.affordance_align_scale * aff_loss
@@ -623,6 +642,8 @@ class WorldModel(nn.Module):
         metrics["model_loss"] = to_np(torch.mean(model_loss))
         if obj_dyn_loss is not None:
             metrics["object_dyn_loss"] = to_np(obj_dyn_loss)
+        if obj_dyn_scale_current is not None:
+            metrics["object_dyn_scale_current"] = obj_dyn_scale_current
         if obj_dyn_pred_delta is not None:
             metrics["object_dyn_pred_delta"] = to_np(obj_dyn_pred_delta)
         if aff_loss is not None:
