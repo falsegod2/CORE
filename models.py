@@ -8,6 +8,7 @@ import random
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
 from torch import nn
+import torch.nn.functional as F
 
 import networks
 import tools
@@ -549,6 +550,75 @@ class WorldModel(nn.Module):
         loss = ((pred_slots - matched_target) ** 2).mean(dim=-1)
         return loss
 
+    def _contrastive_object_dynamics_loss(
+        self,
+        pred_dyn,
+        target_dyn,
+        tao_weights=None,
+        valid=None,
+        temperature=0.1,
+        use_tao=True,
+    ):
+        """Action-conditioned contrastive objective for object dynamics.
+
+        This is a C-SWM-style auxiliary objective adapted to AGOC slots. The
+        Object-RSSM prediction for the next dynamic object state should identify
+        the true next dynamic state among other states in the same batch. It does
+        not modify the reward objective; it only strengthens model-side object
+        dynamics learning.
+
+        Args:
+            pred_dyn:    [N, K, D] predicted next dynamic slots.
+            target_dyn:  [N, K, D] encoded true next dynamic slots.
+            tao_weights: [N, K] optional TAO weights from the current timestep.
+            valid:       [N, 1] optional boundary mask, 1 for valid transitions.
+            temperature: InfoNCE temperature.
+            use_tao:     if True, use TAO-weighted object context; otherwise mean.
+        Returns:
+            scalar contrastive loss and scalar accuracy.
+        """
+        if pred_dyn is None or target_dyn is None:
+            zero = torch.zeros((), device=self._config.device)
+            return zero, zero
+
+        if valid is not None:
+            mask = valid.reshape(-1) > 0.5
+            pred_dyn = pred_dyn[mask]
+            target_dyn = target_dyn[mask]
+            if tao_weights is not None:
+                tao_weights = tao_weights[mask]
+
+        # Need at least two samples to form non-trivial in-batch negatives.
+        if pred_dyn.shape[0] < 2:
+            zero = pred_dyn.sum() * 0.0
+            return zero, zero.detach()
+
+        if use_tao and tao_weights is not None:
+            w = tao_weights.detach().to(dtype=pred_dyn.dtype)
+            w = w / (w.sum(dim=-1, keepdim=True) + 1e-8)
+            pred_ctx = torch.einsum("nk,nkd->nd", w, pred_dyn)
+            target_ctx = torch.einsum("nk,nkd->nd", w, target_dyn.detach())
+        else:
+            pred_ctx = pred_dyn.mean(dim=1)
+            target_ctx = target_dyn.detach().mean(dim=1)
+
+        pred_ctx = F.normalize(pred_ctx, dim=-1)
+        target_ctx = F.normalize(target_ctx, dim=-1)
+        temp = max(float(temperature), 1e-4)
+        logits = torch.matmul(pred_ctx, target_ctx.t()) / temp
+        labels = torch.arange(logits.shape[0], device=logits.device)
+
+        # Symmetric InfoNCE: prediction -> target and target -> prediction. The
+        # second term makes the object state space less collapsed without adding
+        # any reward-side shaping.
+        loss_forward = F.cross_entropy(logits, labels)
+        loss_backward = F.cross_entropy(logits.t(), labels)
+        loss = 0.5 * (loss_forward + loss_backward)
+
+        with torch.no_grad():
+            acc = (logits.argmax(dim=-1) == labels).float().mean()
+        return loss, acc
+
     def _train(self, data_origin, step=None):
         
         data = self.preprocess(data_origin)
@@ -560,6 +630,8 @@ class WorldModel(nn.Module):
 
                 obj_dyn_loss = None
                 obj_dyn_pred_delta = None
+                obj_contrastive_loss = None
+                obj_contrastive_acc = None
 
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "last_slots"):
                     slots_flat = self.encoder._cnn.last_slots
@@ -622,6 +694,21 @@ class WorldModel(nn.Module):
                                 valid.sum() * K + 1e-8
                             )
 
+                            # C-SWM-style action-conditioned contrastive object
+                            # dynamics. The predicted next object context must
+                            # identify the true next object context among
+                            # in-batch negatives. This provides dense model-side
+                            # supervision without using dense intrinsic rewards.
+                            obj_contrastive_loss, obj_contrastive_acc = self._contrastive_object_dynamics_loss(
+                                pred_slots,
+                                target_slots,
+                                tao_weights=(tao_weights_seq[:, :-1].reshape(BT, K).detach()
+                                             if tao_weights_flat is not None else None),
+                                valid=valid,
+                                temperature=getattr(self._config, "object_contrastive_temp", 0.1),
+                                use_tao=getattr(self._config, "object_contrastive_use_tao", True),
+                            )
+
                             obj_kl = obj_rssm_kl_seq.reshape(BT, K)
                             obj_kl_free = float(getattr(self._config, "object_rssm_kl_free", 0.0))
                             if obj_kl_free > 0:
@@ -631,7 +718,12 @@ class WorldModel(nn.Module):
                             )
 
                             obj_rssm_kl_scale = float(getattr(self._config, "object_rssm_kl_scale", 0.05))
-                            obj_dyn_loss = dyn_pred_loss + obj_rssm_kl_scale * obj_rssm_kl_loss
+                            obj_contrastive_scale = float(getattr(self._config, "object_contrastive_scale", 0.0))
+                            obj_dyn_loss = (
+                                dyn_pred_loss
+                                + obj_rssm_kl_scale * obj_rssm_kl_loss
+                                + obj_contrastive_scale * obj_contrastive_loss
+                            )
 
                             with torch.no_grad():
                                 obj_dyn_pred_delta = (
@@ -771,6 +863,10 @@ class WorldModel(nn.Module):
                 metrics["object_dyn_pred_loss"] = to_np(dyn_pred_loss)
             if "obj_rssm_kl_loss" in locals():
                 metrics["object_rssm_kl_loss"] = to_np(obj_rssm_kl_loss)
+            if obj_contrastive_loss is not None:
+                metrics["object_contrastive_loss"] = to_np(obj_contrastive_loss)
+            if obj_contrastive_acc is not None:
+                metrics["object_contrastive_acc"] = to_np(obj_contrastive_acc)
         if obj_dyn_scale_current is not None:
             metrics["object_dyn_scale_current"] = obj_dyn_scale_current
         if obj_dyn_pred_delta is not None:

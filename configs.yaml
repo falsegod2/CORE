@@ -27,7 +27,7 @@ defaults:
   prefill: 2500
   reward_EMA: True
   eval_every: 10000
-  eval_episode_num: 3
+  eval_episode_num: 10
   log_every: 20000
   reset_every: 0
 
@@ -107,6 +107,7 @@ defaults:
     loss_scale: 1.0
     outscale: 0.0
 
+  # Kept for compatibility; disabled in the reward-shaping-free main method.
   intrinsic_head:
     layers: 5
     dist: 'symlog_disc'
@@ -188,6 +189,11 @@ defaults:
   object_dyn_context_scale: 1.0
   object_dyn_aff_weight: 1.5
   object_dyn_match_temp: 0.2
+  # Contrastive Object Dynamics: C-SWM-style in-batch InfoNCE on predicted
+  # next object dynamics. This is model-side supervision, not reward shaping.
+  object_contrastive_scale: 0.05
+  object_contrastive_temp: 0.1
+  object_contrastive_use_tao: True
   object_dyn_hidden: 256
   object_dyn_heads: 4
   object_dyn_layers: 1
