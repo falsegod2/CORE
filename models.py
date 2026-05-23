@@ -428,6 +428,67 @@ class WorldModel(nn.Module):
         loss = ((pred_slots - matched_target) ** 2).mean(dim=-1)
         return loss
 
+    def _contrastive_object_dynamics_loss(
+        self,
+        pred_slots_seq,
+        target_slots_seq,
+        tao_weights_seq=None,
+        valid_seq=None,
+        temperature=0.1,
+        use_tao=True,
+    ):
+        """C-SWM-style in-batch InfoNCE for AGOC-Gate object dynamics.
+
+        This is a model-side auxiliary objective, not intrinsic reward. It asks
+        whether the predicted next task-relevant object state can identify its
+        true next state among other next states in the batch.
+
+        pred_slots_seq:   [B, T, K, D], predicted next slots from ObjectSSMDynamics
+        target_slots_seq: [B, T, K, D], encoder slots at the true next step
+        tao_weights_seq:  [B, T, K], TAO weights at the current step
+        valid_seq:        [B, T], 1 for valid transitions, 0 across episode reset
+        return:           scalar loss, scalar top-1 accuracy
+        """
+        if pred_slots_seq is None or target_slots_seq is None:
+            device = next(self.parameters()).device
+            zero = torch.zeros((), device=device)
+            return zero, zero
+
+        if use_tao and tao_weights_seq is not None:
+            # Use TAO-selected object context to avoid relying on unstable slot ids.
+            weights = tao_weights_seq.detach()
+            weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+            pred_ctx = torch.einsum("btk,btkd->btd", weights, pred_slots_seq)
+            target_ctx = torch.einsum("btk,btkd->btd", weights, target_slots_seq)
+        else:
+            pred_ctx = pred_slots_seq.mean(dim=2)
+            target_ctx = target_slots_seq.mean(dim=2)
+
+        pred = pred_ctx.reshape(-1, pred_ctx.shape[-1])
+        target = target_ctx.reshape(-1, target_ctx.shape[-1]).detach()
+
+        if valid_seq is not None:
+            valid = valid_seq.reshape(-1).bool()
+            pred = pred[valid]
+            target = target[valid]
+
+        # Need at least two candidates for a non-trivial contrastive batch.
+        if pred.shape[0] < 2:
+            zero = pred.sum() * 0.0
+            return zero, zero.detach()
+
+        pred = torch.nn.functional.normalize(pred.float(), dim=-1)
+        target = torch.nn.functional.normalize(target.float(), dim=-1)
+        logits = pred @ target.t()
+        logits = logits / max(float(temperature), 1e-6)
+
+        labels = torch.arange(logits.shape[0], device=logits.device)
+        loss = torch.nn.functional.cross_entropy(logits, labels)
+
+        with torch.no_grad():
+            acc = (logits.argmax(dim=-1) == labels).float().mean()
+        return loss, acc
+
     def _train(self, data_origin):
         
         data = self.preprocess(data_origin)
@@ -439,6 +500,8 @@ class WorldModel(nn.Module):
 
                 obj_dyn_loss = None
                 obj_dyn_pred_delta = None
+                obj_contrastive_loss = None
+                obj_contrastive_acc = None
 
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "last_slots"):
                     slots_flat = self.encoder._cnn.last_slots
@@ -489,6 +552,23 @@ class WorldModel(nn.Module):
                                 obj_dyn_pred_delta = (
                                     pred_slots - slots_t.reshape(BT, K, D)
                                 ).norm(dim=-1).mean()
+
+                            # Gate-Contrastive Object Dynamics:
+                            # The predicted next TAO-relevant object state should identify
+                            # the true next object state among in-batch negatives.
+                            if getattr(self._config, "object_contrastive_scale", 0.0) > 0:
+                                tao_for_contrast = None
+                                if tao_weights_flat is not None:
+                                    tao_for_contrast = tao_weights_flat.reshape(B, T, K)[:, :-1]
+                                valid_seq = 1.0 - data["is_first"][:, 1:].float()
+                                obj_contrastive_loss, obj_contrastive_acc = self._contrastive_object_dynamics_loss(
+                                    pred_slots_seq,
+                                    slots_tp1,
+                                    tao_weights_seq=tao_for_contrast,
+                                    valid_seq=valid_seq,
+                                    temperature=getattr(self._config, "object_contrastive_temp", 0.1),
+                                    use_tao=getattr(self._config, "object_contrastive_use_tao", True),
+                                )
 
                 object_aux = {}
                 if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "object_aux_losses"):
@@ -581,6 +661,8 @@ class WorldModel(nn.Module):
 
                 if obj_dyn_loss is not None:
                     model_loss = model_loss + self._config.object_dyn_scale * obj_dyn_loss
+                if obj_contrastive_loss is not None:
+                    model_loss = model_loss + getattr(self._config, "object_contrastive_scale", 0.0) * obj_contrastive_loss
                 if aff_loss is not None:
                     aff_loss = aff_loss.reshape(embed.shape[:2])
                     model_loss = model_loss + self._config.affordance_align_scale * aff_loss
@@ -613,6 +695,10 @@ class WorldModel(nn.Module):
             metrics["object_dyn_loss"] = to_np(obj_dyn_loss)
         if obj_dyn_pred_delta is not None:
             metrics["object_dyn_pred_delta"] = to_np(obj_dyn_pred_delta)
+        if obj_contrastive_loss is not None:
+            metrics["object_contrastive_loss"] = to_np(obj_contrastive_loss)
+        if obj_contrastive_acc is not None:
+            metrics["object_contrastive_acc"] = to_np(obj_contrastive_acc)
         if aff_loss is not None:
             metrics["affordance_align_loss"] = to_np(torch.mean(aff_loss))
         if div_loss is not None:

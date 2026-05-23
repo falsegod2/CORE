@@ -324,19 +324,24 @@ def main(config): # config is namespace
 
     
     # make sure eval will be executed once after config.steps
-    while agent._step < config.steps + config.eval_every: 
+    while agent._step < config.steps + config.eval_every:
         logger.write()
-        
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False) 
+
+        eval_start_step = int(getattr(config, "eval_start_step", 0))
+        current_step = int(agent._step * config.action_repeat)
+
+        if current_step >= eval_start_step and config.eval_episode_num > 0:
+            print(
+                f"Start evaluation: "
+                f"step={current_step}, episodes={config.eval_episode_num}."
+            )
+            eval_policy = functools.partial(agent, training=False)
             tools.simulate(
                 eval_policy,
                 eval_envs,
                 eval_eps,
                 config.evaldir,
                 logger,
-                #step_calculator,
                 config.episode_max_steps,
                 config.discount,
                 is_eval=True,
@@ -346,6 +351,11 @@ def main(config): # config is namespace
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
                 logger.video("eval_openl", to_np(video_pred))
+        else:
+            print(
+                f"Skip evaluation: "
+                f"step={current_step}, eval_start_step={eval_start_step}."
+            )
 
         print("Start training.")
 

@@ -27,7 +27,9 @@ defaults:
   prefill: 2500
   reward_EMA: True
   eval_every: 10000
-  eval_episode_num: 3
+  eval_episode_num: 10
+  eval_start_step: 200000
+
   log_every: 20000
   reset_every: 0
 
@@ -169,6 +171,15 @@ defaults:
   object_dyn_scale: 0.1
   object_dyn_aff_weight: 1.5
   object_dyn_match_temp: 0.2
+
+  # Gate-Contrastive Object Dynamics.
+  # This does not add intrinsic reward. It only regularizes the AGOC object dynamics branch:
+  # the predicted next TAO-relevant object state must identify the true next object state
+  # among in-batch negatives. Start small because AGOC-Gate is already a strong base.
+  object_contrastive_scale: 0.03
+  object_contrastive_temp: 0.1
+  object_contrastive_use_tao: True
+
   object_dyn_hidden: 256
   object_dyn_heads: 4
   object_dyn_layers: 1
