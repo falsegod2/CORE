@@ -192,7 +192,7 @@ class WorldModel(nn.Module):
             name="End",
         )
 
-        # CORE2-no-intrinsic-short:
+        # CORE3-no-intrinsic-short:
         # Do not create intrinsic reward head or LS-Imagine long-distance/jumpy heads
         # when the corresponding switches are disabled. This keeps the method clean:
         # actor imagination uses only reward_head, and there is no jump / accumulated reward branch.
@@ -281,13 +281,14 @@ class WorldModel(nn.Module):
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
             # 增加创新点 2 的损失权重，建议初始设为 1.0 或 2.0
             affordance_s=getattr(config, "affordance_s_scale", 1.0),
+            interaction=getattr(config, "interaction_loss_scale", 1.0),
         )
 
     def _train(self, data_origin):
             # 1. 预处理原始数据和缩放数据
             data = self.preprocess(data_origin, zoomed=False)
 
-            # CORE2-no-intrinsic-short: disable LS-Imagine long-distance/zoomed branch.
+            # CORE3-no-intrinsic-short: disable LS-Imagine long-distance/zoomed branch.
             # We still keep heatmap reconstruction and CORE2 representation losses
             # (inverse dynamics + affordance_s), but do not train jump / zoomed heads.
             if getattr(self._config, "disable_long_branch", False):
@@ -335,6 +336,17 @@ class WorldModel(nn.Module):
                     preds_s = self.heads["decoder"](feat_s_only)
                     loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
                     # --------------------------------------------
+
+                    # --- CORE3: reward-change interaction gate auxiliary loss ---
+                    # The long-distance branch is disabled in this variant, so the
+                    # gate is not used for jump decisions. Instead, it regularizes
+                    # the controllable branch to mark states near reward changes.
+                    interaction_score = self.dynamics.get_interaction_score(post)
+                    reward_diff = torch.abs(data["reward"][:, 1:] - data["reward"][:, :-1])
+                    reward_diff = torch.cat([torch.zeros_like(reward_diff[:, :1]), reward_diff], dim=1)
+                    interaction_target = (reward_diff > 0).float().unsqueeze(-1)
+                    loss_interaction = F.binary_cross_entropy(interaction_score, interaction_target)
+                    # ------------------------------------------------------------
 
                     # 3. 计算 KL 散度损失
                     kl_free = self._config.kl_free 
@@ -437,7 +449,8 @@ class WorldModel(nn.Module):
                     # 3. 汇总总损失
                     total_loss = torch.mean(model_loss) + \
                                 loss_inv * self._scales.get("inverse", 1.0) + \
-                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
+                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0) + \
+                                torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
 
                 # 统一执行优化
                 metrics = self._model_opt(total_loss, self.parameters())
@@ -446,6 +459,8 @@ class WorldModel(nn.Module):
             metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
             metrics["loss_inverse"] = to_np(loss_inv)
             metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
+            metrics["loss_interaction"] = to_np(torch.mean(loss_interaction))
+            metrics.update(tools.tensorstats(interaction_score, "interaction_score"))
             metrics["model_loss"] = to_np(total_loss)
             metrics["kl"] = to_np(torch.mean(kl_value_img))
             
@@ -595,7 +610,7 @@ class ImagBehavior(nn.Module):
             self._update_slow_target()
             metrics = {}
 
-            # CORE2-no-intrinsic-short:
+            # CORE3-no-intrinsic-short:
             # Remove LS-Imagine long-distance/jumpy imagination and train behavior with
             # ordinary short latent imagination. The reward is strictly reward_head(feat);
             # intrinsic_objective, jump heads, accumulated rewards are ignored.

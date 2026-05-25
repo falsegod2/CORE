@@ -62,9 +62,37 @@ class RSSM(nn.Module):
             nn.Linear(self._hidden, num_actions)
         )
 
+        # CORE3: interaction gate.
+        # It reads only controllable-branch features and predicts whether the
+        # current state is near a task-relevant interaction event.
+        self._interaction_gate = nn.Sequential(
+            nn.Linear(self._deter_s + stoch_size_s, self._hidden),
+            nn.LayerNorm(self._hidden, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
+            nn.Linear(self._hidden, 1),
+            nn.Sigmoid(),
+        )
+        self._interaction_gate.apply(tools.weight_init)
+
         if self._initial == "learned":
             self.W = torch.nn.Parameter(torch.zeros((1, self._deter), device=torch.device(self._device)), requires_grad=True)
         
+    def get_interaction_score(self, state):
+        """Predict an interaction probability from the controllable branch.
+
+        CORE3-no-intrinsic-short removes the long-distance/jumpy branch, so this
+        score is not used to gate jumpy imagination. It is still trained as an
+        auxiliary representation signal: states around reward changes should be
+        distinguishable in the controllable branch.
+        """
+        s_stoch = state["stoch_s"]
+        if self._discrete:
+            s_stoch = s_stoch.reshape(
+                list(s_stoch.shape[:-2]) + [self._stoch_s * self._discrete]
+            )
+        feat_s = torch.cat([s_stoch, state["deter_s"]], -1)
+        return self._interaction_gate(feat_s)
+
     def _make_layer(self, inp_dim, norm, act_fn):
         layers = [nn.Linear(inp_dim, self._hidden, bias=False)]
         if norm: layers.append(nn.LayerNorm(self._hidden, eps=1e-03))

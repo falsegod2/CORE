@@ -12,8 +12,9 @@ defaults:
   # ... 原有参数 ...
   inverse_loss_scale: 1.0      # 创新 1：逆动力学约束
   affordance_s_scale: 2.0      # 创新 2：可供性地图对齐约束 (建议设为 2.0 增强引导)
+  interaction_loss_scale: 1.0   # CORE3：reward-change interaction gate 辅助损失
 
-  # CORE2-no-intrinsic-short: disable reward-side intrinsic and LS-Imagine long-distance/jumpy branch.
+  # CORE3-no-intrinsic-short: disable reward-side intrinsic and LS-Imagine long-distance/jumpy branch.
   disable_intrinsic: True
   disable_long_branch: True
 
