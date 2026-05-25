@@ -192,57 +192,64 @@ class WorldModel(nn.Module):
             name="End",
         )
 
-        self.heads["jump"] = networks.MLP(
-            feat_size,
-            (),
-            config.jump_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist="binary",
-            outscale=config.jump_head["outscale"],
-            device=config.device,
-            name="Jump",
-        )
+        # CORE2-no-intrinsic-short:
+        # Do not create intrinsic reward head or LS-Imagine long-distance/jumpy heads
+        # when the corresponding switches are disabled. This keeps the method clean:
+        # actor imagination uses only reward_head, and there is no jump / accumulated reward branch.
+        if not getattr(config, "disable_long_branch", False):
+            self.heads["jump"] = networks.MLP(
+                feat_size,
+                (),
+                config.jump_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist="binary",
+                outscale=config.jump_head["outscale"],
+                device=config.device,
+                name="Jump",
+            )
 
-        self.heads["intrinsic"] = networks.MLP(
-            feat_size,
-            (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
-            config.intrinsic_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist=config.intrinsic_head["dist"],
-            outscale=config.intrinsic_head["outscale"],
-            device=config.device,
-            name="Intrinsic",
-        )
+        if not getattr(config, "disable_intrinsic", False):
+            self.heads["intrinsic"] = networks.MLP(
+                feat_size,
+                (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
+                config.intrinsic_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.intrinsic_head["dist"],
+                outscale=config.intrinsic_head["outscale"],
+                device=config.device,
+                name="Intrinsic",
+            )
 
-        self.heads["jumping_steps"] = networks.MLP(
-            feat_size * 2,
-            (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
-            config.jumping_steps_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist=config.jumping_steps_head["dist"],
-            outscale=config.jumping_steps_head["outscale"],
-            device=config.device,
-            name="jumping_steps",
-        )
+        if not getattr(config, "disable_long_branch", False):
+            self.heads["jumping_steps"] = networks.MLP(
+                feat_size * 2,
+                (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
+                config.jumping_steps_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.jumping_steps_head["dist"],
+                outscale=config.jumping_steps_head["outscale"],
+                device=config.device,
+                name="jumping_steps",
+            )
 
-        self.heads["accumulated_reward"] = networks.MLP(
-            feat_size * 2,
-            (255,) if config.accumulated_reward_head["dist"] == "symlog_disc" else (),
-            config.accumulated_reward_head["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            dist=config.accumulated_reward_head["dist"],
-            outscale=config.accumulated_reward_head["outscale"],
-            device=config.device,
-            name="accumulated_reward",
-        )
+            self.heads["accumulated_reward"] = networks.MLP(
+                feat_size * 2,
+                (255,) if config.accumulated_reward_head["dist"] == "symlog_disc" else (),
+                config.accumulated_reward_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.accumulated_reward_head["dist"],
+                outscale=config.accumulated_reward_head["outscale"],
+                device=config.device,
+                name="accumulated_reward",
+            )
        
         for name in config.grad_heads:
             assert name in self.heads, name
@@ -279,15 +286,22 @@ class WorldModel(nn.Module):
     def _train(self, data_origin):
             # 1. 预处理原始数据和缩放数据
             data = self.preprocess(data_origin, zoomed=False)
-            data_zoomed = self.preprocess(data_origin, zoomed=True)
 
-            zoomed_num = torch.sum(data["is_zoomed"]).item()
+            # CORE2-no-intrinsic-short: disable LS-Imagine long-distance/zoomed branch.
+            # We still keep heatmap reconstruction and CORE2 representation losses
+            # (inverse dynamics + affordance_s), but do not train jump / zoomed heads.
+            if getattr(self._config, "disable_long_branch", False):
+                data_zoomed = None
+                zoomed_num = 0
+            else:
+                data_zoomed = self.preprocess(data_origin, zoomed=True)
+                zoomed_num = torch.sum(data["is_zoomed"]).item()
 
             with tools.RequiresGrad(self):
                 with torch.cuda.amp.autocast(self._use_amp):
                     # 编码图像特征
                     embed = self.encoder(data)
-                    embed_zoomed = self.encoder(data_zoomed)
+                    embed_zoomed = self.encoder(data_zoomed) if data_zoomed is not None else None
 
                     # --- 2. 正常序列观察 (Observe Phase) ---
                     # post 包含: deter_s, deter_z, stoch_s, stoch_z
@@ -581,6 +595,13 @@ class ImagBehavior(nn.Module):
             self._update_slow_target()
             metrics = {}
 
+            # CORE2-no-intrinsic-short:
+            # Remove LS-Imagine long-distance/jumpy imagination and train behavior with
+            # ordinary short latent imagination. The reward is strictly reward_head(feat);
+            # intrinsic_objective, jump heads, accumulated rewards are ignored.
+            if getattr(self._config, "disable_long_branch", False):
+                return self._train_short(start, objective, is_end)
+
             with tools.RequiresGrad(self.actor):
                 with torch.cuda.amp.autocast(self._use_amp):
                     # 1. 展平并合并初始状态
@@ -728,6 +749,67 @@ class ImagBehavior(nn.Module):
                 metrics.update(self._value_opt(value_loss, self.value.parameters()))
                 
             return imag_feat, imag_state, imag_action, weights, metrics
+
+    def _train_short(self, start, objective, is_end):
+        metrics = {}
+
+        with tools.RequiresGrad(self.actor):
+            with torch.cuda.amp.autocast(self._use_amp):
+                flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+                start = {k: flatten(v) for k, v in start.items()}
+
+                imag_feat, imag_state, imag_action = self._imagine(
+                    start, self.actor, self._config.imag_horizon
+                )
+
+                reward = objective(imag_feat, imag_state, imag_action)
+                actor_ent = self.actor(imag_feat).entropy()
+
+                end = is_end(imag_state)
+                gamma = self._config.discount * torch.ones_like(reward) * (1.0 - end)
+                value = self.value(imag_feat).mode()
+
+                target = tools.lambda_return(
+                    reward[1:],
+                    value[:-1],
+                    gamma[:-1],
+                    bootstrap=value[-1],
+                    lambda_=self._config.discount_lambda,
+                    axis=0,
+                )
+
+                weights = torch.cumprod(
+                    torch.cat([torch.ones_like(gamma[:1]), gamma[:-1]], 0), 0
+                ).detach()
+
+                jump_record = torch.zeros_like(reward)
+                actor_loss, mets = self._compute_actor_loss(
+                    imag_feat, imag_action, target, weights, value[:-1], jump_record
+                )
+                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                actor_loss = torch.mean(actor_loss)
+                metrics.update(mets)
+                value_input = imag_feat
+
+        with tools.RequiresGrad(self.value):
+            with torch.cuda.amp.autocast(self._use_amp):
+                value_dist = self.value(value_input[:-1].detach())
+                target_for_value = torch.stack(target, dim=1)
+                value_loss = -value_dist.log_prob(target_for_value.detach())
+                if self._config.critic["slow_target"]:
+                    slow_target = self._slow_value(value_input[:-1].detach())
+                    value_loss -= value_dist.log_prob(slow_target.mode().detach())
+                value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
+
+        metrics.update(tools.tensorstats(value.mode(), "value"))
+        metrics.update(tools.tensorstats(target, "target"))
+        metrics.update(tools.tensorstats(reward, "imag_reward"))
+
+        with tools.RequiresGrad(self):
+            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+            metrics.update(self._value_opt(value_loss, self.value.parameters()))
+
+        return imag_feat, imag_state, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics

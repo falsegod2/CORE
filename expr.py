@@ -120,21 +120,17 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
-            self._wm.dynamics.get_feat(s)
-        ).mode() 
+        # CORE2-no-intrinsic-short: actor imagination must use only reward_head.
+        # Keep these zero/no-op callables only for API compatibility with ImagBehavior._train().
+        intrinsic = lambda f, s, a: torch.zeros_like(reward(f, s, a))
 
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
+        jumping_steps = lambda f, s, a: torch.ones((*f.shape[:-1], 1), device=f.device, dtype=torch.long)
 
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
+        accumulated_reward = lambda f, s, a: torch.zeros((*f.shape[:-1], 1), device=f.device, dtype=f.dtype)
 
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
+        jump_indicator = lambda s: torch.zeros_like(
+            self._wm.heads["end"](self._wm.dynamics.get_feat(s)).mean
+        )
 
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
@@ -188,15 +184,11 @@ def main(config): # config is namespace
     if config.deterministic_run:
         tools.enable_deterministic_run()
 
-    logdir = pathlib.Path(config.logdir).expanduser()
-    # 增加一个判断：如果传入的 logdir 中还不包含 seed_，说明是新开训练，生成新路径；
-    # 否则说明用户直接传入了旧的时间戳断点目录，直接使用即可。
-    if "seed_" not in str(logdir): 
-        logdir = logdir / config.task
-        logdir = logdir / 'seed_{}'.format(config.seed)
-        timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
-        logdir = logdir / timestamp
-        
+    logdir = pathlib.Path(config.logdir).expanduser() 
+    logdir = logdir / config.task
+    logdir = logdir / 'seed_{}'.format(config.seed)
+    timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
+    logdir = logdir / timestamp
     config.logdir = logdir
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
