@@ -12,11 +12,18 @@ defaults:
   # ... 原有参数 ...
   inverse_loss_scale: 1.0      # 创新 1：逆动力学约束
   affordance_s_scale: 2.0      # 创新 2：可供性地图对齐约束 (建议设为 2.0 增强引导)
-  interaction_loss_scale: 1.0   # CORE3：reward-change interaction gate 辅助损失
+  interaction_loss_scale: 0.02  # CORE4-NoDense：交互辅助损失，只做表示约束，不作为奖励
 
   # CORE3-no-intrinsic-short: disable reward-side intrinsic and LS-Imagine long-distance/jumpy branch.
   disable_intrinsic: True
   disable_long_branch: True
+
+  # CORE4-NoDense: Iso-Dream++ style anti-collapse constraints and conservative object residual.
+  # These are representation/model losses only; actor still uses reward_head only.
+  iso_var_s_scale: 0.02        # maximize action sensitivity of controllable branch s
+  iso_var_z_scale: 0.02        # penalize action sensitivity of noncontrollable branch z
+  iso_var_warmup: 100000       # linearly warm up variance losses
+  aff_object_residual_max: 0.1 # conservative residual context inside controllable feature
 
   logdir: null
   traindir: null

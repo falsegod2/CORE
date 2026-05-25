@@ -134,6 +134,7 @@ class WorldModel(nn.Module):
         super(WorldModel, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
+        self._step = step
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()} # 'image': (64, 64, 3)
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
@@ -153,6 +154,7 @@ class WorldModel(nn.Module):
             config.num_actions,
             self.embed_size,
             config.device,
+            getattr(config, "aff_object_residual_max", 0.0),
         )
 
         self.heads = nn.ModuleDict()
@@ -282,7 +284,69 @@ class WorldModel(nn.Module):
             # 增加创新点 2 的损失权重，建议初始设为 1.0 或 2.0
             affordance_s=getattr(config, "affordance_s_scale", 1.0),
             interaction=getattr(config, "interaction_loss_scale", 1.0),
+            iso_var_s=getattr(config, "iso_var_s_scale", 0.0),
+            iso_var_z=getattr(config, "iso_var_z_scale", 0.0),
         )
+
+
+    def _flatten_time_state(self, state):
+        return {k: v.reshape([-1] + list(v.shape[2:])) for k, v in state.items()}
+
+    def _slice_time_state(self, state, end=-1):
+        return {k: v[:, :end] for k, v in state.items()}
+
+    def _compute_iso_variance_losses(self, post, actions):
+        """Iso-Dream++-style anti-collapse constraints without dense rewards.
+
+        s branch should react to different hypothetical actions; z branch should not.
+        We use true action vs. zero action as the hypothetical pair. This is stable for
+        both one-hot MineDojo actions and continuous actions.
+        """
+        state_t = self._flatten_time_state(self._slice_time_state(post, -1))
+        act_true = actions[:, :-1].reshape([-1, actions.shape[-1]])
+        act_zero = torch.zeros_like(act_true)
+
+        prior_true = self.dynamics.img_step(state_t, act_true, sample=False)
+        prior_zero = self.dynamics.img_step(state_t, act_zero, sample=False)
+
+        s_true = self.dynamics.get_s_feat(prior_true, residual=False)
+        s_zero = self.dynamics.get_s_feat(prior_zero, residual=False)
+        z_true = self.dynamics.get_z_feat(prior_true)
+        z_zero = self.dynamics.get_z_feat(prior_zero)
+
+        var_s = torch.mean((s_true - s_zero) ** 2)
+        var_z = torch.mean((z_true - z_zero) ** 2)
+        # Optimize by minimizing: maximize bounded s sensitivity, minimize z sensitivity.
+        loss_iso_s = -torch.clamp(var_s, max=1.0)
+        loss_iso_z = var_z
+        return loss_iso_s, loss_iso_z, var_s.detach(), var_z.detach()
+
+    def _compute_interaction_target(self, data):
+        """Reward/inventory-change target for CORE3-style interaction auxiliary.
+
+        This remains representation supervision only. It is never added to reward.
+        """
+        device = data["reward"].device
+        target = torch.zeros_like(data["reward"]).float()
+
+        def add_change(key, threshold=1e-6):
+            nonlocal target
+            if key not in data:
+                return
+            x = data[key].float()
+            diff = torch.abs(x[:, 1:] - x[:, :-1])
+            while diff.ndim > 2:
+                diff = diff.sum(-1)
+            diff = torch.cat([torch.zeros_like(diff[:, :1]), diff], dim=1)
+            target = torch.maximum(target, (diff > threshold).float())
+
+        add_change("reward", 1e-8)
+        add_change("obs_reward", 1e-8)
+        add_change("inventory", 1e-6)
+        add_change("equipped", 1e-6)
+        add_change("health", 1e-6)
+        add_change("hunger", 1e-6)
+        return target.unsqueeze(-1).to(device)
 
     def _train(self, data_origin):
             # 1. 预处理原始数据和缩放数据
@@ -342,11 +406,19 @@ class WorldModel(nn.Module):
                     # gate is not used for jump decisions. Instead, it regularizes
                     # the controllable branch to mark states near reward changes.
                     interaction_score = self.dynamics.get_interaction_score(post)
-                    reward_diff = torch.abs(data["reward"][:, 1:] - data["reward"][:, :-1])
-                    reward_diff = torch.cat([torch.zeros_like(reward_diff[:, :1]), reward_diff], dim=1)
-                    interaction_target = (reward_diff > 0).float().unsqueeze(-1)
+                    interaction_target = self._compute_interaction_target(data)
                     loss_interaction = F.binary_cross_entropy(interaction_score, interaction_target)
                     # ------------------------------------------------------------
+
+                    # --- CORE4-NoDense: Iso-Dream++ style min-max variance constraints ---
+                    loss_iso_s, loss_iso_z, iso_var_s, iso_var_z = self._compute_iso_variance_losses(
+                        post, data["action"]
+                    )
+                    iso_warmup = min(
+                        1.0,
+                        float(getattr(self, "_step", 0)) / float(max(1, getattr(self._config, "iso_var_warmup", 1))),
+                    )
+                    # ---------------------------------------------------------------------
 
                     # 3. 计算 KL 散度损失
                     kl_free = self._config.kl_free 
@@ -450,7 +522,11 @@ class WorldModel(nn.Module):
                     total_loss = torch.mean(model_loss) + \
                                 loss_inv * self._scales.get("inverse", 1.0) + \
                                 torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0) + \
-                                torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
+                                torch.mean(loss_interaction) * self._scales.get("interaction", 1.0) + \
+                                iso_warmup * (
+                                    loss_iso_s * self._scales.get("iso_var_s", 0.0) +
+                                    loss_iso_z * self._scales.get("iso_var_z", 0.0)
+                                )
 
                 # 统一执行优化
                 metrics = self._model_opt(total_loss, self.parameters())
@@ -461,14 +537,36 @@ class WorldModel(nn.Module):
             metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
             metrics["loss_interaction"] = to_np(torch.mean(loss_interaction))
             metrics.update(tools.tensorstats(interaction_score, "interaction_score"))
+            metrics.update(tools.tensorstats(interaction_target, "interaction_target"))
+            metrics["loss_iso_s"] = to_np(loss_iso_s)
+            metrics["loss_iso_z"] = to_np(loss_iso_z)
+            metrics["iso_var_s"] = to_np(iso_var_s)
+            metrics["iso_var_z"] = to_np(iso_var_z)
+            metrics["iso_var_warmup_current"] = iso_warmup
+            metrics["aff_object_residual_max"] = getattr(self._config, "aff_object_residual_max", 0.0)
             metrics["model_loss"] = to_np(total_loss)
+            metrics["kl_free"] = self._config.kl_free
+            metrics["dyn_scale"] = self._config.dyn_scale
+            metrics["rep_scale"] = self._config.rep_scale
+            metrics["dyn_loss"] = to_np(torch.mean(dyn_loss_img))
+            metrics["rep_loss"] = to_np(torch.mean(rep_loss_img))
             metrics["kl"] = to_np(torch.mean(kl_value_img))
             
             with torch.cuda.amp.autocast(self._use_amp):
                 s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
                 z_stats = {k[2:]:v for k,v in post.items() if k.startswith("z_")}
-                metrics["post_ent_s"] = to_np(torch.mean(self.dynamics.get_dist(s_stats).entropy()))
-                metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist(z_stats).entropy()))
+                ps_stats = {k[2:]:v for k,v in prior.items() if k.startswith("s_")}
+                pz_stats = {k[2:]:v for k,v in prior.items() if k.startswith("z_")}
+                post_ent_s = torch.mean(self.dynamics.get_dist(s_stats).entropy())
+                post_ent_z = torch.mean(self.dynamics.get_dist(z_stats).entropy())
+                prior_ent_s = torch.mean(self.dynamics.get_dist(ps_stats).entropy())
+                prior_ent_z = torch.mean(self.dynamics.get_dist(pz_stats).entropy())
+                metrics["post_ent_s"] = to_np(post_ent_s)
+                metrics["post_ent_z"] = to_np(post_ent_z)
+                metrics["prior_ent_s"] = to_np(prior_ent_s)
+                metrics["prior_ent_z"] = to_np(prior_ent_z)
+                metrics["post_ent"] = to_np(post_ent_s + post_ent_z)
+                metrics["prior_ent"] = to_np(prior_ent_s + prior_ent_z)
 
             post = {k: v.detach() for k, v in post.items()}
             post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if zoomed_num > 0 else None

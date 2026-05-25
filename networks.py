@@ -21,6 +21,7 @@ class RSSM(nn.Module):
         self, stoch=30, deter=200, hidden=200, rec_depth=1, discrete=False,
         act="SiLU", norm=True, mean_act="none", std_act="softplus", min_std=0.1,
         unimix_ratio=0.01, initial="learned", num_actions=None, embed=None, device=None,
+        aff_object_residual_max=0.0,
     ):
         super(RSSM, self).__init__()
         # 1. 维度拆分：s(受控), z(非受控)
@@ -37,6 +38,7 @@ class RSSM(nn.Module):
         self._unimix_ratio, self._initial = unimix_ratio, initial
         self._num_actions = num_actions + 1
         self._embed, self._device = embed, device
+        self._aff_object_residual_max = float(aff_object_residual_max or 0.0)
 
         # 2. 受控分支网络 (输入包含动作)
         stoch_size_s = self._stoch_s * (self._discrete if self._discrete else 1)
@@ -73,6 +75,19 @@ class RSSM(nn.Module):
             nn.Sigmoid(),
         )
         self._interaction_gate.apply(tools.weight_init)
+
+        # CORE4-NoDense: a conservative latent residual context on the controllable branch.
+        # It never uses reward-side dense signals. The residual has the same dimensionality as
+        # the controllable feature, so downstream heads keep the original feat_size.
+        self._feat_s_size = self._deter_s + stoch_size_s
+        self._feat_z_size = self._deter_z + stoch_size_z
+        self._aff_object_residual = nn.Sequential(
+            nn.Linear(self._feat_s_size, self._hidden),
+            nn.LayerNorm(self._hidden, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
+            nn.Linear(self._hidden, self._feat_s_size),
+        )
+        self._aff_object_residual.apply(tools.weight_init)
 
         if self._initial == "learned":
             self.W = torch.nn.Parameter(torch.zeros((1, self._deter), device=torch.device(self._device)), requires_grad=True)
@@ -244,23 +259,30 @@ class RSSM(nn.Module):
             return torchd.independent.Independent(tools.OneHotDist(stats["logit"], unimix_ratio=self._unimix_ratio), 1)
         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
 
-    def get_feat(self, state):
-        s_stoch = state.get("stoch_s", torch.tensor([]).to(self._device))
-        z_stoch = state.get("stoch_z", torch.tensor([]).to(self._device))
-        deter_s = state.get("deter_s", torch.tensor([]).to(self._device))
-        deter_z = state.get("deter_z", torch.tensor([]).to(self._device))
-
+    def _flat_stoch(self, stoch, branch):
         if self._discrete:
-            s_dim = self._stoch_s * self._discrete
-            z_dim = self._stoch_z * self._discrete
-            if s_stoch.numel() > 0:
-                s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
-            if z_stoch.numel() > 0:
-                z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
-        
-        # 确认顺序：s_stoch -> deter_s -> z_stoch -> deter_z
-        # 这保证了前 (s_stoch + deter_s) 位全是受控信息
-        return torch.cat([s_stoch, deter_s, z_stoch, deter_z], -1)
+            dim = (self._stoch_s if branch == "s" else self._stoch_z) * self._discrete
+            if stoch.numel() > 0:
+                stoch = stoch.reshape(list(stoch.shape[:-2]) + [dim])
+        return stoch
+
+    def get_s_feat(self, state, residual=True):
+        s_stoch = self._flat_stoch(state["stoch_s"], "s")
+        feat_s = torch.cat([s_stoch, state["deter_s"]], -1)
+        if residual and self._aff_object_residual_max > 0:
+            # Small bounded residual: keeps Dreamer-style latent path dominant while
+            # allowing a structured controllable context to be learned from aux losses.
+            feat_s = feat_s + self._aff_object_residual_max * torch.tanh(self._aff_object_residual(feat_s))
+        return feat_s
+
+    def get_z_feat(self, state):
+        z_stoch = self._flat_stoch(state["stoch_z"], "z")
+        return torch.cat([z_stoch, state["deter_z"]], -1)
+
+    def get_feat(self, state):
+        # Order: controllable feature first, noncontrollable feature second.
+        # The first self._feat_s_size dimensions are always the s branch.
+        return torch.cat([self.get_s_feat(state, residual=True), self.get_z_feat(state)], -1)
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         # 适配双分支的 KL 损失计算

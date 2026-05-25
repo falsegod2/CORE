@@ -88,7 +88,13 @@ class LS_Imagine(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+            # Compatible with both vanilla RSSM and CORE s/z RSSM.
+            if "mean" in latent:
+                latent["stoch"] = latent["mean"]
+            if "s_mean" in latent:
+                latent["stoch_s"] = latent["s_mean"]
+            if "z_mean" in latent:
+                latent["stoch_z"] = latent["z_mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -112,6 +118,7 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
+        self._wm._step = self._step
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
         # start = (post, post_zoomed)
