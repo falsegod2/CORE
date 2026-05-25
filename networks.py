@@ -21,6 +21,7 @@ class RSSM(nn.Module):
         self, stoch=30, deter=200, hidden=200, rec_depth=1, discrete=False,
         act="SiLU", norm=True, mean_act="none", std_act="softplus", min_std=0.1,
         unimix_ratio=0.01, initial="learned", num_actions=None, embed=None, device=None,
+        object_context_dim=0,
     ):
         super(RSSM, self).__init__()
         # 1. 维度拆分：s(受控), z(非受控)
@@ -37,6 +38,15 @@ class RSSM(nn.Module):
         self._unimix_ratio, self._initial = unimix_ratio, initial
         self._num_actions = num_actions + 1
         self._embed, self._device = embed, device
+        # CORE4-Full-NoDense: the encoder can append heatmap top-k object context
+        # to the end of the embedding. The posterior s branch sees the full embedding,
+        # while the z branch receives only the base visual/MLP embedding. This keeps
+        # task-relevant affordance-object information in the controllable branch.
+        self._object_context_dim = int(object_context_dim or 0)
+        self._embed_base = int(embed) - self._object_context_dim
+        if self._embed_base <= 0:
+            self._embed_base = int(embed)
+            self._object_context_dim = 0
 
         # 2. 受控分支网络 (输入包含动作)
         stoch_size_s = self._stoch_s * (self._discrete if self._discrete else 1)
@@ -50,7 +60,7 @@ class RSSM(nn.Module):
         self._img_in_z = self._make_layer(stoch_size_z, norm, act_fn)
         self._cell_z = GRUCell(self._hidden, self._deter_z, norm=norm)
         self._img_out_z = self._make_layer(self._deter_z, norm, act_fn)
-        self._obs_out_z = self._make_layer(self._deter_z + self._embed, norm, act_fn)
+        self._obs_out_z = self._make_layer(self._deter_z + self._embed_base, norm, act_fn)
 
         # 4. 映射层与逆动力学
         self._stat_s_img = self._make_stat_layer(self._stoch_s)
@@ -169,6 +179,15 @@ class RSSM(nn.Module):
         prior = tools.static_scan(self.img_step, [action], state)[0]
         return {k: swap(v) for k, v in prior.items()}
 
+    def _split_embed_for_branches(self, embed):
+        if self._object_context_dim > 0 and embed.shape[-1] > self._object_context_dim:
+            embed_base = embed[..., : -self._object_context_dim]
+            embed_full = embed
+        else:
+            embed_base = embed
+            embed_full = embed
+        return embed_full, embed_base
+
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
         if prev_state == None or torch.sum(is_first) == len(is_first):
             prev_state = self.initial(len(is_first))
@@ -187,11 +206,12 @@ class RSSM(nn.Module):
             prev_action = torch.cat([prev_action, torch.zeros_like(prev_action[..., :1])], -1)
 
         prior = self.img_step(prev_state, prev_action)
-        # 受控后验
-        stats_s = self._suff_stats_layer(self._stat_s_obs, self._obs_out_s(torch.cat([prior["deter_s"], embed], -1)), self._stoch_s)
+        embed_s, embed_z = self._split_embed_for_branches(embed)
+        # 受控后验：读取完整 embedding，其中最后几维可以是 affordance top-k object context。
+        stats_s = self._suff_stats_layer(self._stat_s_obs, self._obs_out_s(torch.cat([prior["deter_s"], embed_s], -1)), self._stoch_s)
         stoch_s = self.get_dist(stats_s).sample() if sample else self.get_dist(stats_s).mode()
-        # 非受控后验
-        stats_z = self._suff_stats_layer(self._stat_z_obs, self._obs_out_z(torch.cat([prior["deter_z"], embed], -1)), self._stoch_z)
+        # 非受控后验：不读取 affordance-object context，避免任务相关局部对象信息泄露到 z 分支。
+        stats_z = self._suff_stats_layer(self._stat_z_obs, self._obs_out_z(torch.cat([prior["deter_z"], embed_z], -1)), self._stoch_z)
         stoch_z = self.get_dist(stats_z).sample() if sample else self.get_dist(stats_z).mode()
 
         post = {"stoch_s": stoch_s, "deter_s": prior["deter_s"], "stoch_z": stoch_z, "deter_z": prior["deter_z"]}
@@ -285,6 +305,85 @@ class RSSM(nn.Module):
 
         return dyn_scale * dyn_loss + rep_scale * rep_loss, (kl_s + kl_z), dyn_loss, rep_loss
 
+
+
+class AffordanceTopKObjectPool(nn.Module):
+    """Lightweight object-token extractor guided by affordance heatmaps.
+
+    This is the practical, no-extra-reward version of the Dyn-O / OC-STORM idea:
+    it does not call SAM/Cutie online and does not create dense rewards. Instead,
+    it uses the already available LS-Imagine heatmap as a spatial prior, extracts
+    top-k task-relevant local CNN features, converts them into object tokens, and
+    returns a compact context vector appended to the encoder embedding.
+    """
+
+    def __init__(self, in_channels, token_dim=128, context_dim=128, topk=4,
+                 act="SiLU", norm=True, score_temp=0.2):
+        super().__init__()
+        act_fn = getattr(torch.nn, act)
+        self._topk = int(topk)
+        self._score_temp = float(score_temp)
+        self._token_dim = int(token_dim)
+        self._context_dim = int(context_dim)
+        self._token_mlp = nn.Sequential(
+            nn.Linear(in_channels + 3, token_dim, bias=False),
+            nn.LayerNorm(token_dim, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
+            nn.Linear(token_dim, token_dim, bias=False),
+            nn.LayerNorm(token_dim, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
+        )
+        heads = 4 if token_dim % 4 == 0 else 1
+        self._self_attn = nn.MultiheadAttention(token_dim, heads, batch_first=True)
+        self._context_mlp = nn.Sequential(
+            nn.Linear(token_dim, context_dim, bias=False),
+            nn.LayerNorm(context_dim, eps=1e-03) if norm else nn.Identity(),
+            act_fn(),
+        )
+        self.apply(tools.weight_init)
+
+    def forward(self, spatial_feat, heatmap):
+        # spatial_feat: [B, T, C, H, W], heatmap: [B, T, H0, W0, 1] or [B,T,H0,W0]
+        b, t, c, h, w = spatial_feat.shape
+        bt = b * t
+        x = spatial_feat.reshape(bt, c, h, w)
+        if heatmap is None:
+            hm = torch.zeros(bt, 1, h, w, device=x.device, dtype=x.dtype)
+        else:
+            hm = heatmap
+            if hm.ndim == 5:
+                hm = hm.reshape(bt, hm.shape[-3], hm.shape[-2], hm.shape[-1]).permute(0, 3, 1, 2)
+            elif hm.ndim == 4:
+                hm = hm.reshape(bt, 1, hm.shape[-2], hm.shape[-1])
+            hm = hm.to(device=x.device, dtype=x.dtype)
+            hm = F.interpolate(hm, size=(h, w), mode="bilinear", align_corners=False)
+        scores = hm.flatten(1)  # [BT, HW]
+        k = max(1, min(self._topk, scores.shape[-1]))
+        vals, idx = torch.topk(scores, k=k, dim=-1)
+        feat_flat = x.flatten(2).transpose(1, 2)  # [BT, HW, C]
+        gather_idx = idx.unsqueeze(-1).expand(-1, -1, c)
+        local_feat = torch.gather(feat_flat, 1, gather_idx)  # [BT, K, C]
+
+        # normalized spatial coordinates and heatmap confidence per selected token
+        yy = (idx // w).to(x.dtype) / max(1, h - 1)
+        xx = (idx % w).to(x.dtype) / max(1, w - 1)
+        token_in = torch.cat([local_feat, vals.unsqueeze(-1), yy.unsqueeze(-1), xx.unsqueeze(-1)], dim=-1)
+        tokens = self._token_mlp(token_in)
+        tokens_attn, _ = self._self_attn(tokens, tokens, tokens, need_weights=False)
+        tokens = tokens + tokens_attn
+        weights = torch.softmax(vals / max(self._score_temp, 1e-6), dim=-1).unsqueeze(-1)
+        pooled = torch.sum(tokens * weights, dim=1)
+        context = self._context_mlp(pooled).reshape(b, t, self._context_dim)
+        stats = {
+            "aff_object_score_mean": vals.mean().detach(),
+            "aff_object_score_std": vals.std().detach(),
+            "aff_object_score_max": vals.max().detach(),
+            "aff_object_context_norm": context.norm(dim=-1).mean().detach(),
+            "aff_object_token_norm": tokens.norm(dim=-1).mean().detach(),
+        }
+        return context, stats
+
+
 class MultiEncoder(nn.Module):
     def __init__(
         self,
@@ -299,6 +398,12 @@ class MultiEncoder(nn.Module):
         mlp_layers,
         mlp_units,
         symlog_inputs,
+        use_aff_object_tokens=False,
+        aff_object_keys="heatmap",
+        aff_object_num=4,
+        aff_object_token_dim=128,
+        aff_object_context_dim=128,
+        aff_object_score_temp=0.2,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -319,6 +424,10 @@ class MultiEncoder(nn.Module):
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.outdim = 0
+        self._use_aff_object_tokens = False
+        self._aff_object_keys = aff_object_keys
+        self._last_aff_object_stats = {}
+        self._aff_object_pool = None
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
@@ -326,6 +435,22 @@ class MultiEncoder(nn.Module):
                 input_shape, cnn_depth, act, norm, kernel_size, minres
             )
             self.outdim += self._cnn.outdim
+            self._use_aff_object_tokens = bool(use_aff_object_tokens)
+            self._aff_object_keys = aff_object_keys
+            self._last_aff_object_stats = {}
+            if self._use_aff_object_tokens:
+                self._aff_object_pool = AffordanceTopKObjectPool(
+                    self._cnn.out_channels,
+                    token_dim=aff_object_token_dim,
+                    context_dim=aff_object_context_dim,
+                    topk=aff_object_num,
+                    act=act,
+                    norm=norm,
+                    score_temp=aff_object_score_temp,
+                )
+                self.outdim += int(aff_object_context_dim)
+            else:
+                self._aff_object_pool = None
         if self.mlp_shapes:
             input_size = sum([sum(v) for v in self.mlp_shapes.values()])
             self._mlp = MLP(
@@ -342,14 +467,33 @@ class MultiEncoder(nn.Module):
 
     def forward(self, obs):
         outputs = []
+        obj_context = None
         if self.cnn_shapes:
             inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
-            outputs.append(self._cnn(inputs))
+            if self._use_aff_object_tokens and self._aff_object_pool is not None:
+                cnn_embed, spatial = self._cnn(inputs, return_spatial=True)
+                outputs.append(cnn_embed)
+                heatmap = None
+                for key in str(self._aff_object_keys).split("|"):
+                    if key in obs:
+                        heatmap = obs[key]
+                        break
+                obj_context, obj_stats = self._aff_object_pool(spatial, heatmap)
+                self._last_aff_object_stats = obj_stats
+            else:
+                outputs.append(self._cnn(inputs))
         if self.mlp_shapes:
             inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
             outputs.append(self._mlp(inputs))
+        # Important: object context is appended at the end so RSSM can route the
+        # last aff_object_context_dim dimensions only to the controllable branch.
+        if obj_context is not None:
+            outputs.append(obj_context)
         outputs = torch.cat(outputs, -1)
         return outputs
+
+    def get_extra_metrics(self):
+        return getattr(self, "_last_aff_object_stats", {})
 
 
 class MultiDecoder(nn.Module):
@@ -472,21 +616,24 @@ class ConvEncoder(nn.Module):
             out_dim *= 2
             h, w = h // 2, w // 2
 
-        self.outdim = out_dim // 2 * h * w
+        self.out_channels = out_dim // 2
+        self.outdim = self.out_channels * h * w
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
 
-    def forward(self, obs):
-        obs -= 0.5
+    def forward(self, obs, return_spatial=False):
+        obs = obs - 0.5
         # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
         x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
         # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
         x = x.permute(0, 3, 1, 2)
         x = self.layers(x)
-        # (batch * time, ...) -> (batch * time, -1)
-        x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
-        # (batch * time, -1) -> (batch, time, -1)
-        return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
+        spatial = x.reshape(list(obs.shape[:-3]) + list(x.shape[1:]))
+        flat = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+        flat = flat.reshape(list(obs.shape[:-3]) + [flat.shape[-1]])
+        if return_spatial:
+            return flat, spatial
+        return flat
 
 
 class ConvDecoder(nn.Module):
