@@ -189,6 +189,19 @@ class WorldModel(nn.Module):
             f"Optimizer model_opt has {sum(param.numel() for param in self.parameters())} variables."
         )
 
+        self._slot_opt = None
+        if int(getattr(config, "slot_pretrain_steps", 0)) > 0:
+            self._slot_opt = tools.Optimizer(
+                "slot_pretrain",
+                self.encoder.parameters(),
+                getattr(config, "slot_pretrain_lr", config.model_lr),
+                config.opt_eps,
+                config.grad_clip,
+                config.weight_decay,
+                opt=config.opt,
+                use_amp=self._use_amp,
+            )
+
         # other losses are scaled by 1.0.
         # 从 self._scales 字典中删除跳跃相关的预测头（Heads）
         self._scales = dict(
@@ -376,6 +389,8 @@ class WorldModel(nn.Module):
             metrics["rep_loss_img"] = to_np(torch.mean(rep_loss_img))
             metrics["rep_loss_jmp"] = to_np(torch.mean(rep_loss_jmp))
         metrics["model_loss"] = to_np(torch.mean(model_loss))
+        metrics["agoc_residual_scale_current"] = agoc_residual_scale_current
+        metrics["tao_temperature_current"] = tao_temperature_current
 
         with torch.cuda.amp.autocast(self._use_amp):
             metrics["prior_ent"] = to_np(
@@ -407,6 +422,70 @@ class WorldModel(nn.Module):
             return post, None, context, metrics
     '''
 
+
+
+    def _linear_warmup_scale(self, step, base_scale, start_step=0, warmup_steps=0):
+        """Piecewise linear schedule used for AGOC residual and TAO smoothing.
+
+        Returns 0 before start_step, then linearly increases to base_scale over
+        warmup_steps. If warmup_steps <= 0, it jumps to base_scale at start_step.
+        """
+        base_scale = float(base_scale)
+        if base_scale <= 0:
+            return 0.0
+        if step is None:
+            step = 0
+        step = float(step)
+        start_step = float(start_step)
+        warmup_steps = float(warmup_steps)
+        if step < start_step:
+            return 0.0
+        if warmup_steps <= 0:
+            return base_scale
+        progress = max(0.0, min(1.0, (step - start_step) / warmup_steps))
+        return base_scale * progress
+
+    def _linear_anneal(self, step, start_value, end_value, decay_steps=0):
+        """Linearly anneal from start_value to end_value.
+
+        In this codebase TAO temperature is a logit scale, so smaller values are
+        smoother. A typical schedule is 0.3 -> 1.0.
+        """
+        if step is None:
+            step = 0
+        start_value = float(start_value)
+        end_value = float(end_value)
+        decay_steps = float(decay_steps)
+        if decay_steps <= 0:
+            return end_value
+        progress = max(0.0, min(1.0, float(step) / decay_steps))
+        return start_value + progress * (end_value - start_value)
+
+    def set_step(self, step):
+        """Update scheduled encoder-side coefficients before forward passes."""
+        agoc_scale = self._linear_warmup_scale(
+            step,
+            getattr(self._config, "agoc_residual_scale", 1.0),
+            getattr(self._config, "agoc_residual_start", 0),
+            getattr(self._config, "agoc_residual_warmup", 0),
+        )
+        if hasattr(self.encoder, "set_agoc_residual_scale"):
+            self.encoder.set_agoc_residual_scale(agoc_scale)
+
+        enc_cfg = self._config.encoder
+        base_tao_temp = enc_cfg.get("tao_temperature", 1.0) if isinstance(enc_cfg, dict) else getattr(enc_cfg, "tao_temperature", 1.0)
+        if getattr(self._config, "tao_temperature_schedule", False):
+            tao_temp = self._linear_anneal(
+                step,
+                getattr(self._config, "tao_temperature_start", base_tao_temp),
+                getattr(self._config, "tao_temperature_end", base_tao_temp),
+                getattr(self._config, "tao_temperature_decay_steps", 0),
+            )
+        else:
+            tao_temp = base_tao_temp
+        if hasattr(self.encoder, "set_tao_temperature"):
+            self.encoder.set_tao_temperature(tao_temp)
+        return agoc_scale, tao_temp
     def _soft_slot_matching_loss(self, pred_slots, target_slots, temperature=0.1):
         """
         pred_slots:   [B, K, D]
@@ -428,9 +507,10 @@ class WorldModel(nn.Module):
         loss = ((pred_slots - matched_target) ** 2).mean(dim=-1)
         return loss
 
-    def _train(self, data_origin):
+    def _train(self, data_origin, step=None):
         
         data = self.preprocess(data_origin)
+        agoc_residual_scale_current, tao_temperature_current = self.set_step(step)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -609,6 +689,8 @@ class WorldModel(nn.Module):
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(torch.mean(model_loss))
+        metrics["agoc_residual_scale_current"] = agoc_residual_scale_current
+        metrics["tao_temperature_current"] = tao_temperature_current
         if obj_dyn_loss is not None:
             metrics["object_dyn_loss"] = to_np(obj_dyn_loss)
         if obj_dyn_pred_delta is not None:
@@ -710,6 +792,82 @@ class WorldModel(nn.Module):
         obs["end"] = torch.Tensor(obs["is_terminal"]).unsqueeze(-1)
         obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
         return obs
+
+
+    def slot_pretrain(self, data_origin, step=0):
+        """Slot-only warm-start before online RL.
+
+        This updates only the AGOC encoder/slot/TAO path using existing AGOC
+        representation losses. It does not call RSSM.observe(), decoder,
+        reward/end heads, ObjectSSM, actor, or critic.
+        """
+        if self._slot_opt is None:
+            return {"slot_pretrain_skipped": 1.0}
+
+        data = self.preprocess(data_origin)
+        agoc_residual_scale_current, tao_temperature_current = self.set_step(step)
+
+        with tools.RequiresGrad(self.encoder):
+            with torch.cuda.amp.autocast(self._use_amp):
+                _ = self.encoder(data)
+                object_aux = {}
+                if hasattr(self.encoder, "_cnn") and hasattr(self.encoder._cnn, "object_aux_losses"):
+                    object_aux = self.encoder._cnn.object_aux_losses()
+
+                loss_terms = []
+                metrics = {
+                    "slot_pretrain_agoc_residual_scale_current": agoc_residual_scale_current,
+                    "slot_pretrain_tao_temperature_current": tao_temperature_current,
+                }
+
+                if "affordance_align" in object_aux:
+                    aff_loss = object_aux["affordance_align"]
+                    metrics["slot_pretrain_affordance_align_loss"] = to_np(torch.mean(aff_loss))
+                    loss_terms.append(self._config.affordance_align_scale * aff_loss)
+
+                if "slot_diversity" in object_aux:
+                    div_loss = object_aux["slot_diversity"]
+                    metrics["slot_pretrain_slot_diversity_loss"] = to_np(torch.mean(div_loss))
+                    loss_terms.append(self._config.slot_diversity_scale * div_loss)
+
+                if "tao_entropy" in object_aux:
+                    tao_entropy = object_aux["tao_entropy"]
+                    metrics["slot_pretrain_tao_entropy"] = to_np(torch.mean(tao_entropy))
+                    if float(getattr(self._config, "tao_entropy_scale", 0.0)) != 0.0:
+                        loss_terms.append(self._config.tao_entropy_scale * tao_entropy)
+
+                if not loss_terms:
+                    # Keep a differentiable zero for the optimizer interface.
+                    slot_loss = sum(p.sum() * 0.0 for p in self.encoder.parameters())
+                else:
+                    slot_loss = torch.mean(sum(loss_terms))
+
+            opt_metrics = self._slot_opt(slot_loss, self.encoder.parameters())
+
+        metrics.update(opt_metrics)
+
+        if hasattr(self.encoder, "_cnn"):
+            aff_scores = getattr(self.encoder._cnn, "last_aff_scores", None)
+            aff_scores_norm = getattr(self.encoder._cnn, "last_aff_scores_norm", None)
+            tao_weights = getattr(self.encoder._cnn, "last_tao_weights", None)
+
+            if aff_scores is not None:
+                aff = aff_scores.detach().float()
+                metrics["slot_pretrain_agoc_aff_mean"] = to_np(aff.mean())
+                metrics["slot_pretrain_agoc_aff_std"] = to_np(aff.std())
+                metrics["slot_pretrain_agoc_aff_slot_mean_std"] = to_np(aff.mean(dim=0).std())
+
+            if aff_scores_norm is not None:
+                affn = aff_scores_norm.detach().float()
+                metrics["slot_pretrain_agoc_aff_norm_std"] = to_np(affn.std())
+
+            if tao_weights is not None:
+                tao = tao_weights.detach().float()
+                metrics["slot_pretrain_agoc_tao_top1_mean"] = to_np(tao.max(dim=-1).values.mean())
+                tao_entropy = -(tao.clamp_min(1e-8) * torch.log(tao.clamp_min(1e-8))).sum(dim=-1)
+                metrics["slot_pretrain_agoc_tao_entropy_mean"] = to_np(tao_entropy.mean())
+
+        return metrics
 
     def video_pred(self, data):
         data = self.preprocess(data)

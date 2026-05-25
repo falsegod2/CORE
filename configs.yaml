@@ -27,7 +27,7 @@ defaults:
   prefill: 2500
   reward_EMA: True
   eval_every: 10000
-  eval_episode_num: 3
+  eval_episode_num: 6
   log_every: 20000
   reset_every: 0
 
@@ -85,6 +85,10 @@ defaults:
     tao_affordance_weight: 1.0
     tao_task_weight: 0.0
     tao_temperature: 1.0
+
+    # AGOC-Residual-Gate: keep ordinary Dreamer CNN embedding as the main path.
+    # TAO-gated slot embedding is projected back and added as a scheduled residual.
+    agoc_residual: True
 
   decoder:
     mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath'
@@ -164,6 +168,27 @@ defaults:
   affordance_align_scale: 0.3
   slot_diversity_scale: 0.03
   tao_entropy_scale: 0.0
+
+  # ===== AGOC-Residual-Gate schedules =====
+  # Residual starts from 0 so early RSSM behaves like ordinary Dreamer CNN encoder.
+  # Then AGOC slot features gradually enter the RSSM input.
+  agoc_residual_scale: 1.0
+  agoc_residual_start: 100000
+  agoc_residual_warmup: 300000
+
+  # In this codebase tao_temperature is a logit scale: smaller = smoother.
+  # So this schedule starts smooth and returns to the original scale 1.0.
+  tao_temperature_schedule: True
+  tao_temperature_start: 0.3
+  tao_temperature_end: 1.0
+  tao_temperature_decay_steps: 300000
+
+  # Slot-only warm-start before online RL. This trains only encoder/slots/TAO
+  # with affordance_align + slot_diversity; it does not train RSSM/actor/critic.
+  slot_pretrain_steps: 1000
+  slot_pretrain_log_every: 100
+  slot_pretrain_lr: 1e-4
+  slot_pretrain_on_resume: False
 
   # Dyn-O style shared object SSM auxiliary loss
   object_dyn_scale: 0.1

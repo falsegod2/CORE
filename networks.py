@@ -618,6 +618,7 @@ class ObjectCentricConvEncoder(nn.Module):
         tao_affordance_weight=1.0,
         tao_task_weight=1.0,
         tao_temperature=5.0,
+        agoc_residual=False,
     ):
         super().__init__()
         act = getattr(torch.nn, act)
@@ -671,7 +672,11 @@ class ObjectCentricConvEncoder(nn.Module):
         self.tao_include_task = tao_include_task
         self.tao_affordance_weight = tao_affordance_weight
         self.tao_task_weight = tao_task_weight
-        self.tao_temperature = tao_temperature
+        # NOTE: In this codebase, tao_temperature is used as a logit scale
+        # (logits are multiplied by it), not as a divisor. Smaller values make
+        # TAO smoother; larger values make it sharper.
+        self.tao_temperature = float(tao_temperature)
+        self.current_tao_temperature = float(tao_temperature)
 
         self.slot_task_proj = nn.Linear(slot_dim, task_embed_dim)
         self.slot_task_proj.apply(tools.weight_init)
@@ -695,6 +700,9 @@ class ObjectCentricConvEncoder(nn.Module):
         self.last_tao_weights = None
         self.last_slots = None
         self.last_lead_shape = None
+
+    def set_tao_temperature(self, value):
+        self.current_tao_temperature = float(value)
 
     def _coords(self, b, h, w, device, dtype):
         ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
@@ -760,7 +768,7 @@ class ObjectCentricConvEncoder(nn.Module):
         tao_logits = (
             self.tao_affordance_weight * aff_scores_norm
             + self.tao_task_weight * task_scores
-        ) * self.tao_temperature
+        ) * self.current_tao_temperature
 
         tao_weights = torch.softmax(tao_logits, dim=-1)
 
@@ -933,6 +941,7 @@ class MultiEncoder(nn.Module):
         tao_affordance_weight=1.0,
         tao_task_weight=1.0,
         tao_temperature=5.0,
+        agoc_residual=False,
     ):
         super(MultiEncoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
@@ -957,6 +966,8 @@ class MultiEncoder(nn.Module):
             )
         self.outdim = 0
         self.use_slots = use_slots
+        self.agoc_residual = bool(agoc_residual and use_slots)
+        self.agoc_residual_scale = 0.0 if self.agoc_residual else 1.0
         self.affordance_keys = [
             k for k, v in shapes.items()
             if len(v) == 3 and re.match(affordance_keys, k)
@@ -996,12 +1007,22 @@ class MultiEncoder(nn.Module):
                     tao_task_weight=tao_task_weight,
                     tao_temperature=tao_temperature,
                 )
+                if self.agoc_residual:
+                    # Dreamer 保底路径：普通 CNN 表示作为主输入。
+                    # AGOC/slots 只作为残差增强，避免早期未成熟 slots 直接替代 Dreamer embedding。
+                    self._dreamer_cnn = ConvEncoder(
+                        input_shape, cnn_depth, act, norm, kernel_size, minres
+                    )
+                    self._agoc_res_proj = nn.Linear(self._cnn.outdim, self._dreamer_cnn.outdim)
+                    self._agoc_res_proj.apply(tools.weight_init)
+                    self.outdim += self._dreamer_cnn.outdim
+                else:
+                    self.outdim += self._cnn.outdim
             else:
                 self._cnn = ConvEncoder(
                     input_shape, cnn_depth, act, norm, kernel_size, minres
                 )
-
-            self.outdim += self._cnn.outdim
+                self.outdim += self._cnn.outdim
 
         if self.mlp_shapes:
             input_size = sum([sum(v) for v in self.mlp_shapes.values()])
@@ -1016,6 +1037,13 @@ class MultiEncoder(nn.Module):
                 name="Encoder",
             )
             self.outdim += mlp_units
+
+    def set_agoc_residual_scale(self, value):
+        self.agoc_residual_scale = float(value)
+
+    def set_tao_temperature(self, value):
+        if hasattr(self, "_cnn") and hasattr(self._cnn, "set_tao_temperature"):
+            self._cnn.set_tao_temperature(value)
 
     def forward(self, obs):
         outputs = []
@@ -1033,7 +1061,13 @@ class MultiEncoder(nn.Module):
                     if key in obs:
                         task_embed = obs[key]
                         break
-                outputs.append(self._cnn(inputs, affordance, task_embed))
+                agoc_embed = self._cnn(inputs, affordance, task_embed)
+                if self.agoc_residual:
+                    dreamer_embed = self._dreamer_cnn(inputs)
+                    agoc_res = self._agoc_res_proj(agoc_embed)
+                    outputs.append(dreamer_embed + self.agoc_residual_scale * agoc_res)
+                else:
+                    outputs.append(agoc_embed)
             else:
                 outputs.append(self._cnn(inputs))
 

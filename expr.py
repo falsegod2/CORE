@@ -39,17 +39,46 @@ class LS_Imagine(nn.Module):
         self._dataset = dataset
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
-        if (
-            config.compile and os.name != "nt"
-        ):  # compilation is not supported on windows
-            self._wm = torch.compile(self._wm)
-            self._task_behavior = torch.compile(self._task_behavior)
+        self._compiled = False
+        # Slot warm-start calls a non-standard WorldModel.slot_pretrain() path.
+        # Delay torch.compile until after warm-start, otherwise the compiled
+        # wrapper can hide this method or pay unnecessary compile cost.
+        if int(getattr(config, "slot_pretrain_steps", 0)) <= 0:
+            self.maybe_compile()
         reward = lambda f, s, a: self._wm.heads["reward"](f).mean()
         self._expl_behavior = dict(
             greedy=lambda: self._task_behavior,
             random=lambda: expl.Random(config, act_space),
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
+
+    def maybe_compile(self):
+        if self._compiled:
+            return
+        if self._config.compile and os.name != "nt":
+            self._wm = torch.compile(self._wm)
+            self._task_behavior = torch.compile(self._task_behavior)
+            self._compiled = True
+
+    def slot_pretrain(self, train_dataset, steps):
+        if steps <= 0:
+            return
+        print(f"Start AGOC slot warm-start for {steps} updates.")
+        log_every = int(getattr(self._config, "slot_pretrain_log_every", 100))
+        for idx in range(int(steps)):
+            mets = self._wm.slot_pretrain(next(train_dataset), step=idx)
+            for name, value in mets.items():
+                if not name in self._metrics.keys():
+                    self._metrics[name] = [value]
+                else:
+                    self._metrics[name].append(value)
+            if log_every > 0 and ((idx + 1) % log_every == 0 or idx == 0):
+                for name, values in self._metrics.items():
+                    if name.startswith("slot_pretrain"):
+                        self._logger.scalar(name, float(np.mean(values)))
+                        self._metrics[name] = []
+                self._logger.write()
+        print("AGOC slot warm-start finished.")
 
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
@@ -85,6 +114,8 @@ class LS_Imagine(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
+        if hasattr(self._wm, "set_step"):
+            self._wm.set_step(self._step)
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
@@ -113,7 +144,7 @@ class LS_Imagine(nn.Module):
     def _train(self, data):
         metrics = {}
         # 去掉 post_zoomed，只保留纯净的后验状态
-        post, _, context, mets = self._wm._train(data)
+        post, _, context, mets = self._wm._train(data, self._step)
         metrics.update(mets)
 
         def reward(f, s, a):
@@ -316,11 +347,20 @@ def main(config): # config is namespace
 
     agent.requires_grad_(requires_grad=False)
     
+    resumed = False
     if (logdir / "latest.pt").exists():
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
         agent._should_pretrain._once = False
+        resumed = True
+
+    slot_pretrain_steps = int(getattr(config, "slot_pretrain_steps", 0))
+    slot_pretrain_on_resume = bool(getattr(config, "slot_pretrain_on_resume", False))
+    if slot_pretrain_steps > 0 and ((not resumed) or slot_pretrain_on_resume):
+        agent.slot_pretrain(train_dataset, slot_pretrain_steps)
+
+    agent.maybe_compile()
 
     
     # make sure eval will be executed once after config.steps
