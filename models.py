@@ -897,6 +897,11 @@ class ImagBehavior(nn.Module):
                     lambda_=self._config.discount_lambda,
                     axis=0,
                 )
+                # tools.lambda_return returns an iterable of [time, 1] tensors
+                # for compatibility with the original LS-Imagine actor-loss code.
+                # Keep `target` in that form for _compute_actor_loss(), but also
+                # materialize a [time, batch, 1] tensor for critic training and logs.
+                target_tensor = torch.stack(target, dim=1)
 
                 weights = torch.cumprod(
                     torch.cat([torch.ones_like(gamma[:1]), gamma[:-1]], 0), 0
@@ -914,15 +919,15 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value_dist = self.value(value_input[:-1].detach())
-                target_for_value = torch.stack(target, dim=1)
+                target_for_value = target_tensor
                 value_loss = -value_dist.log_prob(target_for_value.detach())
                 if self._config.critic["slow_target"]:
                     slow_target = self._slow_value(value_input[:-1].detach())
                     value_loss -= value_dist.log_prob(slow_target.mode().detach())
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
-        metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
+        metrics.update(tools.tensorstats(value, "value"))
+        metrics.update(tools.tensorstats(target_tensor, "target"))
         metrics.update(tools.tensorstats(reward, "imag_reward"))
 
         with tools.RequiresGrad(self):
