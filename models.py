@@ -274,7 +274,6 @@ class WorldModel(nn.Module):
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
             # 增加创新点 2 的损失权重，建议初始设为 1.0 或 2.0
             affordance_s=getattr(config, "affordance_s_scale", 1.0),
-            interaction=getattr(config, "interaction_loss_scale", 1.0),
         )
 
     def _train(self, data_origin):
@@ -321,23 +320,6 @@ class WorldModel(nn.Module):
                     # 这会迫使模型将任务目标的相关视觉信息压入 s 分支
                     preds_s = self.heads["decoder"](feat_s_only)
                     loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
-                    # --------------------------------------------
-
-                    # --- [创新点 3：交互门训练逻辑修复] ---
-                    # 1. 计算当前受控状态下的交互分数 (B, T, 1)
-                    interaction_score = self.dynamics.get_interaction_score(post)
-                    
-                    # 2. 计算奖励的变化梯度作为真实标签 (B, T)
-                    # 计算相邻步奖励差的绝对值
-                    reward_diff = torch.abs(data["reward"][:, 1:] - data["reward"][:, :-1])
-                    # 在起始端补零，对齐时间步长度 T
-                    reward_diff = torch.cat([torch.zeros_like(reward_diff[:, :1]), reward_diff], dim=1)
-                    
-                    # --- 修复点：使用 unsqueeze(-1) 将 (B, T) 变为 (B, T, 1) ---
-                    interaction_target = (reward_diff > 0).float().unsqueeze(-1)
-                    
-                    # 计算二元交叉熵损失
-                    loss_interaction = F.binary_cross_entropy(interaction_score, interaction_target)
                     # --------------------------------------------
 
                     # 3. 计算 KL 散度损失
@@ -441,8 +423,7 @@ class WorldModel(nn.Module):
                     # 3. 汇总总损失
                     total_loss = torch.mean(model_loss) + \
                                 loss_inv * self._scales.get("inverse", 1.0) + \
-                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0) + \
-                                torch.mean(loss_interaction) * self._scales.get("interaction", 1.0)
+                                torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
 
                 # 统一执行优化
                 metrics = self._model_opt(total_loss, self.parameters())
@@ -453,7 +434,6 @@ class WorldModel(nn.Module):
             metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
             metrics["model_loss"] = to_np(total_loss)
             metrics["kl"] = to_np(torch.mean(kl_value_img))
-            metrics["loss_interaction"] = to_np(torch.mean(loss_interaction))
             
             with torch.cuda.amp.autocast(self._use_amp):
                 s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
@@ -631,18 +611,10 @@ class ImagBehavior(nn.Module):
                         # 获取当前末端状态
                         checking_state = {key: tensor[-1] for key, tensor in imag_state.items()}
                         
-                        # --- [创新点 3：交互驱动判定] ---
-                        # 获取传统的跳跃预测
-                        jump_prob_pred = jump_indicator(checking_state) 
-                        # 获取受控分支的交互强度 (Interaction Score)
-                        interaction_score = self._world_model.dynamics.get_interaction_score(checking_state)
-                        
-                        # 融合逻辑：只有当预测要跳跃，且交互强度高于阈值时，才执行精准跳跃
-                        # 这能过滤掉由于环境背景波动引起的“伪跳跃”
-                        refined_jump_prob = jump_prob_pred * interaction_score 
-                        
-                        end_factor = is_end(checking_state) 
-                        indices = probability_to_bool(refined_jump_prob * (1.0 - end_factor), self.jump_prob).squeeze()
+                        # CORE2：使用原始 jump_head 概率进行 jumpy imagination，不使用 interaction gate。
+                        jump_prob_pred = jump_indicator(checking_state)
+                        end_factor = is_end(checking_state)
+                        indices = probability_to_bool(jump_prob_pred * (1.0 - end_factor), self.jump_prob).squeeze()
 
 
                         jump_record = torch.cat((jump_record, indices.unsqueeze(0)), dim=0) 
