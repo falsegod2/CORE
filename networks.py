@@ -264,23 +264,34 @@ class RSSM(nn.Module):
             return torchd.independent.Independent(tools.OneHotDist(stats["logit"], unimix_ratio=self._unimix_ratio), 1)
         return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
 
-    def get_feat(self, state):
-        s_stoch = state.get("stoch_s", torch.tensor([]).to(self._device))
-        z_stoch = state.get("stoch_z", torch.tensor([]).to(self._device))
-        deter_s = state.get("deter_s", torch.tensor([]).to(self._device))
-        deter_z = state.get("deter_z", torch.tensor([]).to(self._device))
+    def get_s_feat(self, state):
+        """Return the controllable-branch feature: [stoch_s, deter_s].
 
-        if self._discrete:
+        CORE4's Iso-Dream++ style variance loss and interaction gate need to
+        inspect the s branch directly. The main get_feat() concatenates both
+        branches, so this helper keeps the branch split explicit and works for
+        both continuous and discrete RSSM states.
+        """
+        s_stoch = state.get("stoch_s", torch.tensor([], device=self._device))
+        deter_s = state.get("deter_s", torch.tensor([], device=self._device))
+        if self._discrete and s_stoch.numel() > 0:
             s_dim = self._stoch_s * self._discrete
+            s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
+        return torch.cat([s_stoch, deter_s], -1)
+
+    def get_z_feat(self, state):
+        """Return the noncontrollable-branch feature: [stoch_z, deter_z]."""
+        z_stoch = state.get("stoch_z", torch.tensor([], device=self._device))
+        deter_z = state.get("deter_z", torch.tensor([], device=self._device))
+        if self._discrete and z_stoch.numel() > 0:
             z_dim = self._stoch_z * self._discrete
-            if s_stoch.numel() > 0:
-                s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
-            if z_stoch.numel() > 0:
-                z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
-        
+            z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
+        return torch.cat([z_stoch, deter_z], -1)
+
+    def get_feat(self, state):
         # 确认顺序：s_stoch -> deter_s -> z_stoch -> deter_z
-        # 这保证了前 (s_stoch + deter_s) 位全是受控信息
-        return torch.cat([s_stoch, deter_s, z_stoch, deter_z], -1)
+        # 这保证了前 (s_stoch + deter_s) 位全是受控信息。
+        return torch.cat([self.get_s_feat(state), self.get_z_feat(state)], -1)
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         # 适配双分支的 KL 损失计算
