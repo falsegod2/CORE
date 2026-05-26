@@ -56,6 +56,8 @@ def _add_wrappers(
     fast_reset: int = None,
     log_dir: str = None,
     freeze_equipped: bool = True,
+    disable_intrinsic: bool = False,
+    disable_long_branch: bool = False,
     **kwargs
 ):
     
@@ -74,10 +76,15 @@ def _add_wrappers(
 
     # Add reward shaping wrapper
     if clip_specs is not None:
+        clip_specs = dict(clip_specs)
+        clip_specs["disable_intrinsic"] = disable_intrinsic
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
     if concentration_specs is not None:
+        concentration_specs = dict(concentration_specs)
+        concentration_specs["disable_intrinsic"] = disable_intrinsic
+        concentration_specs["disable_long_branch"] = disable_long_branch
         unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
         gaussian_sigma_weight = concentration_specs["gaussian_sigma_weight"] if "gaussian_sigma_weight" in concentration_specs else 0.5
         concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight)

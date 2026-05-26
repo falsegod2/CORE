@@ -162,7 +162,9 @@ def make_env(config, mode, id):
 
         kwargs=dict(
                 log_dir=log_dir,
-                target_item=config.target_item
+                target_item=config.target_item,
+                disable_intrinsic=getattr(config, "disable_intrinsic", False),
+                disable_long_branch=getattr(config, "disable_long_branch", False),
             )
         env = minedojo.make_env(task, **kwargs)
         env = wrappers.OneHotAction(env)
@@ -247,7 +249,8 @@ def main(config): # config is namespace
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
-    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
+    use_long_data = not getattr(config, "disable_long_branch", False)
+    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps) if use_long_data else None
 
     state = None
 
@@ -284,6 +287,7 @@ def main(config): # config is namespace
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
+            use_long_data=use_long_data,
         )
 
         logger.step += prefill * config.action_repeat
@@ -328,6 +332,7 @@ def main(config): # config is namespace
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
+                use_long_data=use_long_data,
             )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
@@ -348,6 +353,7 @@ def main(config): # config is namespace
             steps=config.eval_every, 
             state=state,
             is_training=True,
+            use_long_data=use_long_data,
         )
 
         items_to_save = {

@@ -3,7 +3,7 @@ import torch as th
 
 
 class ClipWrapper(Wrapper):
-    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', **kwargs):
+    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', disable_intrinsic=False, **kwargs):
         super().__init__(env)
         self.clip = clip # ClipReward
         self.wrapper_name = "ClipWrapper"
@@ -13,6 +13,7 @@ class ClipWrapper(Wrapper):
         self.expl_prompt = [f"Explore the widest possible area to find {target_object}"]
         self.dense_reward = dense_reward
         self.smoothing = smoothing
+        self.disable_intrinsic = disable_intrinsic
         
         self.buffer = None
         self._clip_state = None, None
@@ -46,7 +47,7 @@ class ClipWrapper(Wrapper):
             score = self._get_score()
 
             if score > self.last_score:
-                obs['intrinsic'] = self.dense_reward * score
+                obs['intrinsic'] = 0.0 if self.disable_intrinsic else self.dense_reward * score
                 self.last_score = score
             else:
                 obs['intrinsic'] = 0.0
@@ -65,7 +66,7 @@ class ClipWrapper(Wrapper):
             expl_score = self._get_expl_score()
 
             if expl_score > self.expl_last_score:
-                info['expl_intrinsic'] = self.dense_reward * expl_score
+                info['expl_intrinsic'] = 0.0 if self.disable_intrinsic else self.dense_reward * expl_score
                 self.expl_last_score = expl_score
             else:
                 info['expl_intrinsic'] = 0.0
