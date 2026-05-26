@@ -120,9 +120,12 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
-            self._wm.dynamics.get_feat(s)
-        ).mode() 
+        # CORE2-no-intrinsic: do not use the original MineCLIP/affordance
+        # intrinsic head in actor imagination.  Keep the callable signature for
+        # compatibility with ImagBehavior._train().
+        def intrinsic(f, s, a):
+            feat = self._wm.dynamics.get_feat(s)
+            return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
 
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
             f

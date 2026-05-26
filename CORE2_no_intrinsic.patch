@@ -1,0 +1,166 @@
+Binary files core2_nointr_orig/CORE-CORE-ISO2/__pycache__/expr.cpython-313.pyc and core2_nointr_work/CORE-CORE-ISO2/__pycache__/expr.cpython-313.pyc differ
+Binary files core2_nointr_orig/CORE-CORE-ISO2/__pycache__/models.cpython-313.pyc and core2_nointr_work/CORE-CORE-ISO2/__pycache__/models.cpython-313.pyc differ
+Binary files core2_nointr_orig/CORE-CORE-ISO2/__pycache__/networks.cpython-313.pyc and core2_nointr_work/CORE-CORE-ISO2/__pycache__/networks.cpython-313.pyc differ
+Binary files core2_nointr_orig/CORE-CORE-ISO2/__pycache__/tools.cpython-313.pyc and core2_nointr_work/CORE-CORE-ISO2/__pycache__/tools.cpython-313.pyc differ
+diff -ruN core2_nointr_orig/CORE-CORE-ISO2/configs.yaml core2_nointr_work/CORE-CORE-ISO2/configs.yaml
+--- core2_nointr_orig/CORE-CORE-ISO2/configs.yaml	2026-05-25 21:30:55.000000000 +0000
++++ core2_nointr_work/CORE-CORE-ISO2/configs.yaml	2026-05-26 18:35:43.974985344 +0000
+@@ -43,6 +43,10 @@
+   reward_EMA: True
+ 
+   # Model
++  # CORE2-no-intrinsic: keep long-term branch, but remove the original
++  # MineCLIP/affordance intrinsic reward from both world-model losses and actor rewards.
++  use_original_intrinsic: False
++  use_wm_progress_reward: False
+   dyn_hidden: 512
+   dyn_deter: 512
+   dyn_stoch: 32
+@@ -51,7 +55,7 @@
+   dyn_mean_act: 'none'
+   dyn_std_act: 'sigmoid2'
+   dyn_min_std: 0.1
+-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
++  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward']
+   units: 512
+   act: 'SiLU'
+   norm: True
+@@ -71,8 +75,9 @@
+     {layers: 2, loss_scale: 1.0, outscale: 1.0}
+   concentration_score_head:
+     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
++  # Kept only for checkpoint/config compatibility; not trained or used when use_original_intrinsic=False.
+   intrinsic_head:
+-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
++    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
+   jumping_steps_head:
+     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+   accumulated_reward_head:
+@@ -124,6 +129,8 @@
+ 
+ minedojo:
+ 
++  use_original_intrinsic: False
++  use_wm_progress_reward: False
+   long_term_branch_weight: 1.0
+   gaussian_reward_weight: 1.0
+   gaussian_sigma_weight: 0.5
+@@ -153,7 +160,7 @@
+   actor: {layers: 5, dist: 'onehot', std: 'none'}
+   value: {layers: 5}
+   reward_head: {layers: 5}
+-  intrinsic_head: {layers: 5}
++  intrinsic_head: {layers: 5, loss_scale: 0.0}
+   jumping_steps_head: {layers: 5}
+   accumulated_reward_head: {layers: 5}
+   end_head: {layers: 5}
+diff -ruN core2_nointr_orig/CORE-CORE-ISO2/expr.py core2_nointr_work/CORE-CORE-ISO2/expr.py
+--- core2_nointr_orig/CORE-CORE-ISO2/expr.py	2026-05-25 21:30:55.000000000 +0000
++++ core2_nointr_work/CORE-CORE-ISO2/expr.py	2026-05-26 18:35:43.975970777 +0000
+@@ -120,9 +120,12 @@
+             self._wm.dynamics.get_feat(s)
+         ).mode()
+ 
+-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
+-            self._wm.dynamics.get_feat(s)
+-        ).mode() 
++        # CORE2-no-intrinsic: do not use the original MineCLIP/affordance
++        # intrinsic head in actor imagination.  Keep the callable signature for
++        # compatibility with ImagBehavior._train().
++        def intrinsic(f, s, a):
++            feat = self._wm.dynamics.get_feat(s)
++            return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
+ 
+         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
+             f
+diff -ruN core2_nointr_orig/CORE-CORE-ISO2/models.py core2_nointr_work/CORE-CORE-ISO2/models.py
+--- core2_nointr_orig/CORE-CORE-ISO2/models.py	2026-05-25 21:30:55.000000000 +0000
++++ core2_nointr_work/CORE-CORE-ISO2/models.py	2026-05-26 18:35:43.977347948 +0000
+@@ -268,7 +268,7 @@
+             reward=config.reward_head["loss_scale"],
+             end=config.end_head["loss_scale"],
+             jump=config.jump_head["loss_scale"],
+-            intrinsic=config.intrinsic_head["loss_scale"],
++            intrinsic=0.0 if not getattr(config, "use_original_intrinsic", True) else config.intrinsic_head["loss_scale"],
+             jumping_steps=config.jumping_steps_head["loss_scale"],
+             accumulated_reward=config.accumulated_reward_head["loss_scale"],
+             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
+@@ -334,6 +334,8 @@
+                     # 4. 计算各个预测头 (Heads) 的损失
+                     preds = {}
+                     for name, head in self.heads.items():
++                        if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
++                            continue
+                         if name in ["jumping_steps", "accumulated_reward"]:
+                             continue
+                         grad_head = name in self._config.grad_heads
+@@ -378,6 +380,8 @@
+ 
+                         preds_zoomed = {}
+                         for name, head in self.heads.items():
++                            if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
++                                continue
+                             grad_head_zoomed = name in self._config.grad_heads
+                             if name in ["jumping_steps", "accumulated_reward"]:
+                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
+@@ -466,7 +470,10 @@
+             obs["image"] = torch.Tensor(obs["zoomed_image"]) / 255.0
+             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
+             obs["reward"] = obs["reward_on_zoomed"]
+-            obs['intrinsic'] = obs['intrinsic_on_zoomed']
++            if getattr(self._config, "use_original_intrinsic", True):
++                obs['intrinsic'] = obs['intrinsic_on_zoomed']
++            else:
++                obs['intrinsic'] = np.zeros_like(obs['reward_on_zoomed'])
+             
+             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
+             if "action" in obs:
+@@ -689,8 +696,11 @@
+ 
+                     # 5. 奖励计算与策略更新
+                     reward = objective(imag_feat, imag_state, imag_action)
+-                    intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+-                    reward += intrinsic_reward
++                    if getattr(self._config, "use_original_intrinsic", True):
++                        intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
++                        reward += intrinsic_reward
++                    else:
++                        metrics["intrinsic_disabled"] = torch.tensor(1.0, device=self._config.device)
+ 
+                     actor_ent = self.actor(imag_feat).entropy() 
+ 
+diff -ruN core2_nointr_orig/CORE-CORE-ISO2/tools.py core2_nointr_work/CORE-CORE-ISO2/tools.py
+--- core2_nointr_orig/CORE-CORE-ISO2/tools.py	2026-05-25 21:30:55.000000000 +0000
++++ core2_nointr_work/CORE-CORE-ISO2/tools.py	2026-05-26 18:35:43.977895434 +0000
+@@ -197,18 +197,25 @@
+             wandb.finish()
+ 
+ def calculate_accumulated_reward(rewards, intrinsics, gamma):
++    """Discounted extrinsic reward used by CORE2-no-intrinsic.
++
++    The original CORE2/LS-Imagine style code added dense intrinsic rewards into
++    the long-term accumulated reward target.  For the clean degradation baseline,
++    long-term imagination is preserved, but the original MineCLIP/affordance
++    intrinsic reward must not leak into the actor or long-term branch targets.
++    The ``intrinsics`` argument is kept for call-site compatibility and is
++    intentionally ignored.
++    """
+     if len(rewards) == 0:
+         return 0
+-    
++
+     rewards = np.array(rewards)
+-    intrinsics = np.array(intrinsics)
+     gammas = np.power(gamma, np.arange(len(rewards)))
+     discounted_rewards = rewards * gammas
+-    discounted_intrinsics = intrinsics * gammas
+-    total_reward = np.sum(discounted_rewards + discounted_intrinsics)
++    total_reward = np.sum(discounted_rewards)
+     gamma_sum = np.sum(gammas)
+-    
+-    return total_reward / gamma_sum  
++
++    return total_reward / gamma_sum
+ 
+ def simulate(
+     agent,

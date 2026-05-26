@@ -197,18 +197,25 @@ class Logger:
             wandb.finish()
 
 def calculate_accumulated_reward(rewards, intrinsics, gamma):
+    """Discounted extrinsic reward used by CORE2-no-intrinsic.
+
+    The original CORE2/LS-Imagine style code added dense intrinsic rewards into
+    the long-term accumulated reward target.  For the clean degradation baseline,
+    long-term imagination is preserved, but the original MineCLIP/affordance
+    intrinsic reward must not leak into the actor or long-term branch targets.
+    The ``intrinsics`` argument is kept for call-site compatibility and is
+    intentionally ignored.
+    """
     if len(rewards) == 0:
         return 0
-    
+
     rewards = np.array(rewards)
-    intrinsics = np.array(intrinsics)
     gammas = np.power(gamma, np.arange(len(rewards)))
     discounted_rewards = rewards * gammas
-    discounted_intrinsics = intrinsics * gammas
-    total_reward = np.sum(discounted_rewards + discounted_intrinsics)
+    total_reward = np.sum(discounted_rewards)
     gamma_sum = np.sum(gammas)
-    
-    return total_reward / gamma_sum  
+
+    return total_reward / gamma_sum
 
 def simulate(
     agent,

@@ -268,7 +268,7 @@ class WorldModel(nn.Module):
             reward=config.reward_head["loss_scale"],
             end=config.end_head["loss_scale"],
             jump=config.jump_head["loss_scale"],
-            intrinsic=config.intrinsic_head["loss_scale"],
+            intrinsic=0.0 if not getattr(config, "use_original_intrinsic", True) else config.intrinsic_head["loss_scale"],
             jumping_steps=config.jumping_steps_head["loss_scale"],
             accumulated_reward=config.accumulated_reward_head["loss_scale"],
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
@@ -334,6 +334,8 @@ class WorldModel(nn.Module):
                     # 4. 计算各个预测头 (Heads) 的损失
                     preds = {}
                     for name, head in self.heads.items():
+                        if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                            continue
                         if name in ["jumping_steps", "accumulated_reward"]:
                             continue
                         grad_head = name in self._config.grad_heads
@@ -378,6 +380,8 @@ class WorldModel(nn.Module):
 
                         preds_zoomed = {}
                         for name, head in self.heads.items():
+                            if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                                continue
                             grad_head_zoomed = name in self._config.grad_heads
                             if name in ["jumping_steps", "accumulated_reward"]:
                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
@@ -466,7 +470,10 @@ class WorldModel(nn.Module):
             obs["image"] = torch.Tensor(obs["zoomed_image"]) / 255.0
             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
             obs["reward"] = obs["reward_on_zoomed"]
-            obs['intrinsic'] = obs['intrinsic_on_zoomed']
+            if getattr(self._config, "use_original_intrinsic", True):
+                obs['intrinsic'] = obs['intrinsic_on_zoomed']
+            else:
+                obs['intrinsic'] = np.zeros_like(obs['reward_on_zoomed'])
             
             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
             if "action" in obs:
@@ -689,8 +696,11 @@ class ImagBehavior(nn.Module):
 
                     # 5. 奖励计算与策略更新
                     reward = objective(imag_feat, imag_state, imag_action)
-                    intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                    reward += intrinsic_reward
+                    if getattr(self._config, "use_original_intrinsic", True):
+                        intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                        reward += intrinsic_reward
+                    else:
+                        metrics["intrinsic_disabled"] = torch.tensor(1.0, device=self._config.device)
 
                     actor_ent = self.actor(imag_feat).entropy() 
 
