@@ -343,18 +343,49 @@ class AffordanceTopKObjectPool(nn.Module):
         self.apply(tools.weight_init)
 
     def forward(self, spatial_feat, heatmap):
-        # spatial_feat: [B, T, C, H, W], heatmap: [B, T, H0, W0, 1] or [B,T,H0,W0]
-        b, t, c, h, w = spatial_feat.shape
-        bt = b * t
-        x = spatial_feat.reshape(bt, c, h, w)
+        # Training-time encoder input has a time dimension:
+        #   spatial_feat: [B, T, C, H, W]
+        # Policy/evaluation input is a single step without time:
+        #   spatial_feat: [B, C, H, W]
+        # Keep both cases valid and return a context with matching leading dims.
+        has_time = spatial_feat.ndim == 5
+        if has_time:
+            b, t, c, h, w = spatial_feat.shape
+            bt = b * t
+            x = spatial_feat.reshape(bt, c, h, w)
+        elif spatial_feat.ndim == 4:
+            b, c, h, w = spatial_feat.shape
+            t = None
+            bt = b
+            x = spatial_feat
+        else:
+            raise ValueError(f"spatial_feat must be 4D or 5D, got shape {tuple(spatial_feat.shape)}")
+
         if heatmap is None:
             hm = torch.zeros(bt, 1, h, w, device=x.device, dtype=x.dtype)
         else:
             hm = heatmap
             if hm.ndim == 5:
-                hm = hm.reshape(bt, hm.shape[-3], hm.shape[-2], hm.shape[-1]).permute(0, 3, 1, 2)
+                # [B,T,H,W,1] or [B,T,1,H,W]
+                if hm.shape[-1] == 1:
+                    hm = hm.reshape(bt, hm.shape[-3], hm.shape[-2], hm.shape[-1]).permute(0, 3, 1, 2)
+                elif hm.shape[-3] == 1:
+                    hm = hm.reshape(bt, hm.shape[-3], hm.shape[-2], hm.shape[-1])
+                else:
+                    hm = hm.reshape(bt, 1, hm.shape[-2], hm.shape[-1])
             elif hm.ndim == 4:
+                # Could be [B,H,W,1] for policy/eval, [B,T,H,W] for training, or [B,1,H,W].
+                if hm.shape[-1] == 1:
+                    hm = hm.permute(0, 3, 1, 2)
+                elif hm.shape[1] == 1 and hm.shape[0] == bt:
+                    pass
+                else:
+                    hm = hm.reshape(bt, 1, hm.shape[-2], hm.shape[-1])
+            elif hm.ndim == 3:
+                # [B,H,W]
                 hm = hm.reshape(bt, 1, hm.shape[-2], hm.shape[-1])
+            else:
+                raise ValueError(f"heatmap must be 3D, 4D, or 5D, got shape {tuple(hm.shape)}")
             hm = hm.to(device=x.device, dtype=x.dtype)
             hm = F.interpolate(hm, size=(h, w), mode="bilinear", align_corners=False)
         scores = hm.flatten(1)  # [BT, HW]
@@ -373,7 +404,11 @@ class AffordanceTopKObjectPool(nn.Module):
         tokens = tokens + tokens_attn
         weights = torch.softmax(vals / max(self._score_temp, 1e-6), dim=-1).unsqueeze(-1)
         pooled = torch.sum(tokens * weights, dim=1)
-        context = self._context_mlp(pooled).reshape(b, t, self._context_dim)
+        context = self._context_mlp(pooled)
+        if has_time:
+            context = context.reshape(b, t, self._context_dim)
+        else:
+            context = context.reshape(b, self._context_dim)
         stats = {
             "aff_object_score_mean": vals.mean().detach(),
             "aff_object_score_std": vals.std().detach(),
