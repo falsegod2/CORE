@@ -334,6 +334,8 @@ class WorldModel(nn.Module):
                     # 4. 计算各个预测头 (Heads) 的损失
                     preds = {}
                     for name, head in self.heads.items():
+                        if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                            continue
                         if name in ["jumping_steps", "accumulated_reward"]:
                             continue
                         grad_head = name in self._config.grad_heads
@@ -378,6 +380,8 @@ class WorldModel(nn.Module):
 
                         preds_zoomed = {}
                         for name, head in self.heads.items():
+                            if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                                continue
                             grad_head_zoomed = name in self._config.grad_heads
                             if name in ["jumping_steps", "accumulated_reward"]:
                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
@@ -567,6 +571,76 @@ class ImagBehavior(nn.Module):
             self.register_buffer("ema_vals", torch.zeros((2,)).to(self._config.device))
             self.reward_ema = RewardEMA(device=self._config.device)
 
+    def _wm_progress_scale(self):
+        """Annealed scale for CORE2-WMP model-predicted progress bonus.
+
+        This replaces the original environment-side intrinsic reward.  The bonus
+        is deliberately decayed so that it helps early sparse-reward exploration
+        but lets the policy rely on environment reward and long-term returns later.
+        """
+        if not getattr(self._config, "use_wm_progress_reward", False):
+            return 0.0
+
+        base = float(getattr(self._config, "wm_progress_scale", 0.03))
+        min_scale = float(getattr(self._config, "wm_progress_min_scale", 0.0))
+        decay_steps = int(getattr(self._config, "wm_progress_decay_steps", 200000))
+        if decay_steps <= 0:
+            return base
+
+        updates = float(getattr(self, "_updates", 0))
+        decay = max(0.0, 1.0 - updates / float(decay_steps))
+        return max(min_scale, base * decay)
+
+    def _wm_progress_reward(
+        self,
+        imag_feat,
+        imag_state,
+        jump_indicator,
+        jumping_steps_predictor,
+        accumulated_reward_predictor,
+    ):
+        """World-Model Progress bonus for sparse-reward exploration.
+
+        The original CORE2/LS-Imagine intrinsic comes from wrapper-computed
+        heatmap/MineCLIP shaping.  CORE2-WMP does not use that signal. Instead,
+        it gives the actor a small, detached bonus when the current imagined
+        trajectory increases model-predicted jumpability and when the long-term
+        branch predicts a useful jump interval.
+        """
+        scale = self._wm_progress_scale()
+        zeros = torch.zeros(imag_feat.shape[:-1] + (1,), device=imag_feat.device, dtype=imag_feat.dtype)
+        if scale <= 0.0 or imag_feat.shape[0] < 2:
+            return zeros
+
+        with torch.no_grad():
+            jump_prob = jump_indicator(imag_state)
+            jump_prob = torch.nan_to_num(jump_prob, nan=0.0, posinf=1.0, neginf=0.0)
+            jump_prob = jump_prob.clamp(0.0, 1.0).to(imag_feat.dtype)
+
+            # Positive progress toward states that the world model considers
+            # suitable for long-term imagination.
+            jump_delta = torch.relu(jump_prob[1:] - jump_prob[:-1])
+            jump_delta = torch.cat([torch.zeros_like(jump_prob[:1]), jump_delta], dim=0)
+
+            # Long-branch utility: predicted accumulated return normalized by
+            # predicted interval length, gated by jump probability.
+            fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1)
+            pred_steps = jumping_steps_predictor(fc, None, None).float().clamp_min(1.0)
+            pred_acc_reward = accumulated_reward_predictor(fc, None, None).float()
+            pred_acc_reward = torch.nan_to_num(pred_acc_reward, nan=0.0, posinf=0.0, neginf=0.0)
+            long_bonus = jump_prob[:-1] * torch.tanh(torch.relu(pred_acc_reward) / torch.sqrt(pred_steps + 1.0))
+            long_bonus = torch.cat([torch.zeros_like(jump_prob[:1]), long_bonus], dim=0)
+
+            w_jump = float(getattr(self._config, "wm_progress_jump_weight", 1.0))
+            w_long = float(getattr(self._config, "wm_progress_long_weight", 0.2))
+            clip = float(getattr(self._config, "wm_progress_clip", 1.0))
+            bonus = w_jump * jump_delta + w_long * long_bonus
+            bonus = torch.nan_to_num(bonus, nan=0.0, posinf=0.0, neginf=0.0)
+            if clip > 0.0:
+                bonus = bonus.clamp(0.0, clip)
+
+        return bonus * scale
+
     def _train(
             self,
             start,
@@ -689,8 +763,25 @@ class ImagBehavior(nn.Module):
 
                     # 5. 奖励计算与策略更新
                     reward = objective(imag_feat, imag_state, imag_action)
-                    intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                    reward += intrinsic_reward
+
+                    # CORE2-WMP: remove the original wrapper-provided intrinsic reward.
+                    # Optionally keep it only when explicitly enabled for ablations.
+                    if getattr(self._config, "use_original_intrinsic", True):
+                        intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
+                        reward += intrinsic_reward
+                        metrics.update(tools.tensorstats(intrinsic_reward, "intrinsic_reward"))
+
+                    if getattr(self._config, "use_wm_progress_reward", False):
+                        wm_progress_reward = self._wm_progress_reward(
+                            imag_feat,
+                            imag_state,
+                            jump_indicator,
+                            jumping_steps_predictor,
+                            accumulated_reward_predictor,
+                        )
+                        reward += wm_progress_reward
+                        metrics.update(tools.tensorstats(wm_progress_reward, "wm_progress_reward"))
+                        metrics["wm_progress_scale"] = self._wm_progress_scale()
 
                     actor_ent = self.actor(imag_feat).entropy() 
 

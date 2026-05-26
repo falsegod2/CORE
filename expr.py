@@ -120,9 +120,12 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
-            self._wm.dynamics.get_feat(s)
-        ).mode() 
+        def intrinsic(f, s, a):
+            # CORE2-WMP: original wrapper-provided intrinsic reward is disabled.
+            # We keep this callable only for backward compatibility with
+            # ImagBehavior._train(); the replacement bonus is computed inside
+            # ImagBehavior from world-model progress predictions.
+            return torch.zeros(f.shape[:-1] + (1,), device=f.device, dtype=f.dtype)
 
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
             f
