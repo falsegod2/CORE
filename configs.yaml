@@ -27,7 +27,7 @@ defaults:
   log_every: 20000
   reset_every: 0
   device: 'cuda:0'
-  compile: True
+  compile: False  # CORE2-SLP: keep Python landmark-bank updates outside torch.compile
   precision: 32
   debug: False
   video_pred_log: True
@@ -51,7 +51,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward']
+  grad_heads: ['decoder', 'reward', 'end']
   units: 512
   act: 'SiLU'
   norm: True
@@ -68,7 +68,7 @@ defaults:
   end_head:
     {layers: 2, loss_scale: 1.0, outscale: 1.0}
   jump_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+    {layers: 2, loss_scale: 0.0, outscale: 1.0}
   concentration_score_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   # CORE2-WMP: do not train or use the original LS-Imagine-style intrinsic head.
@@ -76,23 +76,35 @@ defaults:
   intrinsic_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
   jumping_steps_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
   accumulated_reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
 
-  # ===== CORE2-WMP: World-Model Progress reward =====
-  # Keep long-term imagination, but replace the original intrinsic reward with
-  # a model-predicted progress bonus derived from jump_head, jumping_steps_head,
-  # and accumulated_reward_head.
+  # ===== CORE2-SLP: Strategic Latent Progress with MineCLIP Landmarks =====
+  # MineCLIP score is used only to mine task-relevant latent landmarks from replay.
+  # The actor receives a dense reward only when imagined latent states move
+  # closer to those landmarks. Original intrinsic reward and WMP are disabled.
   use_original_intrinsic: False
-  use_wm_progress_reward: True
-  wm_progress_scale: 0.03
-  wm_progress_prob_weight: 0.5
-  wm_progress_jump_weight: 1.0
-  wm_progress_long_weight: 0.2
-  wm_progress_decay_steps: 200000
-  wm_progress_min_scale: 0.0
-  wm_progress_clip: 1.0
+  use_long_term: False
+  use_wm_progress_reward: False
+  use_slp_reward: True
+  slp_reward_scale: 0.03
+  slp_min_scale: 0.0
+  slp_decay_steps: 200000
+  slp_reward_clip: 1.0
+  slp_bank_size: 4096
+  slp_top_percentile: 0.2
+  slp_max_new_landmarks: 128
+  slp_candidate_k: 8
+  slp_score_key: 'obs_reward'
+  slp_distance: 'cosine'
+  slp_use_positive_only: True
+  slp_score_priority: 1.0
+  slp_reachability_weight: 0.7
+  slp_min_score: null
+  slp_use_diversity: True
+  slp_landmark_sim_threshold: 0.95
+  slp_replace_similar: True
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -117,7 +129,7 @@ defaults:
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7
+  jump_prob: 0.0  # CORE2-SLP: no jumpy/long-term imagination by default
   jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
@@ -170,24 +182,36 @@ minedojo:
   value: {layers: 5}
   reward_head: {layers: 5}
   intrinsic_head: {layers: 5, loss_scale: 0.0}
-  jumping_steps_head: {layers: 5}
-  accumulated_reward_head: {layers: 5}
+  jumping_steps_head: {layers: 5, loss_scale: 0.0}
+  accumulated_reward_head: {layers: 5, loss_scale: 0.0}
   end_head: {layers: 5}
-  jump_head: {layers: 5}
+  jump_head: {layers: 5, loss_scale: 0.0}
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000
 
-  # CORE2-WMP overrides for MineDojo experiments.
+  # CORE2-SLP overrides for MineDojo experiments.
   use_original_intrinsic: False
-  use_wm_progress_reward: True
-  wm_progress_scale: 0.03
-  wm_progress_prob_weight: 0.5
-  wm_progress_jump_weight: 1.0
-  wm_progress_long_weight: 0.2
-  wm_progress_decay_steps: 200000
-  wm_progress_min_scale: 0.0
-  wm_progress_clip: 1.0
+  use_long_term: False
+  use_wm_progress_reward: False
+  use_slp_reward: True
+  slp_reward_scale: 0.03
+  slp_min_scale: 0.0
+  slp_decay_steps: 200000
+  slp_reward_clip: 1.0
+  slp_bank_size: 4096
+  slp_top_percentile: 0.2
+  slp_max_new_landmarks: 128
+  slp_candidate_k: 8
+  slp_score_key: 'obs_reward'
+  slp_distance: 'cosine'
+  slp_use_positive_only: True
+  slp_score_priority: 1.0
+  slp_reachability_weight: 0.7
+  slp_min_score: null
+  slp_use_diversity: True
+  slp_landmark_sim_threshold: 0.95
+  slp_replace_similar: True
 
 debug:
   debug: True

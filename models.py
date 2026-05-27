@@ -281,13 +281,14 @@ class WorldModel(nn.Module):
             data = self.preprocess(data_origin, zoomed=False)
             data_zoomed = self.preprocess(data_origin, zoomed=True)
 
-            zoomed_num = torch.sum(data["is_zoomed"]).item()
+            use_long_term = getattr(self._config, "use_long_term", True)
+            zoomed_num = torch.sum(data["is_zoomed"]).item() if use_long_term else 0
 
             with tools.RequiresGrad(self):
                 with torch.cuda.amp.autocast(self._use_amp):
                     # 编码图像特征
                     embed = self.encoder(data)
-                    embed_zoomed = self.encoder(data_zoomed)
+                    embed_zoomed = self.encoder(data_zoomed) if use_long_term else None
 
                     # --- 2. 正常序列观察 (Observe Phase) ---
                     # post 包含: deter_s, deter_z, stoch_s, stoch_z
@@ -359,7 +360,7 @@ class WorldModel(nn.Module):
                     }
 
                     # --- 5. 处理缩放跳跃序列 (Zoomed Data Branch) ---
-                    if zoomed_num > 0:
+                    if zoomed_num > 0 and use_long_term:
                         is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
                         is_calculated_mask = data["is_calculated"][is_zoomed_indices]
                         
@@ -414,7 +415,7 @@ class WorldModel(nn.Module):
                         }
 
                     # --- 6. 损失聚合与优化 ---
-                    if zoomed_num > 0:
+                    if zoomed_num > 0 and use_long_term:
                         kl_loss = torch.cat((kl_loss_img.reshape(-1), kl_loss_jmp.reshape(-1)), dim=0)
                         scaled_img = sum(scaled.values()).reshape(-1)
                         scaled_jmp = sum(scaled_zoomed.values()).reshape(-1)
@@ -446,7 +447,7 @@ class WorldModel(nn.Module):
                 metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist(z_stats).entropy()))
 
             post = {k: v.detach() for k, v in post.items()}
-            post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if zoomed_num > 0 else None
+            post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if (zoomed_num > 0 and use_long_term) else None
             context = dict(embed=embed, feat=self.dynamics.get_feat(post), kl=kl_value_img)
 
             return post, post_zoomed, context, metrics
@@ -470,7 +471,7 @@ class WorldModel(nn.Module):
             obs["image"] = torch.Tensor(obs["zoomed_image"]) / 255.0
             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
             obs["reward"] = obs["reward_on_zoomed"]
-            obs['intrinsic'] = obs['intrinsic_on_zoomed']
+            obs['intrinsic'] = np.zeros_like(obs['intrinsic_on_zoomed'])
             
             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
             if "action" in obs:
@@ -531,7 +532,9 @@ class ImagBehavior(nn.Module):
         super(ImagBehavior, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
-        self.jump_prob = config.jump_prob
+        # CORE2-SLP disables jumpy/long-term imagination by default; keep the
+        # implementation available for ablations through use_long_term=True.
+        self.jump_prob = config.jump_prob if getattr(config, "use_long_term", True) else 0.0
         # 预计算折扣因子的累加和，用于长时奖励修正
         self.gamma_sum = [(1 - self._config.discount ** (i + 1)) / (1 - self._config.discount) for i in range(self._config.episode_max_steps)]
         self.gamma_sum = torch.tensor(self.gamma_sum, dtype=torch.float32, device=config.device)
@@ -601,24 +604,14 @@ class ImagBehavior(nn.Module):
     ):
         """World-Model Progress bonus for sparse-reward exploration.
 
-        CORE2-WMP-v2 does not use wrapper-computed intrinsic rewards.  Instead,
-        it derives a detached dense guidance signal from the learned world model:
-        (1) the current state's predicted jumpability, (2) positive increase of
-        jumpability along imagined trajectories, and (3) predicted long-term
-        interval utility.  The direct jumpability term is important in early
-        sparse-reward training; otherwise accumulated_reward_head is almost zero
-        before the agent has found successful trajectories.
+        The original CORE2/LS-Imagine intrinsic comes from wrapper-computed
+        heatmap/MineCLIP shaping.  CORE2-WMP does not use that signal. Instead,
+        it gives the actor a small, detached bonus when the current imagined
+        trajectory increases model-predicted jumpability and when the long-term
+        branch predicts a useful jump interval.
         """
         scale = self._wm_progress_scale()
         zeros = torch.zeros(imag_feat.shape[:-1] + (1,), device=imag_feat.device, dtype=imag_feat.dtype)
-        self._last_wmp_metrics = {
-            "wmp_enabled": float(getattr(self._config, "use_wm_progress_reward", False)),
-            "wm_progress_scale": float(scale),
-            "wmp_jump_prob_mean": 0.0,
-            "wmp_jump_delta_mean": 0.0,
-            "wmp_long_bonus_mean": 0.0,
-            "wmp_bonus_raw_mean": 0.0,
-        }
         if scale <= 0.0 or imag_feat.shape[0] < 2:
             return zeros
 
@@ -627,17 +620,13 @@ class ImagBehavior(nn.Module):
             jump_prob = torch.nan_to_num(jump_prob, nan=0.0, posinf=1.0, neginf=0.0)
             jump_prob = jump_prob.clamp(0.0, 1.0).to(imag_feat.dtype)
 
-            # 1) Dense state-level progress prior.  This is not the original
-            # environment-side intrinsic; it is the learned world model's belief
-            # that a state is suitable for long-term imagination.
-            prob_bonus = jump_prob
-
-            # 2) Positive progress toward higher jumpability.
+            # Positive progress toward states that the world model considers
+            # suitable for long-term imagination.
             jump_delta = torch.relu(jump_prob[1:] - jump_prob[:-1])
             jump_delta = torch.cat([torch.zeros_like(jump_prob[:1]), jump_delta], dim=0)
 
-            # 3) Long-branch utility.  Early in training this term is often zero
-            # under sparse rewards, so it is intentionally not the only bonus.
+            # Long-branch utility: predicted accumulated return normalized by
+            # predicted interval length, gated by jump probability.
             fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1)
             pred_steps = jumping_steps_predictor(fc, None, None).float().clamp_min(1.0)
             pred_acc_reward = accumulated_reward_predictor(fc, None, None).float()
@@ -645,23 +634,13 @@ class ImagBehavior(nn.Module):
             long_bonus = jump_prob[:-1] * torch.tanh(torch.relu(pred_acc_reward) / torch.sqrt(pred_steps + 1.0))
             long_bonus = torch.cat([torch.zeros_like(jump_prob[:1]), long_bonus], dim=0)
 
-            w_prob = float(getattr(self._config, "wm_progress_prob_weight", 0.5))
             w_jump = float(getattr(self._config, "wm_progress_jump_weight", 1.0))
             w_long = float(getattr(self._config, "wm_progress_long_weight", 0.2))
             clip = float(getattr(self._config, "wm_progress_clip", 1.0))
-            bonus = w_prob * prob_bonus + w_jump * jump_delta + w_long * long_bonus
+            bonus = w_jump * jump_delta + w_long * long_bonus
             bonus = torch.nan_to_num(bonus, nan=0.0, posinf=0.0, neginf=0.0)
             if clip > 0.0:
                 bonus = bonus.clamp(0.0, clip)
-
-            self._last_wmp_metrics = {
-                "wmp_enabled": 1.0,
-                "wm_progress_scale": float(scale),
-                "wmp_jump_prob_mean": float(jump_prob.mean().detach().cpu().item()),
-                "wmp_jump_delta_mean": float(jump_delta.mean().detach().cpu().item()),
-                "wmp_long_bonus_mean": float(long_bonus.mean().detach().cpu().item()),
-                "wmp_bonus_raw_mean": float(bonus.mean().detach().cpu().item()),
-            }
 
         return bonus * scale
 
@@ -675,6 +654,7 @@ class ImagBehavior(nn.Module):
             accumulated_reward_predictor,
             jump_indicator,
             is_end,
+            slp_objective=None,
         ):
             self._update_slow_target()
             metrics = {}
@@ -805,7 +785,12 @@ class ImagBehavior(nn.Module):
                         )
                         reward += wm_progress_reward
                         metrics.update(tools.tensorstats(wm_progress_reward, "wm_progress_reward"))
-                        metrics.update(getattr(self, "_last_wmp_metrics", {}))
+                        metrics["wm_progress_scale"] = self._wm_progress_scale()
+
+                    if getattr(self._config, "use_slp_reward", False) and slp_objective is not None:
+                        slp_reward = slp_objective(imag_feat, imag_state, imag_action)
+                        reward += slp_reward
+                        metrics.update(tools.tensorstats(slp_reward, "slp_reward"))
 
                     actor_ent = self.actor(imag_feat).entropy() 
 

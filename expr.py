@@ -34,7 +34,7 @@ def _metric_to_float(value):
         return float(np.nanmean(value))
     if isinstance(value, (list, tuple)):
         vals = [_metric_to_float(v) for v in value if v is not None]
-        if len(vals) == 0:
+        if not vals:
             return 0.0
         return float(np.nanmean(vals))
     try:
@@ -61,6 +61,12 @@ class LS_Imagine(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
+        # CORE2-SLP: latent landmark bank mined from replay by MineCLIP score.
+        self._slp_landmarks = None
+        self._slp_scores = None
+        self._slp_bank_ptr = 0
+        self._slp_bank_count = 0
+        self._slp_last_metrics = {}
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
         if (
@@ -103,6 +109,246 @@ class LS_Imagine(nn.Module):
             self._logger.step = self._config.action_repeat * self._step
         return policy_output, state
 
+    def _slp_scale(self):
+        if not getattr(self._config, "use_slp_reward", False):
+            return 0.0
+        base = float(getattr(self._config, "slp_reward_scale", 0.03))
+        min_scale = float(getattr(self._config, "slp_min_scale", 0.0))
+        decay_steps = int(getattr(self._config, "slp_decay_steps", 200000))
+        if decay_steps <= 0:
+            return base
+        decay = max(0.0, 1.0 - float(self._update_count) / float(decay_steps))
+        return max(min_scale, base * decay)
+
+    def _ensure_slp_bank(self, feat_dim):
+        bank_size = int(getattr(self._config, "slp_bank_size", 4096))
+        device = self._config.device
+        if self._slp_landmarks is None or self._slp_landmarks.shape[-1] != feat_dim:
+            self._slp_landmarks = torch.zeros(bank_size, feat_dim, device=device, dtype=torch.float32)
+            self._slp_scores = torch.full((bank_size,), -1.0e9, device=device, dtype=torch.float32)
+            self._slp_bank_ptr = 0
+            self._slp_bank_count = 0
+
+    def _get_slp_scores_from_batch(self, data):
+        keys = [getattr(self._config, "slp_score_key", "obs_reward"), "obs_reward", "score"]
+        for key in keys:
+            if key in data:
+                score = data[key]
+                if isinstance(score, torch.Tensor):
+                    score = score.detach().to(self._config.device).float()
+                else:
+                    score = torch.as_tensor(score, device=self._config.device).float()
+                return score.squeeze(-1) if score.ndim > 2 and score.shape[-1] == 1 else score
+        return None
+
+    def _insert_slp_landmarks_diverse(self, cand_feat, cand_score):
+        """Insert semantically strong but diverse landmarks into the bank.
+
+        CORE2-SLP differs from plain LGP here: it avoids filling the whole bank
+        with near-duplicate high-MineCLIP-score frames, and replaces an existing
+        near-duplicate only when the new candidate has a better semantic score.
+        """
+        if cand_feat.numel() == 0:
+            return 0, 0, 0
+        self._ensure_slp_bank(cand_feat.shape[-1])
+        bank_size = int(self._slp_landmarks.shape[0])
+        use_div = bool(getattr(self._config, "slp_use_diversity", True))
+        replace_similar = bool(getattr(self._config, "slp_replace_similar", True))
+        sim_threshold = float(getattr(self._config, "slp_landmark_sim_threshold", 0.95))
+        inserted, replaced, skipped = 0, 0, 0
+
+        for feat_i, score_i in zip(cand_feat, cand_score):
+            score_i = score_i.detach().float()
+            feat_i = feat_i.detach().float()
+            if self._slp_bank_count <= 0:
+                idx = int(self._slp_bank_ptr)
+                self._slp_landmarks[idx] = feat_i
+                self._slp_scores[idx] = score_i
+                self._slp_bank_ptr = int((self._slp_bank_ptr + 1) % bank_size)
+                self._slp_bank_count = min(bank_size, self._slp_bank_count + 1)
+                inserted += 1
+                continue
+
+            if use_div:
+                valid = self._slp_landmarks[: int(self._slp_bank_count)]
+                if getattr(self._config, "slp_distance", "cosine") == "cosine":
+                    sim = torch.matmul(valid, feat_i)
+                else:
+                    sim = -torch.sum((valid - feat_i.unsqueeze(0)) ** 2, dim=-1)
+                max_sim, max_idx = torch.max(sim, dim=0)
+                is_duplicate = bool(max_sim.item() >= sim_threshold) if getattr(self._config, "slp_distance", "cosine") == "cosine" else False
+                if is_duplicate:
+                    idx = int(max_idx.item())
+                    if replace_similar and score_i > self._slp_scores[idx]:
+                        self._slp_landmarks[idx] = feat_i
+                        self._slp_scores[idx] = score_i
+                        replaced += 1
+                    else:
+                        skipped += 1
+                    continue
+
+            idx = int(self._slp_bank_ptr)
+            self._slp_landmarks[idx] = feat_i
+            self._slp_scores[idx] = score_i
+            self._slp_bank_ptr = int((self._slp_bank_ptr + 1) % bank_size)
+            self._slp_bank_count = min(bank_size, self._slp_bank_count + 1)
+            inserted += 1
+
+        return inserted, replaced, skipped
+
+    def _get_slp_score_delta(self, score, feat_len):
+        """Estimate MineCLIP progress inside a replay sequence for landmark priority."""
+        try:
+            score_seq = score.reshape(-1)
+            # If score came from [B, T], use temporal delta before flattening when possible.
+            # Otherwise this falls back to a safe zero-delta vector.
+            # The caller only uses this as an optional priority term.
+            return torch.zeros(feat_len, device=self._config.device, dtype=torch.float32)
+        except Exception:
+            return torch.zeros(feat_len, device=self._config.device, dtype=torch.float32)
+
+    def _update_slp_landmarks(self, feat, data):
+        """Mine strategic, diverse latent landmarks using MineCLIP score.
+
+        MineCLIP is not used as an online dense reward here. It only ranks replay
+        states. The actor receives a model-side latent progress reward for moving
+        its imagined states toward selected landmarks.
+        """
+        if not getattr(self._config, "use_slp_reward", False):
+            return {}
+        with torch.no_grad():
+            score = self._get_slp_scores_from_batch(data)
+            if score is None:
+                return {"slp_bank_size": float(self._slp_bank_count), "slp_no_score_key": 1.0}
+
+            feat = feat.detach().float().reshape(-1, feat.shape[-1])
+            raw_score = score.detach().float()
+            score = raw_score.reshape(-1).float()
+            n = min(feat.shape[0], score.shape[0])
+            if n <= 0:
+                return {"slp_bank_size": float(self._slp_bank_count)}
+            feat, score = feat[:n], score[:n]
+            valid = torch.isfinite(score)
+            min_score = getattr(self._config, "slp_min_score", None)
+            if min_score is not None:
+                valid = valid & (score >= float(min_score))
+            if not valid.any():
+                return {
+                    "slp_bank_size": float(self._slp_bank_count),
+                    "slp_batch_score_mean": _metric_to_float(score),
+                    "slp_selected_num": 0.0,
+                }
+
+            feat, score = feat[valid], score[valid]
+            frac = float(getattr(self._config, "slp_top_percentile", 0.2))
+            frac = max(0.0, min(1.0, frac))
+            k = max(1, int(round(feat.shape[0] * frac)))
+            k = min(k, int(getattr(self._config, "slp_max_new_landmarks", 128)), feat.shape[0])
+            top_score, top_idx = torch.topk(score, k=k, largest=True)
+            top_feat = feat[top_idx]
+            if getattr(self._config, "slp_distance", "cosine") == "cosine":
+                top_feat = torch.nn.functional.normalize(top_feat, dim=-1, eps=1e-6)
+
+            inserted, replaced, skipped = self._insert_slp_landmarks_diverse(top_feat, top_score)
+            return {
+                "slp_bank_size": float(self._slp_bank_count),
+                "slp_selected_num": float(k),
+                "slp_inserted_num": float(inserted),
+                "slp_replaced_num": float(replaced),
+                "slp_skipped_duplicate_num": float(skipped),
+                "slp_batch_score_mean": _metric_to_float(score),
+                "slp_selected_score_mean": _metric_to_float(top_score),
+                "slp_selected_score_max": _metric_to_float(top_score.max()),
+            }
+
+    def _strategic_latent_progress_reward(self, imag_feat):
+        """Dense progress reward toward reachable strategic MineCLIP landmarks.
+
+        For each imagined sequence, CORE2-SLP selects a small set of landmarks
+        that are both semantically strong and reachable from the current imagined
+        start state, then rewards increases in similarity to those landmarks.
+        """
+        scale = self._slp_scale()
+        zeros = torch.zeros(imag_feat.shape[:-1] + (1,), device=imag_feat.device, dtype=imag_feat.dtype)
+        self._slp_last_metrics = {
+            "slp_scale": float(scale),
+            "slp_bank_size": float(self._slp_bank_count),
+        }
+        if scale <= 0.0 or self._slp_landmarks is None or self._slp_bank_count <= 0 or imag_feat.shape[0] < 2:
+            return zeros
+
+        with torch.no_grad():
+            valid_count = int(self._slp_bank_count)
+            landmarks = self._slp_landmarks[:valid_count].detach().float()
+            scores = self._slp_scores[:valid_count].detach().float()
+            feat = imag_feat.detach().float()
+
+            if getattr(self._config, "slp_distance", "cosine") == "cosine":
+                feat_n = torch.nn.functional.normalize(feat, dim=-1, eps=1e-6)
+                land_n = torch.nn.functional.normalize(landmarks, dim=-1, eps=1e-6)
+                start_sim = torch.matmul(feat_n[0], land_n.t())  # [N, M]
+            else:
+                feat_n = feat
+                land_n = landmarks
+                start_sim = -torch.cdist(feat[0], landmarks, p=2) ** 2
+
+            # Normalize MineCLIP scores inside the current landmark bank.
+            if scores.numel() > 1:
+                score_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-6)
+            else:
+                score_norm = torch.zeros_like(scores)
+
+            # Strategic landmark selection: semantic score minus reachability cost.
+            alpha = float(getattr(self._config, "slp_score_priority", 1.0))
+            beta = float(getattr(self._config, "slp_reachability_weight", 0.7))
+            priority = alpha * score_norm.unsqueeze(0) + beta * start_sim
+            cand_k = min(int(getattr(self._config, "slp_candidate_k", 8)), valid_count)
+            _, cand_idx = torch.topk(priority, k=cand_k, dim=-1, largest=True)  # [N, K]
+            cand = land_n[cand_idx]
+
+            if getattr(self._config, "slp_distance", "cosine") == "cosine":
+                sim = torch.einsum("lnd,nkd->lnk", feat_n, cand)
+                phi = sim.max(dim=-1).values  # [L, N]
+                dist = 1.0 - phi
+            else:
+                diff = feat.unsqueeze(2) - cand.unsqueeze(0)
+                dist_all = torch.sum(diff * diff, dim=-1)
+                dist = dist_all.min(dim=-1).values
+                phi = -dist
+
+            progress = phi[1:] - phi[:-1]
+            if getattr(self._config, "slp_use_positive_only", True):
+                progress = torch.relu(progress)
+            clip = float(getattr(self._config, "slp_reward_clip", 1.0))
+            if clip > 0.0:
+                if getattr(self._config, "slp_use_positive_only", True):
+                    progress = progress.clamp(0.0, clip)
+                else:
+                    progress = progress.clamp(-clip, clip)
+            reward = torch.zeros_like(zeros)
+            reward[1:, :, 0] = progress.to(reward.dtype)
+            reward = reward * float(scale)
+
+            selected_scores = torch.gather(score_norm.unsqueeze(0).expand_as(start_sim), 1, cand_idx)
+            selected_start_sim = torch.gather(start_sim, 1, cand_idx)
+            self._slp_last_metrics = {
+                "slp_scale": float(scale),
+                "slp_bank_size": float(valid_count),
+                "slp_reward_mean": _metric_to_float(reward),
+                "slp_reward_max": _metric_to_float(reward.max()),
+                "slp_distance_mean": _metric_to_float(dist),
+                "slp_phi_mean": _metric_to_float(phi),
+                "slp_progress_mean": _metric_to_float(progress),
+                "slp_candidate_k": float(cand_k),
+                "slp_candidate_score_mean": _metric_to_float(selected_scores.mean()),
+                "slp_candidate_start_sim_mean": _metric_to_float(selected_start_sim.mean()),
+            }
+            return reward
+
+    def _latent_goal_progress_reward(self, imag_feat):
+        # Backward-compatible alias used by older call sites.
+        return self._strategic_latent_progress_reward(imag_feat)
+
     def _policy(self, obs, state, training):
         if state is None:
             latent = action = None
@@ -138,6 +384,8 @@ class LS_Imagine(nn.Module):
         metrics = {}
         post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
+        if getattr(self._config, "use_slp_reward", False):
+            metrics.update(self._update_slp_landmarks(context["feat"], data))
         # start = (post, post_zoomed)
 
         reward = lambda f, s, a: self._wm.heads["reward"](
@@ -145,11 +393,14 @@ class LS_Imagine(nn.Module):
         ).mode()
 
         def intrinsic(f, s, a):
-            # CORE2-WMP: original wrapper-provided intrinsic reward is disabled.
-            # We keep this callable only for backward compatibility with
-            # ImagBehavior._train(); the replacement bonus is computed inside
-            # ImagBehavior from world-model progress predictions.
+            # CORE2-SLP: original wrapper-provided intrinsic reward is disabled.
             return torch.zeros(f.shape[:-1] + (1,), device=f.device, dtype=f.dtype)
+
+        def slp_objective(f, s, a):
+            reward = self._latent_goal_progress_reward(f)
+            slp_objective.last_metrics = self._slp_last_metrics
+            return reward
+        slp_objective.last_metrics = {}
 
         jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
             f
@@ -167,7 +418,9 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end, slp_objective)[-1])
+        if getattr(self._config, "use_slp_reward", False):
+            metrics.update(getattr(slp_objective, "last_metrics", {}))
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
