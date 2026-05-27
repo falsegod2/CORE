@@ -22,6 +22,30 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
+def _metric_to_float(value):
+    """Convert logger metrics to a Python float, including CUDA tensors."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return 0.0
+        return float(value.detach().float().mean().cpu().item())
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return 0.0
+        return float(np.nanmean(value))
+    if isinstance(value, (list, tuple)):
+        vals = [_metric_to_float(v) for v in value if v is not None]
+        if len(vals) == 0:
+            return 0.0
+        return float(np.nanmean(vals))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        arr = np.asarray(value)
+        if arr.size == 0:
+            return 0.0
+        return float(np.nanmean(arr))
+
+
 class LS_Imagine(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
         super(LS_Imagine, self).__init__()
@@ -65,7 +89,7 @@ class LS_Imagine(nn.Module):
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
                 for name, values in self._metrics.items():
-                    self._logger.scalar(name, float(np.mean(values)))
+                    self._logger.scalar(name, _metric_to_float(values))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
                     openl = self._wm.video_pred(next(self._dataset))

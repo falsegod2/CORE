@@ -87,6 +87,7 @@ defaults:
   use_original_intrinsic: False
   use_wm_progress_reward: True
   wm_progress_scale: 0.03
+  wm_progress_prob_weight: 0.5
   wm_progress_jump_weight: 1.0
   wm_progress_long_weight: 0.2
   wm_progress_decay_steps: 200000
@@ -181,6 +182,7 @@ minedojo:
   use_original_intrinsic: False
   use_wm_progress_reward: True
   wm_progress_scale: 0.03
+  wm_progress_prob_weight: 0.5
   wm_progress_jump_weight: 1.0
   wm_progress_long_weight: 0.2
   wm_progress_decay_steps: 200000

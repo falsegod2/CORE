@@ -601,14 +601,24 @@ class ImagBehavior(nn.Module):
     ):
         """World-Model Progress bonus for sparse-reward exploration.
 
-        The original CORE2/LS-Imagine intrinsic comes from wrapper-computed
-        heatmap/MineCLIP shaping.  CORE2-WMP does not use that signal. Instead,
-        it gives the actor a small, detached bonus when the current imagined
-        trajectory increases model-predicted jumpability and when the long-term
-        branch predicts a useful jump interval.
+        CORE2-WMP-v2 does not use wrapper-computed intrinsic rewards.  Instead,
+        it derives a detached dense guidance signal from the learned world model:
+        (1) the current state's predicted jumpability, (2) positive increase of
+        jumpability along imagined trajectories, and (3) predicted long-term
+        interval utility.  The direct jumpability term is important in early
+        sparse-reward training; otherwise accumulated_reward_head is almost zero
+        before the agent has found successful trajectories.
         """
         scale = self._wm_progress_scale()
         zeros = torch.zeros(imag_feat.shape[:-1] + (1,), device=imag_feat.device, dtype=imag_feat.dtype)
+        self._last_wmp_metrics = {
+            "wmp_enabled": float(getattr(self._config, "use_wm_progress_reward", False)),
+            "wm_progress_scale": float(scale),
+            "wmp_jump_prob_mean": 0.0,
+            "wmp_jump_delta_mean": 0.0,
+            "wmp_long_bonus_mean": 0.0,
+            "wmp_bonus_raw_mean": 0.0,
+        }
         if scale <= 0.0 or imag_feat.shape[0] < 2:
             return zeros
 
@@ -617,13 +627,17 @@ class ImagBehavior(nn.Module):
             jump_prob = torch.nan_to_num(jump_prob, nan=0.0, posinf=1.0, neginf=0.0)
             jump_prob = jump_prob.clamp(0.0, 1.0).to(imag_feat.dtype)
 
-            # Positive progress toward states that the world model considers
-            # suitable for long-term imagination.
+            # 1) Dense state-level progress prior.  This is not the original
+            # environment-side intrinsic; it is the learned world model's belief
+            # that a state is suitable for long-term imagination.
+            prob_bonus = jump_prob
+
+            # 2) Positive progress toward higher jumpability.
             jump_delta = torch.relu(jump_prob[1:] - jump_prob[:-1])
             jump_delta = torch.cat([torch.zeros_like(jump_prob[:1]), jump_delta], dim=0)
 
-            # Long-branch utility: predicted accumulated return normalized by
-            # predicted interval length, gated by jump probability.
+            # 3) Long-branch utility.  Early in training this term is often zero
+            # under sparse rewards, so it is intentionally not the only bonus.
             fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1)
             pred_steps = jumping_steps_predictor(fc, None, None).float().clamp_min(1.0)
             pred_acc_reward = accumulated_reward_predictor(fc, None, None).float()
@@ -631,13 +645,23 @@ class ImagBehavior(nn.Module):
             long_bonus = jump_prob[:-1] * torch.tanh(torch.relu(pred_acc_reward) / torch.sqrt(pred_steps + 1.0))
             long_bonus = torch.cat([torch.zeros_like(jump_prob[:1]), long_bonus], dim=0)
 
+            w_prob = float(getattr(self._config, "wm_progress_prob_weight", 0.5))
             w_jump = float(getattr(self._config, "wm_progress_jump_weight", 1.0))
             w_long = float(getattr(self._config, "wm_progress_long_weight", 0.2))
             clip = float(getattr(self._config, "wm_progress_clip", 1.0))
-            bonus = w_jump * jump_delta + w_long * long_bonus
+            bonus = w_prob * prob_bonus + w_jump * jump_delta + w_long * long_bonus
             bonus = torch.nan_to_num(bonus, nan=0.0, posinf=0.0, neginf=0.0)
             if clip > 0.0:
                 bonus = bonus.clamp(0.0, clip)
+
+            self._last_wmp_metrics = {
+                "wmp_enabled": 1.0,
+                "wm_progress_scale": float(scale),
+                "wmp_jump_prob_mean": float(jump_prob.mean().detach().cpu().item()),
+                "wmp_jump_delta_mean": float(jump_delta.mean().detach().cpu().item()),
+                "wmp_long_bonus_mean": float(long_bonus.mean().detach().cpu().item()),
+                "wmp_bonus_raw_mean": float(bonus.mean().detach().cpu().item()),
+            }
 
         return bonus * scale
 
@@ -781,7 +805,7 @@ class ImagBehavior(nn.Module):
                         )
                         reward += wm_progress_reward
                         metrics.update(tools.tensorstats(wm_progress_reward, "wm_progress_reward"))
-                        metrics["wm_progress_scale"] = self._wm_progress_scale()
+                        metrics.update(getattr(self, "_last_wmp_metrics", {}))
 
                     actor_ent = self.actor(imag_feat).entropy() 
 
