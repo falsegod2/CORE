@@ -96,7 +96,7 @@ defaults:
   slp_top_percentile: 0.2
   slp_max_new_landmarks: 128
   slp_candidate_k: 8
-  slp_score_key: 'obs_reward'
+  slp_score_key: 'score'
   slp_distance: 'cosine'
   slp_use_positive_only: True
   slp_score_priority: 1.0
@@ -203,7 +203,7 @@ minedojo:
   slp_top_percentile: 0.2
   slp_max_new_landmarks: 128
   slp_candidate_k: 8
-  slp_score_key: 'obs_reward'
+  slp_score_key: 'score'
   slp_distance: 'cosine'
   slp_use_positive_only: True
   slp_score_priority: 1.0

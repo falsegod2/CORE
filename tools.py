@@ -228,6 +228,7 @@ def simulate(
     episodes=0,
     state=None,
     is_training=False,
+    use_long_term=True,
 ):
     # initialize or unpack simulation state
     if state is None:
@@ -245,7 +246,12 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            indices = [index for index in indices if information[index].get("real_done", True)]
+            # No-long-term experiments must treat any done=True, including timeout,
+            # as a real episode boundary. The original LS-Imagine real_done gate
+            # was only needed to wait for long-term jump-pair labels, and it causes
+            # train_length to exceed the intended episode cap when long-term is off.
+            if use_long_term:
+                indices = [index for index in indices if information[index].get("real_done", True)]
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results] 
 
@@ -259,7 +265,7 @@ def simulate(
                 add_to_cache(cache, envs[index].id, t)
 
                 current_step = 0
-                if t["is_zoomed"] == True:
+                if use_long_term and t.get("is_zoomed", False) == True:
                     step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
@@ -297,6 +303,17 @@ def simulate(
             a, result, env = action[tmp_index], results[tmp_index], envs[tmp_index]
 
             o, r, d, info = result
+            info = dict(info)
+            # Hard cap for no-long-term variants. This keeps train/eval episode
+            # lengths consistent with max_steps even if an inner wrapper returns
+            # done=False due to legacy real_done handling.
+            next_step_index = len(cache.get(env.id, {}).get("reward", []))
+            if (not use_long_term) and next_step_index >= max_steps:
+                d = True
+                done[tmp_index] = True
+                info["real_done"] = True
+                info["time_limit_reached"] = True
+                info["discount"] = np.array(0.0, dtype=np.float32)
             o = {k: convert(v) for k, v in o.items()}
             transition = o.copy()
             if isinstance(a, dict):
@@ -311,30 +328,36 @@ def simulate(
 
             length = len(cache[env.id]["reward"]) 
             current_step = length - 1
-            if transition["is_zoomed"] == True and not d:
-                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
+            if use_long_term:
+                if transition.get("is_zoomed", False) == True and not d:
+                    step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
 
-            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
-            if len(tmp_list) > 0:
-                for ss in tmp_list:
-                    cache[env.id]["jumping_steps"][ss] = current_step - ss
-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
-                    cache[env.id]["is_calculated"][ss] = True
+                tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+                if len(tmp_list) > 0:
+                    for ss in tmp_list:
+                        cache[env.id]["jumping_steps"][ss] = current_step - ss
+                        cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                        cache[env.id]["is_calculated"][ss] = True
 
-            if step_calculator.count_data_pairs(env.id) == 0:
+                if step_calculator.count_data_pairs(env.id) == 0:
+                    information[tmp_index]['real_done'] = True
+            else:
                 information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                if (not is_eval) and (not information[i].get("real_done", False)):
+                if use_long_term and (not is_eval) and (not information[i].get("real_done", False)):
                     continue
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
 
                 step_calculator.remove_all(envs[i].id)
-                length = len(cache[envs[i].id]["reward"]) - 1
+                raw_length = len(cache[envs[i].id]["reward"]) - 1
+                length = raw_length if use_long_term else min(raw_length, max_steps)
+                if (not use_long_term) and raw_length > max_steps:
+                    logger.scalar("episode_overlimit_raw_length", float(raw_length))
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
                 first_success_step = min(cache[envs[i].id]["first_success_step"][-1], max_steps)

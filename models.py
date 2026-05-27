@@ -792,7 +792,9 @@ class ImagBehavior(nn.Module):
                         reward += slp_reward
                         metrics.update(tools.tensorstats(slp_reward, "slp_reward"))
 
-                    actor_ent = self.actor(imag_feat).entropy() 
+                    actor_policy = self.actor(imag_feat)
+                    actor_ent = actor_policy.entropy()
+                    actor_logprob = actor_policy.log_prob(imag_action)
 
                     target, weights, base = self._compute_target(
                         imag_feat, imag_state, reward, jump_record.unsqueeze(-1), 
@@ -803,9 +805,17 @@ class ImagBehavior(nn.Module):
                         imag_feat, imag_action, target, weights, base, jump_record.unsqueeze(-1)
                     )
 
-                    actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                    actor_loss = torch.mean(actor_loss)
+                    entropy_loss = -self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+                    actor_loss_before_entropy = torch.mean(actor_loss)
+                    actor_entropy_loss = torch.mean(entropy_loss)
+                    actor_loss = torch.mean(actor_loss + entropy_loss)
+
                     metrics.update(mets)
+                    metrics.update(tools.tensorstats(actor_ent, "actor_entropy"))
+                    metrics.update(tools.tensorstats(actor_logprob, "actor_logprob"))
+                    metrics["actor_loss_before_entropy"] = actor_loss_before_entropy.detach()
+                    metrics["actor_entropy_loss"] = actor_entropy_loss.detach()
+                    metrics["actor_loss_total"] = actor_loss.detach()
                     value_input = imag_feat
 
             # 6. Value 网络更新
@@ -819,6 +829,7 @@ class ImagBehavior(nn.Module):
                         value_loss -= value.log_prob(slow_target.mode().detach())
                     value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
+            metrics["value_loss_total"] = value_loss.detach()
             metrics.update(tools.tensorstats(value.mode(), "value"))
             metrics.update(tools.tensorstats(target, "target"))
             metrics.update(tools.tensorstats(reward, "imag_reward"))

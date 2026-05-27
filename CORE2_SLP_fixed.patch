@@ -1,0 +1,229 @@
+diff -ruN /mnt/data/slp_fix_base/CORE-CORE2-SLP/README_CORE2_SLP_FIXED.txt /mnt/data/CORE2-SLP-fixed/README_CORE2_SLP_FIXED.txt
+--- /mnt/data/slp_fix_base/CORE-CORE2-SLP/README_CORE2_SLP_FIXED.txt	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/CORE2-SLP-fixed/README_CORE2_SLP_FIXED.txt	2026-05-27 16:30:11.629175101 +0000
+@@ -0,0 +1,17 @@
++CORE2-SLP-fixed
++
++This version is based on the uploaded CORE-CORE2-SLP code and fixes the issues observed in the previous experiment:
++
++1. No-long-term episode handling is now clean. When use_long_term=False, any done=True immediately terminates and resets the episode. The legacy real_done / step_calculator waiting logic is only active when use_long_term=True. A hard max_steps cap is also enforced in tools.simulate().
++2. slp_score_key is changed from obs_reward to score, so SLP landmarks are mined from MineCLIP/semantic score instead of sparse environment reward. The score fallback order now prefers score and score_on_zoomed before obs_reward.
++3. Actor diagnostics are added: actor_entropy_*, actor_logprob_*, actor_loss_before_entropy, actor_entropy_loss, actor_loss_total, and value_loss_total.
++4. The accidental duplicate dynamics.img_step() call in ImagBehavior._imagine() is removed.
++
++Expected key config:
++  use_original_intrinsic: False
++  use_long_term: False
++  use_wm_progress_reward: False
++  use_slp_reward: True
++  slp_score_key: 'score'
++
++Expected logs include slp_* metrics and actor_entropy_* metrics. Train/eval lengths should not exceed the episode max in no-long-term mode.
+diff -ruN /mnt/data/slp_fix_base/CORE-CORE2-SLP/configs.yaml /mnt/data/CORE2-SLP-fixed/configs.yaml
+--- /mnt/data/slp_fix_base/CORE-CORE2-SLP/configs.yaml	2026-05-27 05:19:25.000000000 +0000
++++ /mnt/data/CORE2-SLP-fixed/configs.yaml	2026-05-27 16:30:11.626815355 +0000
+@@ -96,7 +96,7 @@
+   slp_top_percentile: 0.2
+   slp_max_new_landmarks: 128
+   slp_candidate_k: 8
+-  slp_score_key: 'obs_reward'
++  slp_score_key: 'score'
+   slp_distance: 'cosine'
+   slp_use_positive_only: True
+   slp_score_priority: 1.0
+@@ -203,7 +203,7 @@
+   slp_top_percentile: 0.2
+   slp_max_new_landmarks: 128
+   slp_candidate_k: 8
+-  slp_score_key: 'obs_reward'
++  slp_score_key: 'score'
+   slp_distance: 'cosine'
+   slp_use_positive_only: True
+   slp_score_priority: 1.0
+diff -ruN /mnt/data/slp_fix_base/CORE-CORE2-SLP/expr.py /mnt/data/CORE2-SLP-fixed/expr.py
+--- /mnt/data/slp_fix_base/CORE-CORE2-SLP/expr.py	2026-05-27 05:19:25.000000000 +0000
++++ /mnt/data/CORE2-SLP-fixed/expr.py	2026-05-27 16:30:22.964609458 +0000
+@@ -130,7 +130,15 @@
+             self._slp_bank_count = 0
+ 
+     def _get_slp_scores_from_batch(self, data):
+-        keys = [getattr(self._config, "slp_score_key", "obs_reward"), "obs_reward", "score"]
++        preferred = getattr(self._config, "slp_score_key", "score")
++        # Prefer MineCLIP/semantic score over obs_reward. In this codebase
++        # obs_reward is often only the sparse environment reward, which stays
++        # zero before task success and would fill the landmark bank with
++        # non-semantic zero-score states.
++        keys = []
++        for key in [preferred, "score", "score_on_zoomed", "obs_reward"]:
++            if key not in keys:
++                keys.append(key)
+         for key in keys:
+             if key in data:
+                 score = data[key]
+@@ -572,6 +580,7 @@
+             limit=config.dataset_size,
+             steps=prefill,
+             is_training=False,
++            use_long_term=getattr(config, "use_long_term", True),
+         )
+ 
+         logger.step += prefill * config.action_repeat
+@@ -616,6 +625,7 @@
+                 is_eval=True,
+                 episodes=config.eval_episode_num,
+                 is_training=False,
++                use_long_term=getattr(config, "use_long_term", True),
+             )
+             if config.video_pred_log:
+                 video_pred = agent._wm.video_pred(next(eval_dataset))
+@@ -636,6 +646,7 @@
+             steps=config.eval_every, 
+             state=state,
+             is_training=True,
++            use_long_term=getattr(config, "use_long_term", True),
+         )
+ 
+         items_to_save = {
+diff -ruN /mnt/data/slp_fix_base/CORE-CORE2-SLP/models.py /mnt/data/CORE2-SLP-fixed/models.py
+--- /mnt/data/slp_fix_base/CORE-CORE2-SLP/models.py	2026-05-27 05:19:25.000000000 +0000
++++ /mnt/data/CORE2-SLP-fixed/models.py	2026-05-27 16:30:11.628973698 +0000
+@@ -792,7 +792,9 @@
+                         reward += slp_reward
+                         metrics.update(tools.tensorstats(slp_reward, "slp_reward"))
+ 
+-                    actor_ent = self.actor(imag_feat).entropy() 
++                    actor_policy = self.actor(imag_feat)
++                    actor_ent = actor_policy.entropy()
++                    actor_logprob = actor_policy.log_prob(imag_action)
+ 
+                     target, weights, base = self._compute_target(
+                         imag_feat, imag_state, reward, jump_record.unsqueeze(-1), 
+@@ -803,9 +805,17 @@
+                         imag_feat, imag_action, target, weights, base, jump_record.unsqueeze(-1)
+                     )
+ 
+-                    actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
+-                    actor_loss = torch.mean(actor_loss)
++                    entropy_loss = -self._config.actor["entropy"] * actor_ent[:-1, ..., None]
++                    actor_loss_before_entropy = torch.mean(actor_loss)
++                    actor_entropy_loss = torch.mean(entropy_loss)
++                    actor_loss = torch.mean(actor_loss + entropy_loss)
++
+                     metrics.update(mets)
++                    metrics.update(tools.tensorstats(actor_ent, "actor_entropy"))
++                    metrics.update(tools.tensorstats(actor_logprob, "actor_logprob"))
++                    metrics["actor_loss_before_entropy"] = actor_loss_before_entropy.detach()
++                    metrics["actor_entropy_loss"] = actor_entropy_loss.detach()
++                    metrics["actor_loss_total"] = actor_loss.detach()
+                     value_input = imag_feat
+ 
+             # 6. Value 网络更新
+@@ -819,6 +829,7 @@
+                         value_loss -= value.log_prob(slow_target.mode().detach())
+                     value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
+ 
++            metrics["value_loss_total"] = value_loss.detach()
+             metrics.update(tools.tensorstats(value.mode(), "value"))
+             metrics.update(tools.tensorstats(target, "target"))
+             metrics.update(tools.tensorstats(reward, "imag_reward"))
+diff -ruN /mnt/data/slp_fix_base/CORE-CORE2-SLP/tools.py /mnt/data/CORE2-SLP-fixed/tools.py
+--- /mnt/data/slp_fix_base/CORE-CORE2-SLP/tools.py	2026-05-27 05:19:25.000000000 +0000
++++ /mnt/data/CORE2-SLP-fixed/tools.py	2026-05-27 16:30:11.627983404 +0000
+@@ -228,6 +228,7 @@
+     episodes=0,
+     state=None,
+     is_training=False,
++    use_long_term=True,
+ ):
+     # initialize or unpack simulation state
+     if state is None:
+@@ -245,7 +246,12 @@
+         # reset envs if necessary
+         if done.any():
+             indices = [index for index, d in enumerate(done) if d]
+-            indices = [index for index in indices if information[index].get("real_done", True)]
++            # No-long-term experiments must treat any done=True, including timeout,
++            # as a real episode boundary. The original LS-Imagine real_done gate
++            # was only needed to wait for long-term jump-pair labels, and it causes
++            # train_length to exceed the intended episode cap when long-term is off.
++            if use_long_term:
++                indices = [index for index in indices if information[index].get("real_done", True)]
+             results = [envs[i].reset() for i in indices]
+             results = [r() for r in results] 
+ 
+@@ -259,7 +265,7 @@
+                 add_to_cache(cache, envs[index].id, t)
+ 
+                 current_step = 0
+-                if t["is_zoomed"] == True:
++                if use_long_term and t.get("is_zoomed", False) == True:
+                     step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
+ 
+                 # replace obs with done by initial state
+@@ -297,6 +303,17 @@
+             a, result, env = action[tmp_index], results[tmp_index], envs[tmp_index]
+ 
+             o, r, d, info = result
++            info = dict(info)
++            # Hard cap for no-long-term variants. This keeps train/eval episode
++            # lengths consistent with max_steps even if an inner wrapper returns
++            # done=False due to legacy real_done handling.
++            next_step_index = len(cache.get(env.id, {}).get("reward", []))
++            if (not use_long_term) and next_step_index >= max_steps:
++                d = True
++                done[tmp_index] = True
++                info["real_done"] = True
++                info["time_limit_reached"] = True
++                info["discount"] = np.array(0.0, dtype=np.float32)
+             o = {k: convert(v) for k, v in o.items()}
+             transition = o.copy()
+             if isinstance(a, dict):
+@@ -311,30 +328,36 @@
+ 
+             length = len(cache[env.id]["reward"]) 
+             current_step = length - 1
+-            if transition["is_zoomed"] == True and not d:
+-                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
++            if use_long_term:
++                if transition.get("is_zoomed", False) == True and not d:
++                    step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
++
++                tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
++                if len(tmp_list) > 0:
++                    for ss in tmp_list:
++                        cache[env.id]["jumping_steps"][ss] = current_step - ss
++                        cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
++                        cache[env.id]["is_calculated"][ss] = True
+ 
+-            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+-            if len(tmp_list) > 0:
+-                for ss in tmp_list:
+-                    cache[env.id]["jumping_steps"][ss] = current_step - ss
+-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+-                    cache[env.id]["is_calculated"][ss] = True
+-
+-            if step_calculator.count_data_pairs(env.id) == 0:
++                if step_calculator.count_data_pairs(env.id) == 0:
++                    information[tmp_index]['real_done'] = True
++            else:
+                 information[tmp_index]['real_done'] = True
+ 
+         if done.any():
+             indices = [index for index, d in enumerate(done) if d]
+             # logging for done episode
+             for i in indices:
+-                if (not is_eval) and (not information[i].get("real_done", False)):
++                if use_long_term and (not is_eval) and (not information[i].get("real_done", False)):
+                     continue
+ 
+                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
+ 
+                 step_calculator.remove_all(envs[i].id)
+-                length = len(cache[envs[i].id]["reward"]) - 1
++                raw_length = len(cache[envs[i].id]["reward"]) - 1
++                length = raw_length if use_long_term else min(raw_length, max_steps)
++                if (not use_long_term) and raw_length > max_steps:
++                    logger.scalar("episode_overlimit_raw_length", float(raw_length))
+                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
+                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
+                 first_success_step = min(cache[envs[i].id]["first_success_step"][-1], max_steps)

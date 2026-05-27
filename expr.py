@@ -130,7 +130,15 @@ class LS_Imagine(nn.Module):
             self._slp_bank_count = 0
 
     def _get_slp_scores_from_batch(self, data):
-        keys = [getattr(self._config, "slp_score_key", "obs_reward"), "obs_reward", "score"]
+        preferred = getattr(self._config, "slp_score_key", "score")
+        # Prefer MineCLIP/semantic score over obs_reward. In this codebase
+        # obs_reward is often only the sparse environment reward, which stays
+        # zero before task success and would fill the landmark bank with
+        # non-semantic zero-score states.
+        keys = []
+        for key in [preferred, "score", "score_on_zoomed", "obs_reward"]:
+            if key not in keys:
+                keys.append(key)
         for key in keys:
             if key in data:
                 score = data[key]
@@ -572,6 +580,7 @@ def main(config): # config is namespace
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
+            use_long_term=getattr(config, "use_long_term", True),
         )
 
         logger.step += prefill * config.action_repeat
@@ -616,6 +625,7 @@ def main(config): # config is namespace
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
+                use_long_term=getattr(config, "use_long_term", True),
             )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
@@ -636,6 +646,7 @@ def main(config): # config is namespace
             steps=config.eval_every, 
             state=state,
             is_training=True,
+            use_long_term=getattr(config, "use_long_term", True),
         )
 
         items_to_save = {
