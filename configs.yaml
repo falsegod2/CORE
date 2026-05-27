@@ -38,6 +38,8 @@ defaults:
   envs: 1
   action_repeat: 1
   time_limit: 1000
+  # CORE2-no-long-term: disable jumpy/zoomed long-term branch, keep all other signals such as intrinsic.
+  use_long_term: False
   grayscale: False
   prefill: 2500
   reward_EMA: True
@@ -51,7 +53,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
   units: 512
   act: 'SiLU'
   norm: True
@@ -68,15 +70,15 @@ defaults:
   end_head:
     {layers: 2, loss_scale: 1.0, outscale: 1.0}
   jump_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+    {layers: 2, loss_scale: 0.0, outscale: 1.0}
   concentration_score_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   intrinsic_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   jumping_steps_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
   accumulated_reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -101,7 +103,7 @@ defaults:
   # Behavior.
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7
+  jump_prob: 0.0
   jump_prob_decay: 0.9997
   imag_horizon: 15
   max_imag_sequences_num: 1024
@@ -124,7 +126,9 @@ defaults:
 
 minedojo:
 
-  long_term_branch_weight: 1.0
+  # CORE2-no-long-term keeps original intrinsic/representation losses but disables long-term jump branch.
+  use_long_term: False
+  long_term_branch_weight: 0.0
   gaussian_reward_weight: 1.0
   gaussian_sigma_weight: 0.5
 
@@ -154,10 +158,11 @@ minedojo:
   value: {layers: 5}
   reward_head: {layers: 5}
   intrinsic_head: {layers: 5}
-  jumping_steps_head: {layers: 5}
-  accumulated_reward_head: {layers: 5}
+  jumping_steps_head: {layers: 5, loss_scale: 0.0}
+  accumulated_reward_head: {layers: 5, loss_scale: 0.0}
   end_head: {layers: 5}
-  jump_head: {layers: 5}
+  jump_head: {layers: 5, loss_scale: 0.0}
+  jump_prob: 0.0
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000

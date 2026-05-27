@@ -277,17 +277,19 @@ class WorldModel(nn.Module):
         )
 
     def _train(self, data_origin):
-            # 1. 预处理原始数据和缩放数据
+            # 1. 预处理原始数据。CORE2-no-long-term 关闭 zoomed/jumpy long-term 分支，
+            # 但保留原始 intrinsic、inverse dynamics、affordance_s 等其它机制。
+            use_long_term = getattr(self._config, "use_long_term", True)
             data = self.preprocess(data_origin, zoomed=False)
-            data_zoomed = self.preprocess(data_origin, zoomed=True)
+            data_zoomed = self.preprocess(data_origin, zoomed=True) if use_long_term else None
 
-            zoomed_num = torch.sum(data["is_zoomed"]).item()
+            zoomed_num = torch.sum(data["is_zoomed"]).item() if use_long_term else 0
 
             with tools.RequiresGrad(self):
                 with torch.cuda.amp.autocast(self._use_amp):
-                    # 编码图像特征
+                    # 编码图像特征。no-long-term 时不再编码 zoomed observation。
                     embed = self.encoder(data)
-                    embed_zoomed = self.encoder(data_zoomed)
+                    embed_zoomed = self.encoder(data_zoomed) if use_long_term else None
 
                     # --- 2. 正常序列观察 (Observe Phase) ---
                     # post 包含: deter_s, deter_z, stoch_s, stoch_z
@@ -336,6 +338,8 @@ class WorldModel(nn.Module):
                     for name, head in self.heads.items():
                         if name in ["jumping_steps", "accumulated_reward"]:
                             continue
+                        if (not use_long_term) and name == "jump":
+                            continue
                         grad_head = name in self._config.grad_heads
                         feat = self.dynamics.get_feat(post)
                         feat = feat if grad_head else feat.detach()
@@ -357,7 +361,8 @@ class WorldModel(nn.Module):
                     }
 
                     # --- 5. 处理缩放跳跃序列 (Zoomed Data Branch) ---
-                    if zoomed_num > 0:
+                    # no-long-term: completely skip zoomed/jumpy branch.
+                    if use_long_term and zoomed_num > 0:
                         is_zoomed_indices = data["is_zoomed"].squeeze(-1).bool()
                         is_calculated_mask = data["is_calculated"][is_zoomed_indices]
                         
@@ -410,7 +415,7 @@ class WorldModel(nn.Module):
                         }
 
                     # --- 6. 损失聚合与优化 ---
-                    if zoomed_num > 0:
+                    if use_long_term and zoomed_num > 0:
                         kl_loss = torch.cat((kl_loss_img.reshape(-1), kl_loss_jmp.reshape(-1)), dim=0)
                         scaled_img = sum(scaled.values()).reshape(-1)
                         scaled_jmp = sum(scaled_zoomed.values()).reshape(-1)
@@ -442,7 +447,7 @@ class WorldModel(nn.Module):
                 metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist(z_stats).entropy()))
 
             post = {k: v.detach() for k, v in post.items()}
-            post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if zoomed_num > 0 else None
+            post_zoomed = {k: v.detach() for k, v in post_zoomed.items()} if (use_long_term and zoomed_num > 0) else None
             context = dict(embed=embed, feat=self.dynamics.get_feat(post), kl=kl_value_img)
 
             return post, post_zoomed, context, metrics
@@ -527,7 +532,7 @@ class ImagBehavior(nn.Module):
         super(ImagBehavior, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
-        self.jump_prob = config.jump_prob
+        self.jump_prob = config.jump_prob if getattr(config, "use_long_term", True) else 0.0
         # 预计算折扣因子的累加和，用于长时奖励修正
         self.gamma_sum = [(1 - self._config.discount ** (i + 1)) / (1 - self._config.discount) for i in range(self._config.episode_max_steps)]
         self.gamma_sum = torch.tensor(self.gamma_sum, dtype=torch.float32, device=config.device)
@@ -722,6 +727,8 @@ class ImagBehavior(nn.Module):
             metrics.update(tools.tensorstats(value.mode(), "value"))
             metrics.update(tools.tensorstats(target, "target"))
             metrics.update(tools.tensorstats(reward, "imag_reward"))
+            metrics["use_long_term"] = float(getattr(self._config, "use_long_term", True))
+            metrics["jump_prob_effective"] = float(self.jump_prob)
             
             with tools.RequiresGrad(self):
                 metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))

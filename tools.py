@@ -225,6 +225,7 @@ def simulate(
     episodes=0,
     state=None,
     is_training=False,
+    use_long_term=True,
 ):
     # initialize or unpack simulation state
     if state is None:
@@ -242,7 +243,10 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            indices = [index for index in indices if information[index].get("real_done", True)]
+            # no-long-term: done=True must end the episode immediately.
+            # The original long-term branch delays reset with info['real_done'] until jump-pair labels are completed.
+            if use_long_term:
+                indices = [index for index in indices if information[index].get("real_done", True)]
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results] 
 
@@ -256,7 +260,7 @@ def simulate(
                 add_to_cache(cache, envs[index].id, t)
 
                 current_step = 0
-                if t["is_zoomed"] == True:
+                if use_long_term and t["is_zoomed"] == True:
                     step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
@@ -308,24 +312,28 @@ def simulate(
 
             length = len(cache[env.id]["reward"]) 
             current_step = length - 1
-            if transition["is_zoomed"] == True and not d:
-                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
+            if use_long_term:
+                if transition["is_zoomed"] == True and not d:
+                    step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
 
-            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
-            if len(tmp_list) > 0:
-                for ss in tmp_list:
-                    cache[env.id]["jumping_steps"][ss] = current_step - ss
-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
-                    cache[env.id]["is_calculated"][ss] = True
+                tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+                if len(tmp_list) > 0:
+                    for ss in tmp_list:
+                        cache[env.id]["jumping_steps"][ss] = current_step - ss
+                        cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                        cache[env.id]["is_calculated"][ss] = True
 
-            if step_calculator.count_data_pairs(env.id) == 0:
+                if step_calculator.count_data_pairs(env.id) == 0:
+                    information[tmp_index]['real_done'] = True
+            else:
+                # no-long-term: do not wait for jump-pair completion; timeout/success done ends immediately.
                 information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                if (not is_eval) and (not information[i].get("real_done", False)):
+                if use_long_term and (not is_eval) and (not information[i].get("real_done", False)):
                     continue
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})

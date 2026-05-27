@@ -292,6 +292,7 @@ def main(config): # config is namespace
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
+            use_long_term=getattr(config, "use_long_term", True),
         )
 
         logger.step += prefill * config.action_repeat
@@ -336,6 +337,7 @@ def main(config): # config is namespace
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
+                use_long_term=getattr(config, "use_long_term", True),
             )
             if config.video_pred_log:
                 video_pred = agent._wm.video_pred(next(eval_dataset))
@@ -356,6 +358,7 @@ def main(config): # config is namespace
             steps=config.eval_every, 
             state=state,
             is_training=True,
+            use_long_term=getattr(config, "use_long_term", True),
         )
 
         items_to_save = {
