@@ -80,16 +80,20 @@ defaults:
   accumulated_reward_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
 
-  # ===== CORE2-WMP: World-Model Progress reward =====
+  # ===== CORE2-PWMP: Potential-based World-Model Progress reward =====
   # Keep long-term imagination, but replace the original intrinsic reward with
-  # a model-predicted progress bonus derived from jump_head, jumping_steps_head,
-  # and accumulated_reward_head.
+  # potential-based model-predicted progress:
+  #   r_t = scale * clip(gamma * Phi(s_{t+1}) - Phi(s_t))
+  # where Phi is built from jump_head, accumulated_reward_head / jumping_steps_head,
+  # and optionally the learned critic.
   use_original_intrinsic: False
   use_wm_progress_reward: True
+  wm_progress_mode: 'potential'
   wm_progress_scale: 0.03
-  wm_progress_prob_weight: 0.5
-  wm_progress_jump_weight: 1.0
-  wm_progress_long_weight: 0.2
+  wm_progress_jump_weight: 0.5
+  wm_progress_long_weight: 0.3
+  wm_progress_value_weight: 0.2
+  wm_progress_positive_only: True
   wm_progress_decay_steps: 200000
   wm_progress_min_scale: 0.0
   wm_progress_clip: 1.0
@@ -178,13 +182,15 @@ minedojo:
   break_speed: 100.0
   time_limit: 36000
 
-  # CORE2-WMP overrides for MineDojo experiments.
+  # CORE2-PWMP overrides for MineDojo experiments.
   use_original_intrinsic: False
   use_wm_progress_reward: True
+  wm_progress_mode: 'potential'
   wm_progress_scale: 0.03
-  wm_progress_prob_weight: 0.5
-  wm_progress_jump_weight: 1.0
-  wm_progress_long_weight: 0.2
+  wm_progress_jump_weight: 0.5
+  wm_progress_long_weight: 0.3
+  wm_progress_value_weight: 0.2
+  wm_progress_positive_only: True
   wm_progress_decay_steps: 200000
   wm_progress_min_scale: 0.0
   wm_progress_clip: 1.0

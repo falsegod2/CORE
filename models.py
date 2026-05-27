@@ -599,67 +599,117 @@ class ImagBehavior(nn.Module):
         jumping_steps_predictor,
         accumulated_reward_predictor,
     ):
-        """World-Model Progress bonus for sparse-reward exploration.
+        """Potential-based World-Model Progress bonus for sparse rewards.
 
-        CORE2-WMP-v2 does not use wrapper-computed intrinsic rewards.  Instead,
-        it derives a detached dense guidance signal from the learned world model:
-        (1) the current state's predicted jumpability, (2) positive increase of
-        jumpability along imagined trajectories, and (3) predicted long-term
-        interval utility.  The direct jumpability term is important in early
-        sparse-reward training; otherwise accumulated_reward_head is almost zero
-        before the agent has found successful trajectories.
+        CORE2-PWMP does not use wrapper-computed intrinsic rewards.  Instead,
+        it builds a detached potential function Phi(s) from the learned world
+        model and critic, then rewards increases of this potential inside latent
+        imagination:
+
+            r_t^PWMP = scale * clip(gamma * Phi(s_{t+1}) - Phi(s_t)).
+
+        Phi(s) combines three model-side signals:
+          1) jump_head probability: whether the state is task-relevant / jumpable;
+          2) long-term utility: accumulated_reward_head normalized by jumping_steps_head;
+          3) critic value: the actor's current value estimate in latent space.
+
+        This is intentionally different from LS-Imagine's original environment-
+        side intrinsic reward: no obs["intrinsic"] is read, no intrinsic_head is
+        used, and no heatmap-centered dense reward is added to replay.
         """
         scale = self._wm_progress_scale()
-        zeros = torch.zeros(imag_feat.shape[:-1] + (1,), device=imag_feat.device, dtype=imag_feat.dtype)
+        zeros = torch.zeros(
+            imag_feat.shape[:-1] + (1,),
+            device=imag_feat.device,
+            dtype=imag_feat.dtype,
+        )
         self._last_wmp_metrics = {
-            "wmp_enabled": float(getattr(self._config, "use_wm_progress_reward", False)),
-            "wm_progress_scale": float(scale),
-            "wmp_jump_prob_mean": 0.0,
-            "wmp_jump_delta_mean": 0.0,
-            "wmp_long_bonus_mean": 0.0,
-            "wmp_bonus_raw_mean": 0.0,
+            "pwmp_enabled": float(getattr(self._config, "use_wm_progress_reward", False)),
+            "pwmp_scale": float(scale),
+            "pwmp_phi_mean": 0.0,
+            "pwmp_phi_std": 0.0,
+            "pwmp_progress_mean": 0.0,
+            "pwmp_progress_raw_mean": 0.0,
+            "pwmp_jump_prob_mean": 0.0,
+            "pwmp_long_potential_mean": 0.0,
+            "pwmp_value_potential_mean": 0.0,
         }
         if scale <= 0.0 or imag_feat.shape[0] < 2:
             return zeros
 
         with torch.no_grad():
+            # ----- 1. Jump/task-relevance potential -----
             jump_prob = jump_indicator(imag_state)
             jump_prob = torch.nan_to_num(jump_prob, nan=0.0, posinf=1.0, neginf=0.0)
             jump_prob = jump_prob.clamp(0.0, 1.0).to(imag_feat.dtype)
 
-            # 1) Dense state-level progress prior.  This is not the original
-            # environment-side intrinsic; it is the learned world model's belief
-            # that a state is suitable for long-term imagination.
-            prob_bonus = jump_prob
-
-            # 2) Positive progress toward higher jumpability.
-            jump_delta = torch.relu(jump_prob[1:] - jump_prob[:-1])
-            jump_delta = torch.cat([torch.zeros_like(jump_prob[:1]), jump_delta], dim=0)
-
-            # 3) Long-branch utility.  Early in training this term is often zero
-            # under sparse rewards, so it is intentionally not the only bonus.
+            # ----- 2. Long-term utility potential -----
+            # Transition-level utility for s_t -> s_{t+1}, padded to state level.
             fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1)
             pred_steps = jumping_steps_predictor(fc, None, None).float().clamp_min(1.0)
             pred_acc_reward = accumulated_reward_predictor(fc, None, None).float()
             pred_acc_reward = torch.nan_to_num(pred_acc_reward, nan=0.0, posinf=0.0, neginf=0.0)
-            long_bonus = jump_prob[:-1] * torch.tanh(torch.relu(pred_acc_reward) / torch.sqrt(pred_steps + 1.0))
-            long_bonus = torch.cat([torch.zeros_like(jump_prob[:1]), long_bonus], dim=0)
+            long_trans = torch.tanh(torch.relu(pred_acc_reward) / torch.sqrt(pred_steps + 1.0))
+            # Gate by jumpability of the pre-transition state so the long utility
+            # only matters where the world model predicts task-relevant jumps.
+            long_trans = jump_prob[:-1] * long_trans
+            long_potential = torch.cat([long_trans, torch.zeros_like(jump_prob[:1])], dim=0)
 
-            w_prob = float(getattr(self._config, "wm_progress_prob_weight", 0.5))
-            w_jump = float(getattr(self._config, "wm_progress_jump_weight", 1.0))
-            w_long = float(getattr(self._config, "wm_progress_long_weight", 0.2))
+            # ----- 3. Critic value potential -----
+            # The value network is detached here; PWMP should shape actor targets,
+            # not update the critic through this path.
+            value_potential = torch.zeros_like(jump_prob)
+            try:
+                value_mode = self.value(imag_feat.detach()).mode()
+                if value_mode.dim() == jump_prob.dim() - 1:
+                    value_mode = value_mode.unsqueeze(-1)
+                value_mode = torch.nan_to_num(value_mode.float(), nan=0.0, posinf=0.0, neginf=0.0)
+                # Symlog + tanh keeps the critic contribution bounded and stable.
+                value_potential = torch.tanh(tools.symlog(value_mode)).to(imag_feat.dtype)
+            except Exception:
+                value_potential = torch.zeros_like(jump_prob)
+
+            w_jump = float(getattr(self._config, "wm_progress_jump_weight", 0.5))
+            w_long = float(getattr(self._config, "wm_progress_long_weight", 0.3))
+            w_value = float(getattr(self._config, "wm_progress_value_weight", 0.2))
+            phi = w_jump * jump_prob + w_long * long_potential + w_value * value_potential
+            phi = torch.nan_to_num(phi, nan=0.0, posinf=0.0, neginf=0.0)
+
+            gamma = float(getattr(self._config, "discount", 0.997))
+            raw_progress = gamma * phi[1:] - phi[:-1]
+            positive_only = bool(getattr(self._config, "wm_progress_positive_only", True))
+            if positive_only:
+                progress = torch.relu(raw_progress)
+            else:
+                progress = raw_progress
+
             clip = float(getattr(self._config, "wm_progress_clip", 1.0))
-            bonus = w_prob * prob_bonus + w_jump * jump_delta + w_long * long_bonus
-            bonus = torch.nan_to_num(bonus, nan=0.0, posinf=0.0, neginf=0.0)
             if clip > 0.0:
-                bonus = bonus.clamp(0.0, clip)
+                if positive_only:
+                    progress = progress.clamp(0.0, clip)
+                else:
+                    progress = progress.clamp(-clip, clip)
+
+            # Align transition reward to state-reward tensor shape.  Reward at
+            # index t corresponds to progress from state t-1 to t; index 0 is 0.
+            bonus = torch.cat([torch.zeros_like(phi[:1]), progress], dim=0)
+            bonus = torch.nan_to_num(bonus, nan=0.0, posinf=0.0, neginf=0.0)
 
             self._last_wmp_metrics = {
+                "pwmp_enabled": 1.0,
+                "pwmp_scale": float(scale),
+                "pwmp_phi_mean": float(phi.mean().detach().cpu().item()),
+                "pwmp_phi_std": float(phi.std().detach().cpu().item()) if phi.numel() > 1 else 0.0,
+                "pwmp_progress_mean": float(bonus.mean().detach().cpu().item()),
+                "pwmp_progress_raw_mean": float(raw_progress.mean().detach().cpu().item()),
+                "pwmp_jump_prob_mean": float(jump_prob.mean().detach().cpu().item()),
+                "pwmp_long_potential_mean": float(long_potential.mean().detach().cpu().item()),
+                "pwmp_value_potential_mean": float(value_potential.mean().detach().cpu().item()),
+                # Backward-compatible metric names for existing plotting scripts.
                 "wmp_enabled": 1.0,
                 "wm_progress_scale": float(scale),
                 "wmp_jump_prob_mean": float(jump_prob.mean().detach().cpu().item()),
-                "wmp_jump_delta_mean": float(jump_delta.mean().detach().cpu().item()),
-                "wmp_long_bonus_mean": float(long_bonus.mean().detach().cpu().item()),
+                "wmp_long_bonus_mean": float(long_potential.mean().detach().cpu().item()),
                 "wmp_bonus_raw_mean": float(bonus.mean().detach().cpu().item()),
             }
 
