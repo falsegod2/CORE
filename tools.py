@@ -197,18 +197,23 @@ class Logger:
             wandb.finish()
 
 def calculate_accumulated_reward(rewards, intrinsics, gamma):
+    """Discounted interval return for the long-term branch.
+
+    CORE2-WMP-v2 deliberately removes the original wrapper-computed intrinsic
+    reward from long-term accumulated targets.  The `intrinsics` argument is
+    kept for API compatibility with the original simulate() code, but is not
+    used here.  This prevents the original LS-Imagine intrinsic from leaking
+    back into the supposedly no-intrinsic baseline via accumulated_reward_head.
+    """
     if len(rewards) == 0:
         return 0
-    
+
     rewards = np.array(rewards)
-    intrinsics = np.array(intrinsics)
     gammas = np.power(gamma, np.arange(len(rewards)))
     discounted_rewards = rewards * gammas
-    discounted_intrinsics = intrinsics * gammas
-    total_reward = np.sum(discounted_rewards + discounted_intrinsics)
     gamma_sum = np.sum(gammas)
-    
-    return total_reward / gamma_sum  
+
+    return np.sum(discounted_rewards) / gamma_sum
 
 def simulate(
     agent,

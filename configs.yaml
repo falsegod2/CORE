@@ -51,7 +51,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward']
   units: 512
   act: 'SiLU'
   norm: True
@@ -71,12 +71,28 @@ defaults:
     {layers: 2, loss_scale: 1.0, outscale: 1.0}
   concentration_score_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  # CORE2-WMP: do not train or use the original LS-Imagine-style intrinsic head.
+  # The key is kept for checkpoint/config compatibility, but its loss is disabled.
   intrinsic_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+    {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
   jumping_steps_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   accumulated_reward_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+
+  # ===== CORE2-WMP: World-Model Progress reward =====
+  # Keep long-term imagination, but replace the original intrinsic reward with
+  # a model-predicted progress bonus derived from jump_head, jumping_steps_head,
+  # and accumulated_reward_head.
+  use_original_intrinsic: False
+  use_wm_progress_reward: True
+  wm_progress_scale: 0.03
+  wm_progress_prob_weight: 0.5
+  wm_progress_jump_weight: 1.0
+  wm_progress_long_weight: 0.2
+  wm_progress_decay_steps: 200000
+  wm_progress_min_scale: 0.0
+  wm_progress_clip: 1.0
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -153,7 +169,7 @@ minedojo:
   actor: {layers: 5, dist: 'onehot', std: 'none'}
   value: {layers: 5}
   reward_head: {layers: 5}
-  intrinsic_head: {layers: 5}
+  intrinsic_head: {layers: 5, loss_scale: 0.0}
   jumping_steps_head: {layers: 5}
   accumulated_reward_head: {layers: 5}
   end_head: {layers: 5}
@@ -161,6 +177,17 @@ minedojo:
   imag_gradient: 'reinforce'
   break_speed: 100.0
   time_limit: 36000
+
+  # CORE2-WMP overrides for MineDojo experiments.
+  use_original_intrinsic: False
+  use_wm_progress_reward: True
+  wm_progress_scale: 0.03
+  wm_progress_prob_weight: 0.5
+  wm_progress_jump_weight: 1.0
+  wm_progress_long_weight: 0.2
+  wm_progress_decay_steps: 200000
+  wm_progress_min_scale: 0.0
+  wm_progress_clip: 1.0
 
 debug:
   debug: True
