@@ -30,8 +30,14 @@ class ClipWrapper(Wrapper):
         self.expl_last_score = 0
 
         obs = self.env.reset(**kwargs)
+        # Keep MineCLIP as a clean, separate signal. Do not write it into
+        # obs['intrinsic'], because obs['intrinsic'] is the original
+        # LS-Imagine intrinsic path that may later be mixed with affordance
+        # Gaussian rewards.
         obs['intrinsic'] = 0.0
         obs['score'] = 0.0
+        obs['mineclip_score'] = 0.0
+        obs['mineclip_reward'] = 0.0
 
         return obs
     
@@ -45,17 +51,27 @@ class ClipWrapper(Wrapper):
             self.buffer = self._insert_buffer(self.buffer, logits[:1])
             score = self._get_score()
 
-            if score > self.last_score:
-                obs['intrinsic'] = self.dense_reward * score
-                self.last_score = score
-            else:
-                obs['intrinsic'] = 0.0
+            mineclip_score = self.dense_reward * score
 
-            obs['score'] = self.dense_reward * score
+            # Clean MineCLIP reward path. This is the signal that will be
+            # modeled by mineclip_reward_head and added to actor imagination.
+            obs['mineclip_score'] = mineclip_score
+            obs['mineclip_reward'] = mineclip_score
+
+            # Preserve score for the original long-term bookkeeping / logging.
+            obs['score'] = mineclip_score
+
+            # Do not leak MineCLIP progress into the original intrinsic field.
+            # The original intrinsic path is disabled in this variant.
+            obs['intrinsic'] = 0.0
+            if score > self.last_score:
+                self.last_score = score
 
         else:
             obs['intrinsic'] = 0.0
             obs['score'] = 0.0
+            obs['mineclip_score'] = 0.0
+            obs['mineclip_reward'] = 0.0
 
         if len(self.expl_prompt) > 0:
             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)
@@ -73,7 +89,7 @@ class ClipWrapper(Wrapper):
         else:
             info['expl_intrinsic'] = 0.0
 
-        info["clip_score"] = obs['intrinsic']
+        info["clip_score"] = obs.get('mineclip_reward', 0.0)
         info["clip_last_score"] = self.last_score
         info["clip_dense_reward"] = self.dense_reward    
 

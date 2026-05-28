@@ -76,6 +76,10 @@ class LSImagineWrapper(Wrapper, ABC):
                 'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'mineclip_score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'mineclip_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'mineclip_score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                'mineclip_reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
                 'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             }
@@ -150,10 +154,16 @@ class LSImagineWrapper(Wrapper, ABC):
             'is_last': obs['is_last'],
             'is_terminal': obs['is_terminal'],
             'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
-            'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
-            'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
+            # Disable the original LS-Imagine intrinsic signal in replay.
+            # MineCLIP is exposed through separate fields below.
+            'intrinsic': 0.0,
+            'intrinsic_on_zoomed': 0.0,
             'score': obs['score'] if 'score' in obs else 0.0,
             'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
+            'mineclip_score': obs['mineclip_score'] if 'mineclip_score' in obs else 0.0,
+            'mineclip_reward': obs['mineclip_reward'] if 'mineclip_reward' in obs else 0.0,
+            'mineclip_score_on_zoomed': obs['mineclip_score_on_zoomed'] if 'mineclip_score_on_zoomed' in obs else 0.0,
+            'mineclip_reward_on_zoomed': obs['mineclip_reward_on_zoomed'] if 'mineclip_reward_on_zoomed' in obs else 0.0,
             'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
             'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
         }

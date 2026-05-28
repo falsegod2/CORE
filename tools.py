@@ -196,23 +196,30 @@ class Logger:
         if self._wandb:
             wandb.finish()
 
-def calculate_accumulated_reward(rewards, intrinsics, gamma):
+def calculate_accumulated_reward(rewards, intrinsics, gamma, mineclip_rewards=None):
     """Discounted interval return for the long-term branch.
 
-    CORE2-WMP-v2 deliberately removes the original wrapper-computed intrinsic
-    reward from long-term accumulated targets.  The `intrinsics` argument is
-    kept for API compatibility with the original simulate() code, but is not
-    used here.  This prevents the original LS-Imagine intrinsic from leaking
-    back into the supposedly no-intrinsic baseline via accumulated_reward_head.
+    The original LS-Imagine intrinsic signal is deliberately excluded.  In this
+    variant, MineCLIP is carried by a clean `mineclip_reward` field and can be
+    included in the long-term interval target so that jumpy returns match the
+    actor reward definition: env reward + MineCLIP reward (+ WMP bonus in
+    imagination).  The `intrinsics` argument is kept only for API compatibility
+    and is not used.
     """
     if len(rewards) == 0:
         return 0
 
-    rewards = np.array(rewards)
-    gammas = np.power(gamma, np.arange(len(rewards)))
-    discounted_rewards = rewards * gammas
-    gamma_sum = np.sum(gammas)
+    rewards = np.array(rewards, dtype=np.float32)
+    if mineclip_rewards is None:
+        mineclip_rewards = np.zeros_like(rewards, dtype=np.float32)
+    else:
+        mineclip_rewards = np.array(mineclip_rewards, dtype=np.float32)
+        if mineclip_rewards.shape != rewards.shape:
+            mineclip_rewards = np.resize(mineclip_rewards, rewards.shape)
 
+    gammas = np.power(gamma, np.arange(len(rewards)))
+    discounted_rewards = (rewards + mineclip_rewards) * gammas
+    gamma_sum = np.sum(gammas)
     return np.sum(discounted_rewards) / gamma_sum
 
 def simulate(
@@ -320,7 +327,13 @@ def simulate(
             if len(tmp_list) > 0:
                 for ss in tmp_list:
                     cache[env.id]["jumping_steps"][ss] = current_step - ss
-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                    mineclip_interval = cache[env.id].get("mineclip_reward", [0.0] * len(cache[env.id]["reward"]))
+                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(
+                        cache[env.id]["reward"][ss+1:current_step],
+                        cache[env.id]["intrinsic"][ss+1:current_step],
+                        gamma,
+                        mineclip_interval[ss+1:current_step],
+                    )
                     cache[env.id]["is_calculated"][ss] = True
 
             if step_calculator.count_data_pairs(env.id) == 0:

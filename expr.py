@@ -159,6 +159,14 @@ class LS_Imagine(nn.Module):
             f
         ).mode()
 
+        def mineclip_reward(f, s, a):
+            feat = self._wm.dynamics.get_feat(s)
+            if not getattr(self._config, "use_mineclip_reward", False):
+                return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
+            if "mineclip_reward" not in self._wm.heads:
+                return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
+            return self._wm.heads["mineclip_reward"](feat).mode()
+
         jump_indicator = lambda s: self._wm.heads["jump"](
             self._wm.dynamics.get_feat(s)
         ).mean
@@ -167,7 +175,17 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(
+            post,
+            post_zoomed,
+            reward,
+            intrinsic,
+            jumping_steps,
+            accumulated_reward,
+            jump_indicator,
+            is_end,
+            mineclip_objective=mineclip_reward,
+        )[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})

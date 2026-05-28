@@ -45,26 +45,32 @@ class ConcentrationWrapper(Wrapper):
         obs['reward_on_zoomed'] = 0.0
         obs['intrinsic_on_zoomed'] = 0.0
         obs['score_on_zoomed'] = 0.0
+        obs['mineclip_score_on_zoomed'] = 0.0
+        obs['mineclip_reward_on_zoomed'] = 0.0
         obs['zoomed_image'] = zoomed_image
 
         if score > self.last_score:
-            obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
+            # Do not write the LS-Imagine affordance/Gaussian intrinsic reward
+            # into obs['intrinsic'] in this variant. Keep the threshold update
+            # and score bookkeeping for long-term pair construction.
             self.last_score = score
 
         obs['score'] += self.dense_reward * score
 
         if is_zoomed:
             if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
-                obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
+                # Do not write Gaussian intrinsic into intrinsic_on_zoomed.
                 self.last_zoom_in_gaussian_score = gaussian_on_zoomed
 
             obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
 
+            clean_zoomed_mineclip = self.mineclip_dense_reward * mineclip_on_zoomed
             if mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
-                obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
                 self.last_zoom_in_mineclip_score = mineclip_on_zoomed
 
-            obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+            obs['mineclip_score_on_zoomed'] = clean_zoomed_mineclip
+            obs['mineclip_reward_on_zoomed'] = clean_zoomed_mineclip
+            obs['score_on_zoomed'] += clean_zoomed_mineclip
            
         obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
         if is_zoomed:
@@ -94,27 +100,33 @@ class ConcentrationWrapper(Wrapper):
             obs['reward_on_zoomed'] = reward
             obs['intrinsic_on_zoomed'] = 0.0
             obs['score_on_zoomed'] = 0.0
+            obs['mineclip_score_on_zoomed'] = 0.0
+            obs['mineclip_reward_on_zoomed'] = 0.0
             obs['zoomed_image'] = zoomed_image
 
             if score > self.last_score:
-                obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
+                # Do not write the LS-Imagine affordance/Gaussian intrinsic reward
+                # into obs['intrinsic'] in this variant. Keep the threshold update
+                # and score bookkeeping for long-term pair construction.
                 self.last_score = score
 
             obs['score'] += self.dense_reward * score
 
             if is_zoomed:
                 if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
-                    obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
+                    # Do not write Gaussian intrinsic into intrinsic_on_zoomed.
                     self.last_zoom_in_gaussian_score = gaussian_on_zoomed
 
                 obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
                 
                 if mineclip_on_zoomed > info["clip_last_score"] and mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
                     self.mineclip_dense_reward = info["clip_dense_reward"]
-                    obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
                     self.last_zoom_in_mineclip_score = mineclip_on_zoomed
 
-                obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+                clean_zoomed_mineclip = self.mineclip_dense_reward * mineclip_on_zoomed
+                obs['mineclip_score_on_zoomed'] = clean_zoomed_mineclip
+                obs['mineclip_reward_on_zoomed'] = clean_zoomed_mineclip
+                obs['score_on_zoomed'] += clean_zoomed_mineclip
 
             obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
             if is_zoomed:

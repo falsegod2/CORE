@@ -218,6 +218,20 @@ class WorldModel(nn.Module):
             name="Intrinsic",
         )
 
+        if getattr(config, "use_mineclip_reward", False):
+            self.heads["mineclip_reward"] = networks.MLP(
+                feat_size,
+                (255,) if config.mineclip_reward_head["dist"] == "symlog_disc" else (),
+                config.mineclip_reward_head["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                dist=config.mineclip_reward_head["dist"],
+                outscale=config.mineclip_reward_head["outscale"],
+                device=config.device,
+                name="MineCLIPReward",
+            )
+
         self.heads["jumping_steps"] = networks.MLP(
             feat_size * 2,
             (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
@@ -269,6 +283,7 @@ class WorldModel(nn.Module):
             end=config.end_head["loss_scale"],
             jump=config.jump_head["loss_scale"],
             intrinsic=config.intrinsic_head["loss_scale"],
+            mineclip_reward=config.mineclip_reward_head["loss_scale"] if getattr(config, "use_mineclip_reward", False) else 0.0,
             jumping_steps=config.jumping_steps_head["loss_scale"],
             accumulated_reward=config.accumulated_reward_head["loss_scale"],
             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
@@ -336,6 +351,8 @@ class WorldModel(nn.Module):
                     for name, head in self.heads.items():
                         if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
                             continue
+                        if name == "mineclip_reward" and not getattr(self._config, "use_mineclip_reward", False):
+                            continue
                         if name in ["jumping_steps", "accumulated_reward"]:
                             continue
                         grad_head = name in self._config.grad_heads
@@ -350,6 +367,8 @@ class WorldModel(nn.Module):
                             
                     losses = {}
                     for name, pred in preds.items():
+                        if name not in data:
+                            continue
                         loss = -pred.log_prob(data[name])
                         losses[name] = loss
                         
@@ -382,6 +401,8 @@ class WorldModel(nn.Module):
                         for name, head in self.heads.items():
                             if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
                                 continue
+                            if name == "mineclip_reward" and not getattr(self._config, "use_mineclip_reward", False):
+                                continue
                             grad_head_zoomed = name in self._config.grad_heads
                             if name in ["jumping_steps", "accumulated_reward"]:
                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
@@ -401,6 +422,8 @@ class WorldModel(nn.Module):
                                 
                         losses_zoomed = {}
                         for name, pred in preds_zoomed.items():
+                            if name not in curr_data_zoomed:
+                                continue
                             loss = -pred.log_prob(curr_data_zoomed[name])
                             if name in ['jumping_steps', 'accumulated_reward']:
                                 loss *= is_calculated_mask
@@ -471,6 +494,10 @@ class WorldModel(nn.Module):
             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
             obs["reward"] = obs["reward_on_zoomed"]
             obs['intrinsic'] = obs['intrinsic_on_zoomed']
+            if 'mineclip_reward_on_zoomed' in obs:
+                obs['mineclip_reward'] = obs['mineclip_reward_on_zoomed']
+            if 'mineclip_score_on_zoomed' in obs:
+                obs['mineclip_score'] = obs['mineclip_score_on_zoomed']
             
             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
             if "action" in obs:
@@ -482,6 +509,8 @@ class WorldModel(nn.Module):
         obs.pop("heatmap_on_zoomed", None)
         obs.pop("reward_on_zoomed", None)
         obs.pop("intrinsic_on_zoomed", None)
+        obs.pop("mineclip_reward_on_zoomed", None)
+        obs.pop("mineclip_score_on_zoomed", None)
 
         if "discount" in obs:
             obs["discount"] *= self._config.discount
@@ -675,6 +704,7 @@ class ImagBehavior(nn.Module):
             accumulated_reward_predictor,
             jump_indicator,
             is_end,
+            mineclip_objective=None,
         ):
             self._update_slow_target()
             metrics = {}
@@ -794,6 +824,13 @@ class ImagBehavior(nn.Module):
                         intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
                         reward += intrinsic_reward
                         metrics.update(tools.tensorstats(intrinsic_reward, "intrinsic_reward"))
+
+                    if getattr(self._config, "use_mineclip_reward", False) and mineclip_objective is not None:
+                        mineclip_reward = mineclip_objective(imag_feat, imag_state, imag_action)
+                        mineclip_scale = float(getattr(self._config, "mineclip_reward_scale", 1.0))
+                        reward += mineclip_scale * mineclip_reward
+                        metrics.update(tools.tensorstats(mineclip_reward, "mineclip_reward"))
+                        metrics["mineclip_reward_scale"] = mineclip_scale
 
                     if getattr(self._config, "use_wm_progress_reward", False):
                         wm_progress_reward = self._wm_progress_reward(

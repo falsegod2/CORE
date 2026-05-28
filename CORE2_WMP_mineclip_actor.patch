@@ -1,0 +1,465 @@
+diff -ruN CORE-CORE2-WMP/README_CORE2_WMP_MINECLIP_ACTOR.txt CORE2-WMP-MineCLIPActor/README_CORE2_WMP_MINECLIP_ACTOR.txt
+--- CORE-CORE2-WMP/README_CORE2_WMP_MINECLIP_ACTOR.txt	1970-01-01 00:00:00.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/README_CORE2_WMP_MINECLIP_ACTOR.txt	2026-05-28 07:59:28.022025670 +0000
+@@ -0,0 +1,36 @@
++CORE2-WMP-MineCLIPActor
++
++Goal:
++- Keep CORE2-WMP and long-term imagination.
++- Disable the original LS-Imagine intrinsic path.
++- Add a clean MineCLIP reward path to the actor reward.
++
++Main actor reward:
++  actor_reward = env_reward_prediction
++               + mineclip_reward_scale * mineclip_reward_prediction
++               + WMP_reward
++
++Removed/disabled:
++- obs['intrinsic'] from ClipWrapper is no longer used for MineCLIP progress.
++- affordance/Gaussian intrinsic from ConcentrationWrapper is not written into obs['intrinsic'].
++- LS_ImagineWrapper writes intrinsic and intrinsic_on_zoomed as 0.0.
++- intrinsic_head remains for compatibility but loss_scale is 0 and use_original_intrinsic is False.
++
++Added clean fields:
++- obs['mineclip_score']
++- obs['mineclip_reward']
++- obs['mineclip_score_on_zoomed']
++- obs['mineclip_reward_on_zoomed']
++
++Added model head:
++- heads['mineclip_reward'] trained from data['mineclip_reward'].
++
++Long-term accumulated_reward:
++- Original intrinsic is excluded.
++- Clean mineclip_reward is included in interval targets.
++
++Expected logs:
++- mineclip_reward_mean / std / min / max
++- mineclip_reward_loss
++- mineclip_reward_scale
++- wm_progress_reward_* and wmp_* still appear.
+diff -ruN CORE-CORE2-WMP/configs.yaml CORE2-WMP-MineCLIPActor/configs.yaml
+--- CORE-CORE2-WMP/configs.yaml	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/configs.yaml	2026-05-28 07:57:32.370580632 +0000
+@@ -51,7 +51,7 @@
+   dyn_mean_act: 'none'
+   dyn_std_act: 'sigmoid2'
+   dyn_min_std: 0.1
+-  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward']
++  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward', 'mineclip_reward']
+   units: 512
+   act: 'SiLU'
+   norm: True
+@@ -75,6 +75,8 @@
+   # The key is kept for checkpoint/config compatibility, but its loss is disabled.
+   intrinsic_head:
+     {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
++  mineclip_reward_head:
++    {layers: 2, dist: 'normal', loss_scale: 1.0, outscale: 0.0}
+   jumping_steps_head:
+     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+   accumulated_reward_head:
+@@ -85,6 +87,9 @@
+   # a model-predicted progress bonus derived from jump_head, jumping_steps_head,
+   # and accumulated_reward_head.
+   use_original_intrinsic: False
++  use_mineclip_reward: True
++  mineclip_reward_scale: 1.0
++  use_mineclip_in_accumulated_reward: True
+   use_wm_progress_reward: True
+   wm_progress_scale: 0.03
+   wm_progress_prob_weight: 0.5
+@@ -170,6 +175,7 @@
+   value: {layers: 5}
+   reward_head: {layers: 5}
+   intrinsic_head: {layers: 5, loss_scale: 0.0}
++  mineclip_reward_head: {layers: 5, dist: 'normal', loss_scale: 1.0, outscale: 0.0}
+   jumping_steps_head: {layers: 5}
+   accumulated_reward_head: {layers: 5}
+   end_head: {layers: 5}
+@@ -180,6 +186,9 @@
+ 
+   # CORE2-WMP overrides for MineDojo experiments.
+   use_original_intrinsic: False
++  use_mineclip_reward: True
++  mineclip_reward_scale: 1.0
++  use_mineclip_in_accumulated_reward: True
+   use_wm_progress_reward: True
+   wm_progress_scale: 0.03
+   wm_progress_prob_weight: 0.5
+diff -ruN CORE-CORE2-WMP/envs/tasks/base/clip_wrapper.py CORE2-WMP-MineCLIPActor/envs/tasks/base/clip_wrapper.py
+--- CORE-CORE2-WMP/envs/tasks/base/clip_wrapper.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/envs/tasks/base/clip_wrapper.py	2026-05-28 07:56:50.556953604 +0000
+@@ -30,8 +30,14 @@
+         self.expl_last_score = 0
+ 
+         obs = self.env.reset(**kwargs)
++        # Keep MineCLIP as a clean, separate signal. Do not write it into
++        # obs['intrinsic'], because obs['intrinsic'] is the original
++        # LS-Imagine intrinsic path that may later be mixed with affordance
++        # Gaussian rewards.
+         obs['intrinsic'] = 0.0
+         obs['score'] = 0.0
++        obs['mineclip_score'] = 0.0
++        obs['mineclip_reward'] = 0.0
+ 
+         return obs
+     
+@@ -45,17 +51,27 @@
+             self.buffer = self._insert_buffer(self.buffer, logits[:1])
+             score = self._get_score()
+ 
++            mineclip_score = self.dense_reward * score
++
++            # Clean MineCLIP reward path. This is the signal that will be
++            # modeled by mineclip_reward_head and added to actor imagination.
++            obs['mineclip_score'] = mineclip_score
++            obs['mineclip_reward'] = mineclip_score
++
++            # Preserve score for the original long-term bookkeeping / logging.
++            obs['score'] = mineclip_score
++
++            # Do not leak MineCLIP progress into the original intrinsic field.
++            # The original intrinsic path is disabled in this variant.
++            obs['intrinsic'] = 0.0
+             if score > self.last_score:
+-                obs['intrinsic'] = self.dense_reward * score
+                 self.last_score = score
+-            else:
+-                obs['intrinsic'] = 0.0
+-
+-            obs['score'] = self.dense_reward * score
+ 
+         else:
+             obs['intrinsic'] = 0.0
+             obs['score'] = 0.0
++            obs['mineclip_score'] = 0.0
++            obs['mineclip_reward'] = 0.0
+ 
+         if len(self.expl_prompt) > 0:
+             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)
+@@ -73,7 +89,7 @@
+         else:
+             info['expl_intrinsic'] = 0.0
+ 
+-        info["clip_score"] = obs['intrinsic']
++        info["clip_score"] = obs.get('mineclip_reward', 0.0)
+         info["clip_last_score"] = self.last_score
+         info["clip_dense_reward"] = self.dense_reward    
+ 
+diff -ruN CORE-CORE2-WMP/envs/tasks/base/concentration_wrapper.py CORE2-WMP-MineCLIPActor/envs/tasks/base/concentration_wrapper.py
+--- CORE-CORE2-WMP/envs/tasks/base/concentration_wrapper.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/envs/tasks/base/concentration_wrapper.py	2026-05-28 07:57:11.131282817 +0000
+@@ -45,26 +45,32 @@
+         obs['reward_on_zoomed'] = 0.0
+         obs['intrinsic_on_zoomed'] = 0.0
+         obs['score_on_zoomed'] = 0.0
++        obs['mineclip_score_on_zoomed'] = 0.0
++        obs['mineclip_reward_on_zoomed'] = 0.0
+         obs['zoomed_image'] = zoomed_image
+ 
+         if score > self.last_score:
+-            obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
++            # Do not write the LS-Imagine affordance/Gaussian intrinsic reward
++            # into obs['intrinsic'] in this variant. Keep the threshold update
++            # and score bookkeeping for long-term pair construction.
+             self.last_score = score
+ 
+         obs['score'] += self.dense_reward * score
+ 
+         if is_zoomed:
+             if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
+-                obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
++                # Do not write Gaussian intrinsic into intrinsic_on_zoomed.
+                 self.last_zoom_in_gaussian_score = gaussian_on_zoomed
+ 
+             obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
+ 
++            clean_zoomed_mineclip = self.mineclip_dense_reward * mineclip_on_zoomed
+             if mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
+-                obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+                 self.last_zoom_in_mineclip_score = mineclip_on_zoomed
+ 
+-            obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
++            obs['mineclip_score_on_zoomed'] = clean_zoomed_mineclip
++            obs['mineclip_reward_on_zoomed'] = clean_zoomed_mineclip
++            obs['score_on_zoomed'] += clean_zoomed_mineclip
+            
+         obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+         if is_zoomed:
+@@ -94,27 +100,33 @@
+             obs['reward_on_zoomed'] = reward
+             obs['intrinsic_on_zoomed'] = 0.0
+             obs['score_on_zoomed'] = 0.0
++            obs['mineclip_score_on_zoomed'] = 0.0
++            obs['mineclip_reward_on_zoomed'] = 0.0
+             obs['zoomed_image'] = zoomed_image
+ 
+             if score > self.last_score:
+-                obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
++                # Do not write the LS-Imagine affordance/Gaussian intrinsic reward
++                # into obs['intrinsic'] in this variant. Keep the threshold update
++                # and score bookkeeping for long-term pair construction.
+                 self.last_score = score
+ 
+             obs['score'] += self.dense_reward * score
+ 
+             if is_zoomed:
+                 if gaussian_on_zoomed > self.last_score and gaussian_on_zoomed > self.last_zoom_in_gaussian_score:
+-                    obs['intrinsic_on_zoomed'] += self.dense_reward * gaussian_on_zoomed * self.gaussian_reward_weight
++                    # Do not write Gaussian intrinsic into intrinsic_on_zoomed.
+                     self.last_zoom_in_gaussian_score = gaussian_on_zoomed
+ 
+                 obs['score_on_zoomed'] += self.dense_reward * gaussian_on_zoomed
+                 
+                 if mineclip_on_zoomed > info["clip_last_score"] and mineclip_on_zoomed > self.last_zoom_in_mineclip_score:
+                     self.mineclip_dense_reward = info["clip_dense_reward"]
+-                    obs['intrinsic_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
+                     self.last_zoom_in_mineclip_score = mineclip_on_zoomed
+ 
+-                obs['score_on_zoomed'] += self.mineclip_dense_reward * mineclip_on_zoomed
++                clean_zoomed_mineclip = self.mineclip_dense_reward * mineclip_on_zoomed
++                obs['mineclip_score_on_zoomed'] = clean_zoomed_mineclip
++                obs['mineclip_reward_on_zoomed'] = clean_zoomed_mineclip
++                obs['score_on_zoomed'] += clean_zoomed_mineclip
+ 
+             obs['heatmap'] = self.concentration.get_heatmap(is_zoomed=False)
+             if is_zoomed:
+diff -ruN CORE-CORE2-WMP/envs/tasks/base/ls_imagine_wrapper.py CORE2-WMP-MineCLIPActor/envs/tasks/base/ls_imagine_wrapper.py
+--- CORE-CORE2-WMP/envs/tasks/base/ls_imagine_wrapper.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/envs/tasks/base/ls_imagine_wrapper.py	2026-05-28 07:57:24.144519869 +0000
+@@ -76,6 +76,10 @@
+                 'intrinsic_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                 'score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                 'score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
++                'mineclip_score': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
++                'mineclip_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
++                'mineclip_score_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
++                'mineclip_reward_on_zoomed': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                 'jumping_steps': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                 'accumulated_reward': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+             }
+@@ -150,10 +154,16 @@
+             'is_last': obs['is_last'],
+             'is_terminal': obs['is_terminal'],
+             'reward_on_zoomed': obs['reward_on_zoomed'] if 'reward_on_zoomed' in obs else 0.0,
+-            'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
+-            'intrinsic_on_zoomed': obs['intrinsic_on_zoomed'] if 'intrinsic_on_zoomed' in obs else 0.0,
++            # Disable the original LS-Imagine intrinsic signal in replay.
++            # MineCLIP is exposed through separate fields below.
++            'intrinsic': 0.0,
++            'intrinsic_on_zoomed': 0.0,
+             'score': obs['score'] if 'score' in obs else 0.0,
+             'score_on_zoomed': obs['score_on_zoomed'] if 'score_on_zoomed' in obs else 0.0,
++            'mineclip_score': obs['mineclip_score'] if 'mineclip_score' in obs else 0.0,
++            'mineclip_reward': obs['mineclip_reward'] if 'mineclip_reward' in obs else 0.0,
++            'mineclip_score_on_zoomed': obs['mineclip_score_on_zoomed'] if 'mineclip_score_on_zoomed' in obs else 0.0,
++            'mineclip_reward_on_zoomed': obs['mineclip_reward_on_zoomed'] if 'mineclip_reward_on_zoomed' in obs else 0.0,
+             'jumping_steps': obs['jumping_steps'] if 'jumping_steps' in obs else 1000.0,
+             'accumulated_reward': obs['accumulated_reward'] if 'accumulated_reward' in obs else 1000.0,
+         }
+diff -ruN CORE-CORE2-WMP/expr.py CORE2-WMP-MineCLIPActor/expr.py
+--- CORE-CORE2-WMP/expr.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/expr.py	2026-05-28 07:58:13.211470216 +0000
+@@ -159,6 +159,14 @@
+             f
+         ).mode()
+ 
++        def mineclip_reward(f, s, a):
++            feat = self._wm.dynamics.get_feat(s)
++            if not getattr(self._config, "use_mineclip_reward", False):
++                return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
++            if "mineclip_reward" not in self._wm.heads:
++                return torch.zeros(feat.shape[:-1] + (1,), device=feat.device, dtype=feat.dtype)
++            return self._wm.heads["mineclip_reward"](feat).mode()
++
+         jump_indicator = lambda s: self._wm.heads["jump"](
+             self._wm.dynamics.get_feat(s)
+         ).mean
+@@ -167,7 +175,17 @@
+             self._wm.dynamics.get_feat(s)
+         ).mean
+ 
+-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
++        metrics.update(self._task_behavior._train(
++            post,
++            post_zoomed,
++            reward,
++            intrinsic,
++            jumping_steps,
++            accumulated_reward,
++            jump_indicator,
++            is_end,
++            mineclip_objective=mineclip_reward,
++        )[-1])
+         if self._config.expl_behavior != "greedy":
+             mets = self._expl_behavior.train(post, context, data)[-1]
+             metrics.update({"expl_" + key: value for key, value in mets.items()})
+diff -ruN CORE-CORE2-WMP/models.py CORE2-WMP-MineCLIPActor/models.py
+--- CORE-CORE2-WMP/models.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/models.py	2026-05-28 07:59:13.719940645 +0000
+@@ -218,6 +218,20 @@
+             name="Intrinsic",
+         )
+ 
++        if getattr(config, "use_mineclip_reward", False):
++            self.heads["mineclip_reward"] = networks.MLP(
++                feat_size,
++                (255,) if config.mineclip_reward_head["dist"] == "symlog_disc" else (),
++                config.mineclip_reward_head["layers"],
++                config.units,
++                config.act,
++                config.norm,
++                dist=config.mineclip_reward_head["dist"],
++                outscale=config.mineclip_reward_head["outscale"],
++                device=config.device,
++                name="MineCLIPReward",
++            )
++
+         self.heads["jumping_steps"] = networks.MLP(
+             feat_size * 2,
+             (255,) if config.jumping_steps_head["dist"] == "symlog_disc" else (),
+@@ -269,6 +283,7 @@
+             end=config.end_head["loss_scale"],
+             jump=config.jump_head["loss_scale"],
+             intrinsic=config.intrinsic_head["loss_scale"],
++            mineclip_reward=config.mineclip_reward_head["loss_scale"] if getattr(config, "use_mineclip_reward", False) else 0.0,
+             jumping_steps=config.jumping_steps_head["loss_scale"],
+             accumulated_reward=config.accumulated_reward_head["loss_scale"],
+             inverse=getattr(config, "inverse_loss_scale", 1.0), # 建议在 configs.yaml 默认设为 1.0
+@@ -336,6 +351,8 @@
+                     for name, head in self.heads.items():
+                         if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                             continue
++                        if name == "mineclip_reward" and not getattr(self._config, "use_mineclip_reward", False):
++                            continue
+                         if name in ["jumping_steps", "accumulated_reward"]:
+                             continue
+                         grad_head = name in self._config.grad_heads
+@@ -350,6 +367,8 @@
+                             
+                     losses = {}
+                     for name, pred in preds.items():
++                        if name not in data:
++                            continue
+                         loss = -pred.log_prob(data[name])
+                         losses[name] = loss
+                         
+@@ -382,6 +401,8 @@
+                         for name, head in self.heads.items():
+                             if name == "intrinsic" and not getattr(self._config, "use_original_intrinsic", True):
+                                 continue
++                            if name == "mineclip_reward" and not getattr(self._config, "use_mineclip_reward", False):
++                                continue
+                             grad_head_zoomed = name in self._config.grad_heads
+                             if name in ["jumping_steps", "accumulated_reward"]:
+                                 feat_zoomed = self.dynamics.get_feat(post_zoomed)
+@@ -401,6 +422,8 @@
+                                 
+                         losses_zoomed = {}
+                         for name, pred in preds_zoomed.items():
++                            if name not in curr_data_zoomed:
++                                continue
+                             loss = -pred.log_prob(curr_data_zoomed[name])
+                             if name in ['jumping_steps', 'accumulated_reward']:
+                                 loss *= is_calculated_mask
+@@ -471,6 +494,10 @@
+             obs["heatmap"] = torch.Tensor(obs["heatmap_on_zoomed"]).unsqueeze(-1) / 255.0
+             obs["reward"] = obs["reward_on_zoomed"]
+             obs['intrinsic'] = obs['intrinsic_on_zoomed']
++            if 'mineclip_reward_on_zoomed' in obs:
++                obs['mineclip_reward'] = obs['mineclip_reward_on_zoomed']
++            if 'mineclip_score_on_zoomed' in obs:
++                obs['mineclip_score'] = obs['mineclip_score_on_zoomed']
+             
+             # for states after zooming, clear the action and add it to 13th dimension, and set the last dimension to 1
+             if "action" in obs:
+@@ -482,6 +509,8 @@
+         obs.pop("heatmap_on_zoomed", None)
+         obs.pop("reward_on_zoomed", None)
+         obs.pop("intrinsic_on_zoomed", None)
++        obs.pop("mineclip_reward_on_zoomed", None)
++        obs.pop("mineclip_score_on_zoomed", None)
+ 
+         if "discount" in obs:
+             obs["discount"] *= self._config.discount
+@@ -675,6 +704,7 @@
+             accumulated_reward_predictor,
+             jump_indicator,
+             is_end,
++            mineclip_objective=None,
+         ):
+             self._update_slow_target()
+             metrics = {}
+@@ -795,6 +825,13 @@
+                         reward += intrinsic_reward
+                         metrics.update(tools.tensorstats(intrinsic_reward, "intrinsic_reward"))
+ 
++                    if getattr(self._config, "use_mineclip_reward", False) and mineclip_objective is not None:
++                        mineclip_reward = mineclip_objective(imag_feat, imag_state, imag_action)
++                        mineclip_scale = float(getattr(self._config, "mineclip_reward_scale", 1.0))
++                        reward += mineclip_scale * mineclip_reward
++                        metrics.update(tools.tensorstats(mineclip_reward, "mineclip_reward"))
++                        metrics["mineclip_reward_scale"] = mineclip_scale
++
+                     if getattr(self._config, "use_wm_progress_reward", False):
+                         wm_progress_reward = self._wm_progress_reward(
+                             imag_feat,
+diff -ruN CORE-CORE2-WMP/tools.py CORE2-WMP-MineCLIPActor/tools.py
+--- CORE-CORE2-WMP/tools.py	2026-05-27 02:39:33.000000000 +0000
++++ CORE2-WMP-MineCLIPActor/tools.py	2026-05-28 07:58:44.594217483 +0000
+@@ -196,23 +196,30 @@
+         if self._wandb:
+             wandb.finish()
+ 
+-def calculate_accumulated_reward(rewards, intrinsics, gamma):
++def calculate_accumulated_reward(rewards, intrinsics, gamma, mineclip_rewards=None):
+     """Discounted interval return for the long-term branch.
+ 
+-    CORE2-WMP-v2 deliberately removes the original wrapper-computed intrinsic
+-    reward from long-term accumulated targets.  The `intrinsics` argument is
+-    kept for API compatibility with the original simulate() code, but is not
+-    used here.  This prevents the original LS-Imagine intrinsic from leaking
+-    back into the supposedly no-intrinsic baseline via accumulated_reward_head.
++    The original LS-Imagine intrinsic signal is deliberately excluded.  In this
++    variant, MineCLIP is carried by a clean `mineclip_reward` field and can be
++    included in the long-term interval target so that jumpy returns match the
++    actor reward definition: env reward + MineCLIP reward (+ WMP bonus in
++    imagination).  The `intrinsics` argument is kept only for API compatibility
++    and is not used.
+     """
+     if len(rewards) == 0:
+         return 0
+ 
+-    rewards = np.array(rewards)
++    rewards = np.array(rewards, dtype=np.float32)
++    if mineclip_rewards is None:
++        mineclip_rewards = np.zeros_like(rewards, dtype=np.float32)
++    else:
++        mineclip_rewards = np.array(mineclip_rewards, dtype=np.float32)
++        if mineclip_rewards.shape != rewards.shape:
++            mineclip_rewards = np.resize(mineclip_rewards, rewards.shape)
++
+     gammas = np.power(gamma, np.arange(len(rewards)))
+-    discounted_rewards = rewards * gammas
++    discounted_rewards = (rewards + mineclip_rewards) * gammas
+     gamma_sum = np.sum(gammas)
+-
+     return np.sum(discounted_rewards) / gamma_sum
+ 
+ def simulate(
+@@ -320,7 +327,13 @@
+             if len(tmp_list) > 0:
+                 for ss in tmp_list:
+                     cache[env.id]["jumping_steps"][ss] = current_step - ss
+-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
++                    mineclip_interval = cache[env.id].get("mineclip_reward", [0.0] * len(cache[env.id]["reward"]))
++                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(
++                        cache[env.id]["reward"][ss+1:current_step],
++                        cache[env.id]["intrinsic"][ss+1:current_step],
++                        gamma,
++                        mineclip_interval[ss+1:current_step],
++                    )
+                     cache[env.id]["is_calculated"][ss] = True
+ 
+             if step_calculator.count_data_pairs(env.id) == 0:

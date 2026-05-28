@@ -51,7 +51,7 @@ defaults:
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward']
+  grad_heads: ['decoder', 'reward', 'end', 'jump', 'jumping_steps', 'accumulated_reward', 'mineclip_reward']
   units: 512
   act: 'SiLU'
   norm: True
@@ -75,6 +75,8 @@ defaults:
   # The key is kept for checkpoint/config compatibility, but its loss is disabled.
   intrinsic_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
+  mineclip_reward_head:
+    {layers: 2, dist: 'normal', loss_scale: 1.0, outscale: 0.0}
   jumping_steps_head:
     {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   accumulated_reward_head:
@@ -85,6 +87,9 @@ defaults:
   # a model-predicted progress bonus derived from jump_head, jumping_steps_head,
   # and accumulated_reward_head.
   use_original_intrinsic: False
+  use_mineclip_reward: True
+  mineclip_reward_scale: 1.0
+  use_mineclip_in_accumulated_reward: True
   use_wm_progress_reward: True
   wm_progress_scale: 0.03
   wm_progress_prob_weight: 0.5
@@ -170,6 +175,7 @@ minedojo:
   value: {layers: 5}
   reward_head: {layers: 5}
   intrinsic_head: {layers: 5, loss_scale: 0.0}
+  mineclip_reward_head: {layers: 5, dist: 'normal', loss_scale: 1.0, outscale: 0.0}
   jumping_steps_head: {layers: 5}
   accumulated_reward_head: {layers: 5}
   end_head: {layers: 5}
@@ -180,6 +186,9 @@ minedojo:
 
   # CORE2-WMP overrides for MineDojo experiments.
   use_original_intrinsic: False
+  use_mineclip_reward: True
+  mineclip_reward_scale: 1.0
+  use_mineclip_in_accumulated_reward: True
   use_wm_progress_reward: True
   wm_progress_scale: 0.03
   wm_progress_prob_weight: 0.5
