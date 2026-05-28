@@ -64,6 +64,7 @@ class LS_Imagine(nn.Module):
         # CORE2-SLP: latent landmark bank mined from replay by MineCLIP score.
         self._slp_landmarks = None
         self._slp_scores = None
+        self._slp_deltas = None
         self._slp_bank_ptr = 0
         self._slp_bank_count = 0
         self._slp_last_metrics = {}
@@ -126,6 +127,7 @@ class LS_Imagine(nn.Module):
         if self._slp_landmarks is None or self._slp_landmarks.shape[-1] != feat_dim:
             self._slp_landmarks = torch.zeros(bank_size, feat_dim, device=device, dtype=torch.float32)
             self._slp_scores = torch.full((bank_size,), -1.0e9, device=device, dtype=torch.float32)
+            self._slp_deltas = torch.zeros(bank_size, device=device, dtype=torch.float32)
             self._slp_bank_ptr = 0
             self._slp_bank_count = 0
 
@@ -149,29 +151,42 @@ class LS_Imagine(nn.Module):
                 return score.squeeze(-1) if score.ndim > 2 and score.shape[-1] == 1 else score
         return None
 
-    def _insert_slp_landmarks_diverse(self, cand_feat, cand_score):
+    def _insert_slp_landmarks_diverse(self, cand_feat, cand_score, cand_delta=None):
         """Insert semantically strong but diverse landmarks into the bank.
 
-        CORE2-SLP differs from plain LGP here: it avoids filling the whole bank
-        with near-duplicate high-MineCLIP-score frames, and replaces an existing
-        near-duplicate only when the new candidate has a better semantic score.
+        CORE2-SLP-delta stores both the absolute MineCLIP score and the
+        temporal MineCLIP score delta. Absolute score marks states that look
+        task-relevant, while score_delta marks states where the trajectory is
+        making semantic progress. When replacing near-duplicate landmarks, we
+        compare score + delta_weight * positive_delta, not score alone.
         """
         if cand_feat.numel() == 0:
             return 0, 0, 0
         self._ensure_slp_bank(cand_feat.shape[-1])
+        if cand_delta is None:
+            cand_delta = torch.zeros_like(cand_score)
         bank_size = int(self._slp_landmarks.shape[0])
         use_div = bool(getattr(self._config, "slp_use_diversity", True))
         replace_similar = bool(getattr(self._config, "slp_replace_similar", True))
         sim_threshold = float(getattr(self._config, "slp_landmark_sim_threshold", 0.95))
+        delta_weight = float(getattr(self._config, "slp_delta_priority", 0.5))
+        delta_positive = bool(getattr(self._config, "slp_delta_positive_only", True))
         inserted, replaced, skipped = 0, 0, 0
 
-        for feat_i, score_i in zip(cand_feat, cand_score):
+        def _replace_priority(score_value, delta_value):
+            if delta_positive:
+                delta_value = torch.relu(delta_value)
+            return score_value + delta_weight * delta_value
+
+        for feat_i, score_i, delta_i in zip(cand_feat, cand_score, cand_delta):
             score_i = score_i.detach().float()
+            delta_i = torch.nan_to_num(delta_i.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
             feat_i = feat_i.detach().float()
             if self._slp_bank_count <= 0:
                 idx = int(self._slp_bank_ptr)
                 self._slp_landmarks[idx] = feat_i
                 self._slp_scores[idx] = score_i
+                self._slp_deltas[idx] = delta_i
                 self._slp_bank_ptr = int((self._slp_bank_ptr + 1) % bank_size)
                 self._slp_bank_count = min(bank_size, self._slp_bank_count + 1)
                 inserted += 1
@@ -187,9 +202,12 @@ class LS_Imagine(nn.Module):
                 is_duplicate = bool(max_sim.item() >= sim_threshold) if getattr(self._config, "slp_distance", "cosine") == "cosine" else False
                 if is_duplicate:
                     idx = int(max_idx.item())
-                    if replace_similar and score_i > self._slp_scores[idx]:
+                    old_priority = _replace_priority(self._slp_scores[idx], self._slp_deltas[idx])
+                    new_priority = _replace_priority(score_i, delta_i)
+                    if replace_similar and new_priority > old_priority:
                         self._slp_landmarks[idx] = feat_i
                         self._slp_scores[idx] = score_i
+                        self._slp_deltas[idx] = delta_i
                         replaced += 1
                     else:
                         skipped += 1
@@ -198,22 +216,51 @@ class LS_Imagine(nn.Module):
             idx = int(self._slp_bank_ptr)
             self._slp_landmarks[idx] = feat_i
             self._slp_scores[idx] = score_i
+            self._slp_deltas[idx] = delta_i
             self._slp_bank_ptr = int((self._slp_bank_ptr + 1) % bank_size)
             self._slp_bank_count = min(bank_size, self._slp_bank_count + 1)
             inserted += 1
 
         return inserted, replaced, skipped
 
-    def _get_slp_score_delta(self, score, feat_len):
-        """Estimate MineCLIP progress inside a replay sequence for landmark priority."""
+    def _get_slp_score_delta(self, raw_score, target_shape):
+        """Compute temporal MineCLIP score delta aligned with RSSM features.
+
+        raw_score usually has shape [B, T] or [B, T, 1], while feat has shape
+        [B, T, D]. We compute delta along the temporal dimension:
+            delta[:, t] = score[:, t] - score[:, t-1]
+        and flatten it so it aligns with feat.reshape(-1, D).
+        """
+        total = int(np.prod(tuple(target_shape))) if len(target_shape) > 0 else int(raw_score.numel())
         try:
-            score_seq = score.reshape(-1)
-            # If score came from [B, T], use temporal delta before flattening when possible.
-            # Otherwise this falls back to a safe zero-delta vector.
-            # The caller only uses this as an optional priority term.
-            return torch.zeros(feat_len, device=self._config.device, dtype=torch.float32)
+            score = raw_score.detach().float().to(self._config.device)
+            if score.ndim > 0 and score.shape[-1] == 1:
+                score = score.squeeze(-1)
+
+            if len(target_shape) >= 2 and int(np.prod(tuple(target_shape))) == score.numel():
+                score_seq = score.reshape(*target_shape)
+                delta = torch.zeros_like(score_seq)
+                # In this codebase replay batches are [B, T, ...], so dim=1 is time.
+                delta[:, 1:] = score_seq[:, 1:] - score_seq[:, :-1]
+                delta = delta.reshape(-1)
+            elif score.numel() == total:
+                # If temporal structure is not recoverable, use a safe zero delta.
+                delta = torch.zeros(total, device=self._config.device, dtype=torch.float32)
+            else:
+                delta = torch.zeros(total, device=self._config.device, dtype=torch.float32)
+
+            if bool(getattr(self._config, "slp_delta_positive_only", True)):
+                delta = torch.relu(delta)
+            return torch.nan_to_num(delta.float(), nan=0.0, posinf=0.0, neginf=0.0)
         except Exception:
-            return torch.zeros(feat_len, device=self._config.device, dtype=torch.float32)
+            return torch.zeros(total, device=self._config.device, dtype=torch.float32)
+
+    def _normalize_priority_vector(self, value):
+        value = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if value.numel() <= 1:
+            return torch.zeros_like(value)
+        vmin, vmax = value.min(), value.max()
+        return (value - vmin) / (vmax - vmin + 1e-6)
 
     def _update_slp_landmarks(self, feat, data):
         """Mine strategic, diverse latent landmarks using MineCLIP score.
@@ -229,14 +276,16 @@ class LS_Imagine(nn.Module):
             if score is None:
                 return {"slp_bank_size": float(self._slp_bank_count), "slp_no_score_key": 1.0}
 
+            feat_shape = tuple(feat.shape[:-1])
             feat = feat.detach().float().reshape(-1, feat.shape[-1])
             raw_score = score.detach().float()
+            score_delta = self._get_slp_score_delta(raw_score, feat_shape)
             score = raw_score.reshape(-1).float()
-            n = min(feat.shape[0], score.shape[0])
+            n = min(feat.shape[0], score.shape[0], score_delta.shape[0])
             if n <= 0:
                 return {"slp_bank_size": float(self._slp_bank_count)}
-            feat, score = feat[:n], score[:n]
-            valid = torch.isfinite(score)
+            feat, score, score_delta = feat[:n], score[:n], score_delta[:n]
+            valid = torch.isfinite(score) & torch.isfinite(score_delta)
             min_score = getattr(self._config, "slp_min_score", None)
             if min_score is not None:
                 valid = valid & (score >= float(min_score))
@@ -244,20 +293,32 @@ class LS_Imagine(nn.Module):
                 return {
                     "slp_bank_size": float(self._slp_bank_count),
                     "slp_batch_score_mean": _metric_to_float(score),
+                    "slp_score_delta_mean": _metric_to_float(score_delta),
                     "slp_selected_num": 0.0,
                 }
 
-            feat, score = feat[valid], score[valid]
+            feat, score, score_delta = feat[valid], score[valid], score_delta[valid]
+
+            # Landmark mining priority: high semantic score + positive semantic progress.
+            # This avoids filling the bank with frames that merely look task-related
+            # but do not represent actual approach/progress in the trajectory.
+            delta_weight = float(getattr(self._config, "slp_delta_priority", 0.5))
+            score_norm = self._normalize_priority_vector(score)
+            delta_norm = self._normalize_priority_vector(score_delta)
+            mining_priority = score_norm + delta_weight * delta_norm
+
             frac = float(getattr(self._config, "slp_top_percentile", 0.2))
             frac = max(0.0, min(1.0, frac))
             k = max(1, int(round(feat.shape[0] * frac)))
             k = min(k, int(getattr(self._config, "slp_max_new_landmarks", 128)), feat.shape[0])
-            top_score, top_idx = torch.topk(score, k=k, largest=True)
+            top_priority, top_idx = torch.topk(mining_priority, k=k, largest=True)
+            top_score = score[top_idx]
+            top_delta = score_delta[top_idx]
             top_feat = feat[top_idx]
             if getattr(self._config, "slp_distance", "cosine") == "cosine":
                 top_feat = torch.nn.functional.normalize(top_feat, dim=-1, eps=1e-6)
 
-            inserted, replaced, skipped = self._insert_slp_landmarks_diverse(top_feat, top_score)
+            inserted, replaced, skipped = self._insert_slp_landmarks_diverse(top_feat, top_score, top_delta)
             return {
                 "slp_bank_size": float(self._slp_bank_count),
                 "slp_selected_num": float(k),
@@ -265,8 +326,16 @@ class LS_Imagine(nn.Module):
                 "slp_replaced_num": float(replaced),
                 "slp_skipped_duplicate_num": float(skipped),
                 "slp_batch_score_mean": _metric_to_float(score),
+                "slp_batch_score_max": _metric_to_float(score.max()),
+                "slp_score_delta_mean": _metric_to_float(score_delta),
+                "slp_score_delta_max": _metric_to_float(score_delta.max()),
+                "slp_mining_priority_mean": _metric_to_float(mining_priority),
                 "slp_selected_score_mean": _metric_to_float(top_score),
                 "slp_selected_score_max": _metric_to_float(top_score.max()),
+                "slp_selected_delta_mean": _metric_to_float(top_delta),
+                "slp_selected_delta_max": _metric_to_float(top_delta.max()),
+                "slp_selected_priority_mean": _metric_to_float(top_priority),
+                "slp_selected_priority_max": _metric_to_float(top_priority.max()),
             }
 
     def _strategic_latent_progress_reward(self, imag_feat):
@@ -289,6 +358,7 @@ class LS_Imagine(nn.Module):
             valid_count = int(self._slp_bank_count)
             landmarks = self._slp_landmarks[:valid_count].detach().float()
             scores = self._slp_scores[:valid_count].detach().float()
+            deltas = self._slp_deltas[:valid_count].detach().float() if self._slp_deltas is not None else torch.zeros_like(scores)
             feat = imag_feat.detach().float()
 
             if getattr(self._config, "slp_distance", "cosine") == "cosine":
@@ -300,16 +370,15 @@ class LS_Imagine(nn.Module):
                 land_n = landmarks
                 start_sim = -torch.cdist(feat[0], landmarks, p=2) ** 2
 
-            # Normalize MineCLIP scores inside the current landmark bank.
-            if scores.numel() > 1:
-                score_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-6)
-            else:
-                score_norm = torch.zeros_like(scores)
+            # Normalize MineCLIP scores and score deltas inside the current landmark bank.
+            score_norm = self._normalize_priority_vector(scores)
+            delta_norm = self._normalize_priority_vector(deltas)
 
-            # Strategic landmark selection: semantic score minus reachability cost.
+            # Strategic landmark selection: semantic score + semantic progress + reachability.
             alpha = float(getattr(self._config, "slp_score_priority", 1.0))
             beta = float(getattr(self._config, "slp_reachability_weight", 0.7))
-            priority = alpha * score_norm.unsqueeze(0) + beta * start_sim
+            delta_weight = float(getattr(self._config, "slp_delta_priority", 0.5))
+            priority = alpha * score_norm.unsqueeze(0) + delta_weight * delta_norm.unsqueeze(0) + beta * start_sim
             cand_k = min(int(getattr(self._config, "slp_candidate_k", 8)), valid_count)
             _, cand_idx = torch.topk(priority, k=cand_k, dim=-1, largest=True)  # [N, K]
             cand = land_n[cand_idx]
@@ -338,6 +407,7 @@ class LS_Imagine(nn.Module):
             reward = reward * float(scale)
 
             selected_scores = torch.gather(score_norm.unsqueeze(0).expand_as(start_sim), 1, cand_idx)
+            selected_deltas = torch.gather(delta_norm.unsqueeze(0).expand_as(start_sim), 1, cand_idx)
             selected_start_sim = torch.gather(start_sim, 1, cand_idx)
             self._slp_last_metrics = {
                 "slp_scale": float(scale),
@@ -349,7 +419,10 @@ class LS_Imagine(nn.Module):
                 "slp_progress_mean": _metric_to_float(progress),
                 "slp_candidate_k": float(cand_k),
                 "slp_candidate_score_mean": _metric_to_float(selected_scores.mean()),
+                "slp_candidate_delta_mean": _metric_to_float(selected_deltas.mean()),
                 "slp_candidate_start_sim_mean": _metric_to_float(selected_start_sim.mean()),
+                "slp_bank_delta_mean": _metric_to_float(deltas),
+                "slp_bank_delta_max": _metric_to_float(deltas.max()) if deltas.numel() else 0.0,
             }
             return reward
 
