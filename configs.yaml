@@ -8,6 +8,9 @@ defaults:
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
+
+  video_pred_log: True    # 设为 True 会在 Tensorboard 记录模型的想象视频，设为 False 则关闭
+  
   deterministic_run: False
   device: 'cuda:0'
   compile: True
