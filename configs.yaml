@@ -1,18 +1,7 @@
 defaults:
-
-  use_wandb: False
-  wandb_key: None
-  resume_path: null  # <--- 添加这一行
-
-  # === 新增以下两行 ===
-  enable_cloud_backup: False   # 是否开启云盘备份 (默认为 False，本地跑的时候就不报错了)
-  cloud_backup_interval: 7200  # 备份间隔时间，单位为秒 (7200秒 = 2小时)
-
-  # configs.yaml -> minedojo 部分
-  # ... 原有参数 ...
-  inverse_loss_scale: 1.0      # 创新 1：逆动力学约束
-  affordance_s_scale: 2.0      # 创新 2：可供性地图对齐约束 (建议设为 2.0 增强引导)
-
+  # ==========================================
+  # 1. 系统与日志配置 (System & Logging)
+  # ==========================================
   logdir: null
   traindir: null
   evaldir: null
@@ -20,63 +9,89 @@ defaults:
   offline_evaldir: ''
   seed: 0
   deterministic_run: False
-  steps: 1e6
-  parallel: False
-  eval_every: 20000
-  eval_episode_num: 3
-  log_every: 20000
-  reset_every: 0
   device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
-  video_pred_log: True
+  
+  # Wandb & 备份
+  use_wandb: False
+  wandb_key: None
+  resume_path: null
+  enable_cloud_backup: False
+  cloud_backup_interval: 7200
 
-  # Environment
+  # ==========================================
+  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
+  # ==========================================
+  # 【网络解耦约束】
+  inverse_loss_scale: 1.0      # 创新1：S分支逆动力学约束权重
+  affordance_s_scale: 2.0      # 创新2：S分支可供性地图(Heatmap)对齐约束权重
+  long_term_branch_weight: 1.0 # 长周期跳跃分支的 Loss 权重
+
+  # 【内在奖励消融】(当前设定：剥离高斯浓度奖励，仅保留纯 MineCLIP 奖励作为 Baseline)
+  gaussian_reward_weight: 0.0  # <--- 设为 0.0 阻断 Actor 吃到高斯浓度奖励
+  gaussian_sigma_weight: 0.5   
+
+  # ==========================================
+  # 3. 强化学习与训练超参 (RL & Training Params)
+  # ==========================================
+  steps: 1e6                   # 总环境交互步数
+  parallel: False
+  eval_every: 10000            # 每隔多少步评估一次
+  eval_episode_num: 3
+  log_every: 20000
+  reset_every: 0
+  train_ratio: 16              # Minecraft 重型网络通常用 16
+  pretrain: 100                # 初始预训练步数
+  prefill: 2500                # 初始随机收集数据步数
+  dataset_size: 1000000
+  batch_size: 16
+  batch_length: 32
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  opt: 'adam'
+  reward_EMA: True             # 开启对 MineCLIP 稠密奖励的滑动平均归一化
+
+  # ==========================================
+  # 4. 环境设置 (Environment)
+  # ==========================================
   task: 'minedojo'
   size: [64, 64]
   envs: 1
   action_repeat: 1
-  time_limit: 1000
+  time_limit: 36000
   grayscale: False
-  prefill: 2500
-  reward_EMA: True
+  break_speed: 100.0
 
-  # Model
-  dyn_hidden: 512
-  dyn_deter: 512
+  # ==========================================
+  # 5. 行为策略与长短期想象 (Behavior & Imagination)
+  # ==========================================
+  discount: 0.997
+  discount_lambda: 0.95
+  jump_prob: 0.7               # 跳跃预测的基准概率
+  jump_prob_decay: 0.9997
+  imag_horizon: 15             # 隐空间想象步数
+  max_imag_sequences_num: 1024
+  imag_gradient: 'reinforce'   # 策略优化方式 (MineDojo 通常用 reinforce 避免计算图过长)
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  # ==========================================
+  # 6. 世界模型架构 (World Model Architecture)
+  # ==========================================
+  dyn_hidden: 1024
+  dyn_deter: 4096
   dyn_stoch: 32
   dyn_discrete: 32
   dyn_rec_depth: 1
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  units: 512
+  units: 1024
   act: 'SiLU'
   norm: True
-  encoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
-  decoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  actor:
-    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic:
-    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  end_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  jump_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  concentration_score_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  intrinsic_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  jumping_steps_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  accumulated_reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -85,31 +100,34 @@ defaults:
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
+  
+  # 注意：包含了 'heatmap' 键，确保环境吐出的可用性图能进入网络用于计算创新点2
+  encoder:
+    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
 
-  # Training
-  batch_size: 16
-  batch_length: 32
-  #从磁盘加载 .npz episode 文件
-  train_ratio: 512
-  pretrain: 100
-  model_lr: 1e-4
-  opt_eps: 1e-8
-  grad_clip: 1000
-  dataset_size: 1000000
-  opt: 'adam'
+  # ==========================================
+  # 7. 策略与价值网络 (Actor-Critic & Heads)
+  # ==========================================
+  actor:
+    {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic: # <--- 修正了之前 value 命名错误的问题，现统一使用 5 层网络
+    {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  
+  reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  end_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
+  jump_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
+  concentration_score_head: {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  intrinsic_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  jumping_steps_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  accumulated_reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
 
-  # Behavior.
-  discount: 0.997
-  discount_lambda: 0.95
-  jump_prob: 0.7
-  jump_prob_decay: 0.9997
-  imag_horizon: 15
-  max_imag_sequences_num: 1024
-  imag_gradient: 'dynamics'
-  imag_gradient_mix: 0.0
-  eval_state_mean: False
-
-  # Exploration
+  # ==========================================
+  # 8. 探索参数 (Exploration)
+  # ==========================================
   expl_behavior: 'greedy'
   expl_until: 0
   expl_extr_scale: 0.0
@@ -122,46 +140,20 @@ defaults:
   disag_units: 400
   disag_action_cond: False
 
+# ==============================================================================
+# 由于上面的 defaults 已经将 MineDojo 需要的参数完美整合，
+# 下面的 minedojo 层级仅保留必须被运行时 argparse 识别的宏观参数或冗余占位。
+# ==============================================================================
 minedojo:
-
-  long_term_branch_weight: 1.0
-  gaussian_reward_weight: 1.0
-  gaussian_sigma_weight: 0.5
-
-  # rollout
-  is_random: True
-  agent_checkpoint_dir: ""
-  rollout_image_num: 2000
-
-  unet_batch_size: 64
-  results_dir: "./results"
-  name: "test"
   target_item: "log"
-  steps: 1e6
-  parallel: False
-  envs: 1
-  eval_episode_num: 3
-  eval_every: 10000
-  action_repeat: 1
-  train_ratio: 16
-  video_pred_log: true
-  dyn_hidden: 1024
-  dyn_deter: 4096
-  units: 1024
-  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  actor: {layers: 5, dist: 'onehot', std: 'none'}
-  value: {layers: 5}
-  reward_head: {layers: 5}
-  intrinsic_head: {layers: 5}
-  jumping_steps_head: {layers: 5}
-  accumulated_reward_head: {layers: 5}
-  end_head: {layers: 5}
-  jump_head: {layers: 5}
-  imag_gradient: 'reinforce'
-  break_speed: 100.0
-  time_limit: 36000
+  name: "test"
+  results_dir: "./results"
+  agent_checkpoint_dir: ""
+  unet_batch_size: 64
+  rollout_image_num: 2000
+  is_random: True
 
+# 调试模式快速测试
 debug:
   debug: True
   pretrain: 1
