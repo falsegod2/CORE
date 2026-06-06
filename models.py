@@ -628,7 +628,7 @@ class ImagBehavior(nn.Module):
                             jump_state = {key: tensor[indices] for key, tensor in checking_state.items()}
                             # 执行受控跳转 (Innovation 1: 异步跳跃)
                             _, state_after_jumping, _ = self._jumpy(jump_state, self.actor, 1)
-                            _, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
+                            #_, state_after_jumping, _ = self._imagine(state_after_jumping, self.actor, 1)
                             
                             # 只有发生跳转的样本才覆盖状态
                             for key in state_after_imagination:
