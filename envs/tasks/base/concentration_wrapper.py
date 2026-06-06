@@ -97,7 +97,7 @@ class ConcentrationWrapper(Wrapper):
             obs['zoomed_image'] = zoomed_image
 
             if score > self.last_score:
-                obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
+                #obs['intrinsic'] += self.dense_reward * score * self.gaussian_reward_weight
                 self.last_score = score
 
             obs['score'] += self.dense_reward * score
