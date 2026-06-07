@@ -216,9 +216,7 @@ def simulate(
     cache, 
     directory, 
     logger, 
-    step_calculator,
     max_steps,
-    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -254,10 +252,6 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
-
-                current_step = 0
-                if t["is_zoomed"] == True:
-                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
                 obs[index] = result
@@ -306,20 +300,7 @@ def simulate(
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
 
-            length = len(cache[env.id]["reward"]) 
-            current_step = length - 1
-            if transition["is_zoomed"] == True and not d:
-                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
-
-            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
-            if len(tmp_list) > 0:
-                for ss in tmp_list:
-                    cache[env.id]["jumping_steps"][ss] = current_step - ss
-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
-                    cache[env.id]["is_calculated"][ss] = True
-
-            if step_calculator.count_data_pairs(env.id) == 0:
-                information[tmp_index]['real_done'] = True
+            information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -330,7 +311,6 @@ def simulate(
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
 
-                step_calculator.remove_all(envs[i].id)
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
