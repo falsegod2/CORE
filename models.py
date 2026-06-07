@@ -274,11 +274,6 @@ class WorldModel(nn.Module):
         obs["image"] = torch.Tensor(obs["image"]) / 255.0
         obs["heatmap"] = torch.Tensor(obs["heatmap"]).unsqueeze(-1) / 255.0
         
-        if "action" in obs:
-            original_action = obs["action"]
-            zeros_array = np.zeros((original_action.shape[0], original_action.shape[1], 1), dtype=original_action.dtype)
-            new_action = np.concatenate((original_action, zeros_array), axis=-1)
-            obs["action"] = new_action  
 
         if "discount" in obs:
             obs["discount"] *= self._config.discount
