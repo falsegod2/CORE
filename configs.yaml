@@ -9,7 +9,7 @@ defaults:
   offline_evaldir: ''
   seed: 0
 
-  video_pred_log: True    # 设为 True 会在 Tensorboard 记录模型的想象视频，设为 False 则关闭
+  video_pred_log: True
   
   deterministic_run: False
   device: 'cuda:0'
@@ -17,7 +17,6 @@ defaults:
   precision: 32
   debug: False
   
-  # Wandb & 备份
   use_wandb: False
   wandb_key: None
   resume_path: null
@@ -27,27 +26,25 @@ defaults:
   # ==========================================
   # 2. 核心创新点与消融实验控制 (CJJ Innovations)
   # ==========================================
-  # 【网络解耦约束】
   inverse_loss_scale: 1.0      # 创新1：S分支逆动力学约束权重
   affordance_s_scale: 2.0      # 创新2：S分支可供性地图(Heatmap)对齐约束权重
-  long_term_branch_weight: 1.0 # 长周期跳跃分支的 Loss 权重
+  # 【已移除 long_term_branch_weight】
 
-  # 【内在奖励消融】(当前设定：剥离高斯浓度奖励，仅保留纯 MineCLIP 奖励作为 Baseline)
-  gaussian_reward_weight: 0.0  # <--- 设为 0.0 阻断 Actor 吃到高斯浓度奖励
+  gaussian_reward_weight: 0.0  
   gaussian_sigma_weight: 0.5   
 
   # ==========================================
   # 3. 强化学习与训练超参 (RL & Training Params)
   # ==========================================
-  steps: 1e6                   # 总环境交互步数
+  steps: 1e6                   
   parallel: False
-  eval_every: 10000            # 每隔多少步评估一次
+  eval_every: 10000            
   eval_episode_num: 3
   log_every: 20000
   reset_every: 0
-  train_ratio: 16              # Minecraft 重型网络通常用 16
-  pretrain: 100                # 初始预训练步数
-  prefill: 2500                # 初始随机收集数据步数
+  train_ratio: 16              
+  pretrain: 100                
+  prefill: 2500                
   dataset_size: 1000000
   batch_size: 16
   batch_length: 32
@@ -55,7 +52,7 @@ defaults:
   opt_eps: 1e-8
   grad_clip: 1000
   opt: 'adam'
-  reward_EMA: True             # 开启对 MineCLIP 稠密奖励的滑动平均归一化
+  reward_EMA: True             
 
   # ==========================================
   # 4. 环境设置 (Environment)
@@ -73,11 +70,10 @@ defaults:
   # ==========================================
   discount: 0.997
   discount_lambda: 0.95
-  jump_prob: 0.7               # 跳跃预测的基准概率
-  jump_prob_decay: 0.9997
-  imag_horizon: 15             # 隐空间想象步数
+  # 【已移除 jump_prob 和 jump_prob_decay】
+  imag_horizon: 15             
   max_imag_sequences_num: 1024
-  imag_gradient: 'reinforce'   # 策略优化方式 (MineDojo 通常用 reinforce 避免计算图过长)
+  imag_gradient: 'reinforce'   
   imag_gradient_mix: 0.0
   eval_state_mean: False
 
@@ -104,29 +100,26 @@ defaults:
   unimix_ratio: 0.01
   initial: 'learned'
   
-  # 注意：包含了 'heatmap' 键，确保环境吐出的可用性图能进入网络用于计算创新点2
   encoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
 
   # ==========================================
   # 7. 策略与价值网络 (Actor-Critic & Heads)
   # ==========================================
   actor:
     {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic: # <--- 修正了之前 value 命名错误的问题，现统一使用 5 层网络
+  critic: 
     {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
   
   reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   end_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
-  jump_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
-  concentration_score_head: {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   intrinsic_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  jumping_steps_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  accumulated_reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  # 【已移除 jump_head, jumping_steps_head, accumulated_reward_head, concentration_score_head】
 
   # ==========================================
   # 8. 探索参数 (Exploration)
@@ -143,10 +136,6 @@ defaults:
   disag_units: 400
   disag_action_cond: False
 
-# ==============================================================================
-# 由于上面的 defaults 已经将 MineDojo 需要的参数完美整合，
-# 下面的 minedojo 层级仅保留必须被运行时 argparse 识别的宏观参数或冗余占位。
-# ==============================================================================
 minedojo:
   target_item: "log"
   name: "test"
@@ -156,7 +145,6 @@ minedojo:
   rollout_image_num: 2000
   is_random: True
 
-# 调试模式快速测试
 debug:
   debug: True
   pretrain: 1
