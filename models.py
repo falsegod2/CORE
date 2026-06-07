@@ -415,13 +415,12 @@ class ImagBehavior(nn.Module):
 
     def _imagine(self, start, policy, horizon):
         dynamics = self._world_model.dynamics
+
         def step(prev, _):
             state, _, _ = prev
             feat = dynamics.get_feat(state)
             action = policy(feat.detach()).sample()
-            # 扩展动作为 13 维 (包含 0 填充，适配底层网络要求)
-            new_action = torch.cat((action, torch.zeros(action.shape[0], 1).to(action.device)), dim=-1)
-            succ = dynamics.img_step(state, new_action)
+            succ = dynamics.img_step(state, action)
             return succ, feat, action
 
         succ, feats, actions = tools.static_scan(step, [torch.arange(horizon)], (start, None, None))
