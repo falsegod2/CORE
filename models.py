@@ -196,7 +196,7 @@ class WorldModel(nn.Module):
                 feat_inv = torch.cat([h_s_t, h_s_next], dim=-1)
                 pred_action = self.dynamics._inverse_dynamics(feat_inv)
                 
-                true_action = data["action"][:, :-1, :-1] 
+                true_action = data["action"][:, :-1]
                 loss_inv = F.mse_loss(pred_action, true_action)
 
                 # --- [创新点 2：可供性先验指导的解耦增强] ---
