@@ -429,6 +429,11 @@ class ImagBehavior(nn.Module):
 
                 m_policy = self.manager_actor(imag_feat.detach())
                 m_log_prob = m_policy.log_prob(imag_manager_action)[:-1][:, :, None]
+
+                imag_manager_mask = imag_manager_mask.to(device=m_weights.device, dtype=m_weights.dtype)
+                if imag_manager_mask.dim() == 2:
+                    imag_manager_mask = imag_manager_mask[:, :, None]
+
                 m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach() * imag_manager_mask[:-1]
                 
                 m_ent = m_policy.entropy()
