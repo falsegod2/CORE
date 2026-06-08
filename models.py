@@ -396,7 +396,7 @@ class ImagBehavior(nn.Module):
         start = {k: flatten(v) for k, v in start.items()} 
 
         # 2. 双层想象 (不再需要传 actor 进去)
-        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action = self._imagine(
+        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action, imag_manager_mask = self._imagine(
             start, self._config.imag_horizon
         )
 
@@ -429,7 +429,7 @@ class ImagBehavior(nn.Module):
 
                 m_policy = self.manager_actor(imag_feat.detach())
                 m_log_prob = m_policy.log_prob(imag_manager_action)[:-1][:, :, None]
-                m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach()
+                m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach() * imag_manager_mask[:-1]
                 
                 m_ent = m_policy.entropy()
                 m_actor_loss -= self._config.actor["entropy"] * m_ent[:-1, ..., None]
@@ -477,7 +477,7 @@ class ImagBehavior(nn.Module):
                 w_val = self.value(w_inp[:-1].detach())
                 w_val_loss = -w_val.log_prob(w_target_st.detach())
                 if self._config.critic["slow_target"]:
-                    w_slow_val = self._slow_value(w_inp[:-1].detach())
+                    w_slow_val = self._worker_slow_value(w_inp[:-1].detach())
                     w_val_loss -= w_val.log_prob(w_slow_val.mode().detach())
                 w_val_loss = torch.mean(w_weights[:-1] * w_val_loss[:, :, None])
 
@@ -513,7 +513,7 @@ class ImagBehavior(nn.Module):
 
         def step(prev, t):
             # prev 包含5个元素，记录了上一步的状态
-            state, prev_goal, _, _, _ = prev
+            state, prev_goal, _, _, _, _ = prev
             feat = dynamics.get_feat(state)
 
             # 初始化第一步的 goal
@@ -522,6 +522,7 @@ class ImagBehavior(nn.Module):
 
             # 判断当前步是否需要 Manager 更新目标 (返回 0.0 或 1.0 的标量张量)
             update_mask = (t % self._config.manager_freq == 0).float()
+            manager_mask = update_mask.reshape(1, 1)
 
             # --- Manager 行动 ---
             manager_dist = self.manager_actor(feat.detach())
@@ -540,19 +541,19 @@ class ImagBehavior(nn.Module):
 
             succ = dynamics.img_step(state, action)
             # 返回: 转移后状态, 当前地标, 当前特征, Worker动作, Manager动作
-            return succ, goal_feat, feat, action, manager_action
+            return succ, goal_feat, feat, action, manager_action, manager_mask.expand(feat.shape[0], 1)
 
         # 调用您原生的 static_scan
-        succ, goals, feats, actions, manager_actions = tools.static_scan(
-            step, [torch.arange(horizon)], (start, None, None, None, None)
+        succ, goals, feats, actions, manager_actions, manager_masks = tools.static_scan(
+            step, [torch.arange(horizon)], (start, None, None, None, None, None)
         )
         
         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
         
         if horizon == 1:
-            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0)
+            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0), manager_masks.squeeze(0)
             
-        return feats, states, actions, goals, manager_actions
+        return feats, states, actions, goals, manager_actions, manager_masks
 
     def _compute_target(self, value_input, imag_state, reward, is_end, value_net):
         end = is_end(imag_state) 
@@ -617,7 +618,7 @@ class ImagBehavior(nn.Module):
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
                 # 1. 更新 Worker 的 Slow Target
-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                for s, d in zip(self.value.parameters(), self._worker_slow_value.parameters()):
                     d.data = mix * s.data + (1 - mix) * d.data
                 # 2. 更新 Manager 的 Slow Target
                 for s, d in zip(self.manager_value.parameters(), self._manager_slow_value.parameters()):

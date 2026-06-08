@@ -1,0 +1,159 @@
+diff --git a/expr.py b/expr.py
+index d4a0042..431cfe0 100644
+--- a/expr.py
++++ b/expr.py
+@@ -80,34 +80,63 @@ class LS_Imagine(nn.Module):
+         return policy_output, state
+ 
+     def _policy(self, obs, state, training):
++        # Online Manager-Worker policy.
++        # state = (rssm_latent, previous_env_action, current_goal_feat, step_count)
++        batch_size = len(obs["is_first"]) if "is_first" in obs else obs["image"].shape[0]
++
+         if state is None:
+-            latent = action = None
++            latent = self._wm.dynamics.initial(batch_size)
++            action = torch.zeros((batch_size, self._config.num_actions), device=self._config.device)
++            feat_size = self._wm.dynamics.get_feat(latent).shape[-1]
++            goal = torch.zeros((batch_size, feat_size), device=self._config.device)
++            step_count = torch.zeros((batch_size,), dtype=torch.long, device=self._config.device)
+         else:
+-            latent, action = state
++            latent, action, goal, step_count = state
++
+         obs = self._wm.preprocess(obs)
+         embed = self._wm.encoder(obs)
+         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+         if self._config.eval_state_mean:
+             latent["stoch"] = latent["mean"]
++
+         feat = self._wm.dynamics.get_feat(latent)
++
++        # Reset high-level state at episode boundaries.
++        is_first = obs["is_first"].float()
++        reset_mask = is_first[:, None]
++        goal = goal * (1.0 - reset_mask)
++        step_count = step_count * (1 - is_first.long())
++
++        # Manager updates the latent goal every K environment steps, and always at reset.
++        update_mask = ((step_count % self._config.manager_freq) == 0).float()[:, None]
++        update_mask = torch.maximum(update_mask, reset_mask)
++        manager_dist = self._task_behavior.manager_actor(feat.detach())
++        manager_action = manager_dist.mode() if not training else manager_dist.sample()
++        new_goal = feat.detach() + manager_action
++        goal = update_mask * new_goal + (1.0 - update_mask) * goal
++
++        worker_inp = torch.cat([feat, goal], dim=-1)
++
++        # Use the Manager-Worker actor for task behavior. Keep non-greedy exploration separate.
+         if not training:
+-            actor = self._task_behavior.actor(feat)
++            actor = self._task_behavior.actor(worker_inp)
+             action = actor.mode()
+-        elif self._should_expl(self._step):
++        elif self._should_expl(self._step) and self._config.expl_behavior != "greedy":
+             actor = self._expl_behavior.actor(feat)
+             action = actor.sample()
+         else:
+-            actor = self._task_behavior.actor(feat)
++            actor = self._task_behavior.actor(worker_inp)
+             action = actor.sample()
++
+         logprob = actor.log_prob(action)
+         latent = {k: v.detach() for k, v in latent.items()}
+         action = action.detach()
++        goal = goal.detach()
+         if self._config.actor["dist"] == "onehot_gumble":
+-            action = torch.one_hot(
+-                torch.argmax(action, dim=-1), self._config.num_actions
+-            )
++            action = torch.one_hot(torch.argmax(action, dim=-1), self._config.num_actions)
++
+         policy_output = {"action": action, "logprob": logprob}
+-        state = (latent, action)
++        state = (latent, action, goal, step_count + 1)
+         return policy_output, state
+ 
+     def _train(self, data):
+diff --git a/models.py b/models.py
+index 48712ef..621ddd5 100644
+--- a/models.py
++++ b/models.py
+@@ -396,7 +396,7 @@ class ImagBehavior(nn.Module):
+         start = {k: flatten(v) for k, v in start.items()} 
+ 
+         # 2. 双层想象 (不再需要传 actor 进去)
+-        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action = self._imagine(
++        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action, imag_manager_mask = self._imagine(
+             start, self._config.imag_horizon
+         )
+ 
+@@ -429,7 +429,7 @@ class ImagBehavior(nn.Module):
+ 
+                 m_policy = self.manager_actor(imag_feat.detach())
+                 m_log_prob = m_policy.log_prob(imag_manager_action)[:-1][:, :, None]
+-                m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach()
++                m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach() * imag_manager_mask[:-1]
+                 
+                 m_ent = m_policy.entropy()
+                 m_actor_loss -= self._config.actor["entropy"] * m_ent[:-1, ..., None]
+@@ -477,7 +477,7 @@ class ImagBehavior(nn.Module):
+                 w_val = self.value(w_inp[:-1].detach())
+                 w_val_loss = -w_val.log_prob(w_target_st.detach())
+                 if self._config.critic["slow_target"]:
+-                    w_slow_val = self._slow_value(w_inp[:-1].detach())
++                    w_slow_val = self._worker_slow_value(w_inp[:-1].detach())
+                     w_val_loss -= w_val.log_prob(w_slow_val.mode().detach())
+                 w_val_loss = torch.mean(w_weights[:-1] * w_val_loss[:, :, None])
+ 
+@@ -513,7 +513,7 @@ class ImagBehavior(nn.Module):
+ 
+         def step(prev, t):
+             # prev 包含5个元素，记录了上一步的状态
+-            state, prev_goal, _, _, _ = prev
++            state, prev_goal, _, _, _, _ = prev
+             feat = dynamics.get_feat(state)
+ 
+             # 初始化第一步的 goal
+@@ -522,6 +522,7 @@ class ImagBehavior(nn.Module):
+ 
+             # 判断当前步是否需要 Manager 更新目标 (返回 0.0 或 1.0 的标量张量)
+             update_mask = (t % self._config.manager_freq == 0).float()
++            manager_mask = update_mask.reshape(1, 1)
+ 
+             # --- Manager 行动 ---
+             manager_dist = self.manager_actor(feat.detach())
+@@ -540,19 +541,19 @@ class ImagBehavior(nn.Module):
+ 
+             succ = dynamics.img_step(state, action)
+             # 返回: 转移后状态, 当前地标, 当前特征, Worker动作, Manager动作
+-            return succ, goal_feat, feat, action, manager_action
++            return succ, goal_feat, feat, action, manager_action, manager_mask.expand(feat.shape[0], 1)
+ 
+         # 调用您原生的 static_scan
+-        succ, goals, feats, actions, manager_actions = tools.static_scan(
+-            step, [torch.arange(horizon)], (start, None, None, None, None)
++        succ, goals, feats, actions, manager_actions, manager_masks = tools.static_scan(
++            step, [torch.arange(horizon)], (start, None, None, None, None, None)
+         )
+         
+         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+         
+         if horizon == 1:
+-            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0)
++            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0), manager_masks.squeeze(0)
+             
+-        return feats, states, actions, goals, manager_actions
++        return feats, states, actions, goals, manager_actions, manager_masks
+ 
+     def _compute_target(self, value_input, imag_state, reward, is_end, value_net):
+         end = is_end(imag_state) 
+@@ -617,7 +618,7 @@ class ImagBehavior(nn.Module):
+             if self._updates % self._config.critic["slow_target_update"] == 0:
+                 mix = self._config.critic["slow_target_fraction"]
+                 # 1. 更新 Worker 的 Slow Target
+-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
++                for s, d in zip(self.value.parameters(), self._worker_slow_value.parameters()):
+                     d.data = mix * s.data + (1 - mix) * d.data
+                 # 2. 更新 Manager 的 Slow Target
+                 for s, d in zip(self.manager_value.parameters(), self._manager_slow_value.parameters()):

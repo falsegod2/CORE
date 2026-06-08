@@ -80,34 +80,63 @@ class LS_Imagine(nn.Module):
         return policy_output, state
 
     def _policy(self, obs, state, training):
+        # Online Manager-Worker policy.
+        # state = (rssm_latent, previous_env_action, current_goal_feat, step_count)
+        batch_size = len(obs["is_first"]) if "is_first" in obs else obs["image"].shape[0]
+
         if state is None:
-            latent = action = None
+            latent = self._wm.dynamics.initial(batch_size)
+            action = torch.zeros((batch_size, self._config.num_actions), device=self._config.device)
+            feat_size = self._wm.dynamics.get_feat(latent).shape[-1]
+            goal = torch.zeros((batch_size, feat_size), device=self._config.device)
+            step_count = torch.zeros((batch_size,), dtype=torch.long, device=self._config.device)
         else:
-            latent, action = state
+            latent, action, goal, step_count = state
+
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
+
         feat = self._wm.dynamics.get_feat(latent)
+
+        # Reset high-level state at episode boundaries.
+        is_first = obs["is_first"].float()
+        reset_mask = is_first[:, None]
+        goal = goal * (1.0 - reset_mask)
+        step_count = step_count * (1 - is_first.long())
+
+        # Manager updates the latent goal every K environment steps, and always at reset.
+        update_mask = ((step_count % self._config.manager_freq) == 0).float()[:, None]
+        update_mask = torch.maximum(update_mask, reset_mask)
+        manager_dist = self._task_behavior.manager_actor(feat.detach())
+        manager_action = manager_dist.mode() if not training else manager_dist.sample()
+        new_goal = feat.detach() + manager_action
+        goal = update_mask * new_goal + (1.0 - update_mask) * goal
+
+        worker_inp = torch.cat([feat, goal], dim=-1)
+
+        # Use the Manager-Worker actor for task behavior. Keep non-greedy exploration separate.
         if not training:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(worker_inp)
             action = actor.mode()
-        elif self._should_expl(self._step):
+        elif self._should_expl(self._step) and self._config.expl_behavior != "greedy":
             actor = self._expl_behavior.actor(feat)
             action = actor.sample()
         else:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actor(worker_inp)
             action = actor.sample()
+
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
+        goal = goal.detach()
         if self._config.actor["dist"] == "onehot_gumble":
-            action = torch.one_hot(
-                torch.argmax(action, dim=-1), self._config.num_actions
-            )
+            action = torch.one_hot(torch.argmax(action, dim=-1), self._config.num_actions)
+
         policy_output = {"action": action, "logprob": logprob}
-        state = (latent, action)
+        state = (latent, action, goal, step_count + 1)
         return policy_output, state
 
     def _train(self, data):
