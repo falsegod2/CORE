@@ -111,6 +111,12 @@ defaults:
   # ==========================================
   # 7. 策略与价值网络 (Actor-Critic & Heads)
   # ==========================================
+  # 【新增】Manager 的配置：输出连续的相对隐状态偏移量 \Delta S
+  manager_freq: 10   # K=10，每 10 步 Manager 下达一次新地标
+  manager:
+    {layers: 4, dist: 'trunc_normal', std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  
+  # 【修改】Worker (Actor) 需要扩大输入维度，但配置参数本身不用大改
   actor:
     {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic: 

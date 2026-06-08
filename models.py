@@ -324,118 +324,244 @@ class ImagBehavior(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
             
-        self.actor = networks.MLP(
-            feat_size, (config.num_actions,), config.actor["layers"], config.units,
-            config.act, config.norm, config.actor["dist"], config.actor["std"],
-            config.actor["min_std"], config.actor["max_std"], absmax=1.0,
-            temp=config.actor["temp"], unimix_ratio=config.actor["unimix_ratio"],
-            outscale=config.actor["outscale"], name="Actor",
+        # ==========================================
+        # 2. Manager 网络 (高层，负责设定地标)
+        # ==========================================
+        # Manager Actor: 观察当前 feat_size，输出 \Delta S (维度也是 feat_size)
+        self.manager_actor = networks.MLP(
+            feat_size, (feat_size,), config.manager["layers"], config.units,
+            config.act, config.norm, config.manager["dist"], config.manager["std"],
+            config.manager["min_std"], config.manager["max_std"], absmax=1.0,
+            temp=config.manager["temp"], unimix_ratio=config.manager["unimix_ratio"],
+            outscale=config.manager["outscale"], name="ManagerActor",
         )
-        self.value = networks.MLP(
+        
+        # Manager Value: 评估真实环境的稀疏奖励与 MineCLIP 奖励
+        self.manager_value = networks.MLP(
             feat_size, (255,) if config.critic["dist"] == "symlog_disc" else (),
             config.critic["layers"], config.units, config.act, config.norm,
             config.critic["dist"], outscale=config.critic["outscale"],
-            device=config.device, name="Value",
+            device=config.device, name="ManagerValue",
+        )
+
+
+        # ==========================================
+        # 3. Worker 网络 (底层，也就是原本的 Actor，负责执行)
+        # ==========================================
+        # Worker Actor: 【注意这里】输入变成了 feat_size * 2 (当前状态拼接 Manager给的S_goal)
+        self.actor = networks.MLP(
+            feat_size * 2, (config.num_actions,), config.actor["layers"], config.units,
+            config.act, config.norm, config.actor["dist"], config.actor["std"],
+            config.actor["min_std"], config.actor["max_std"], absmax=1.0,
+            temp=config.actor["temp"], unimix_ratio=config.actor["unimix_ratio"],
+            outscale=config.actor["outscale"], name="WorkerActor",
         )
         
+        # Worker Value: 评估与 S_goal 之间的余弦相似度奖励
+        self.value = networks.MLP(
+            feat_size * 2, (255,) if config.critic["dist"] == "symlog_disc" else (),
+            config.critic["layers"], config.units, config.act, config.norm,
+            config.critic["dist"], outscale=config.critic["outscale"],
+            device=config.device, name="WorkerValue",
+        )
+        
+        # ==========================================
+        # 4. Slow Target 机制及优化器 (需要分发给 Manager 和 Worker)
+        # ==========================================
         if config.critic["slow_target"]:
-            self._slow_value = copy.deepcopy(self.value)
+            self._manager_slow_value = copy.deepcopy(self.manager_value)
+            self._worker_slow_value = copy.deepcopy(self.value)
             self._updates = 0
             
         kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
-        self._actor_opt = tools.Optimizer("actor", self.actor.parameters(), config.actor["lr"], config.actor["eps"], config.actor["grad_clip"], **kw)
-        self._value_opt = tools.Optimizer("value", self.value.parameters(), config.critic["lr"], config.critic["eps"], config.critic["grad_clip"], **kw)
+
+
+        # 分离优化器，防止梯度互串
+        self._manager_actor_opt = tools.Optimizer("manager_actor", self.manager_actor.parameters(), config.manager["lr"], config.manager["eps"], config.manager["grad_clip"], **kw)
+        self._manager_value_opt = tools.Optimizer("manager_value", self.manager_value.parameters(), config.critic["lr"], config.critic["eps"], config.critic["grad_clip"], **kw)
+        
+        self._actor_opt = tools.Optimizer("worker_actor", self.actor.parameters(), config.actor["lr"], config.actor["eps"], config.actor["grad_clip"], **kw)
+        self._value_opt = tools.Optimizer("worker_value", self.value.parameters(), config.critic["lr"], config.critic["eps"], config.critic["grad_clip"], **kw)
         
         if self._config.reward_EMA:
             self.register_buffer("ema_vals", torch.zeros((2,)).to(self._config.device))
             self.reward_ema = RewardEMA(device=self._config.device)
 
-    def _train(
-            self,
-            start,
-            objective,
-            intrinsic_objective,
-            is_end,
-        ):
+    def _train(self, start, objective, intrinsic_objective, is_end):
         self._update_slow_target()
         metrics = {}
 
-        with tools.RequiresGrad(self.actor):
+        # 1. 展开初始状态
+        flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+        start = {k: flatten(v) for k, v in start.items()} 
+
+        # 2. 双层想象 (不再需要传 actor 进去)
+        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action = self._imagine(
+            start, self._config.imag_horizon
+        )
+
+        # ==========================================
+        # 3. Manager (高层) 优化
+        # ==========================================
+        with tools.RequiresGrad(self.manager_actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # 展平初始状态
-                flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-                start = {k: flatten(v) for k, v in start.items()} 
-
-                # 标准 15 步连续想象 (替换掉原先极其复杂的跳跃 for 循环)
-                imag_feat, imag_state, imag_action = self._imagine(
-                    start, self.actor, self._config.imag_horizon
-                )
-
-                # 奖励计算与策略更新
+                # Manager 关注环境真实奖励 + MineCLIP 语义奖励
                 reward = objective(imag_feat, imag_state, imag_action)
                 intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
                 intrinsic_scale = getattr(self._config, "intrinsic_reward_scale", 1.0)
-                reward = reward + intrinsic_scale * intrinsic_reward
+                m_reward = reward + intrinsic_scale * intrinsic_reward
 
-                actor_ent = self.actor(imag_feat).entropy() 
-
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward, is_end
+                m_target, m_weights, m_base = self._compute_target(
+                    imag_feat, imag_state, m_reward, is_end, self.manager_value
                 )
 
-                actor_loss, mets = self._compute_actor_loss(
-                    imag_feat, imag_action, target, weights, base
+                # 计算 Manager Advantage 并严格应用 EMA (极其重要)
+                m_target_st = torch.stack(m_target, dim=1)
+                if self._config.reward_EMA:
+                    offset, scale = self.reward_ema(m_target_st, self.ema_vals)
+                    m_normed_target = (m_target_st - offset) / scale
+                    m_normed_base = (m_base - offset) / scale
+                    m_adv = m_normed_target - m_normed_base
+                    metrics["Manager_EMA_005"] = to_np(self.ema_vals[0])
+                    metrics["Manager_EMA_095"] = to_np(self.ema_vals[1])
+                else:
+                    m_adv = m_target_st - m_base
+
+                m_policy = self.manager_actor(imag_feat.detach())
+                m_log_prob = m_policy.log_prob(imag_manager_action)[:-1][:, :, None]
+                m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach()
+                
+                m_ent = m_policy.entropy()
+                m_actor_loss -= self._config.actor["entropy"] * m_ent[:-1, ..., None]
+                m_actor_loss = torch.mean(m_actor_loss)
+
+        # ==========================================
+        # 4. Worker (底层) 优化
+        # ==========================================
+        with tools.RequiresGrad(self.actor):
+            with torch.cuda.amp.autocast(self._use_amp):
+                # Worker 仅关注是否到达 Manager 指定的地标 (余弦相似度)
+                w_reward = self._compute_worker_reward(imag_feat, imag_goal)
+                
+                w_inp = torch.cat([imag_feat, imag_goal], dim=-1)
+                w_target, w_weights, w_base = self._compute_target(
+                    w_inp, imag_state, w_reward, is_end, self.value
                 )
 
-                actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
-                actor_loss = torch.mean(actor_loss)
-                metrics.update(mets)
-                value_input = imag_feat
+                # Worker 奖励已经被严格缩放到 [0,1]，无需 EMA 干扰
+                w_target_st = torch.stack(w_target, dim=1)
+                w_adv = w_target_st - w_base
 
-        # Value 网络更新
+                w_policy = self.actor(w_inp.detach())
+                w_log_prob = w_policy.log_prob(imag_action)[:-1][:, :, None]
+                w_actor_loss = -w_weights[:-1] * w_log_prob * w_adv.detach()
+
+                w_ent = w_policy.entropy()
+                w_actor_loss -= self._config.actor["entropy"] * w_ent[:-1, ..., None]
+                w_actor_loss = torch.mean(w_actor_loss)
+
+        # ==========================================
+        # 5. Value Networks (Critic) 优化
+        # ==========================================
+        with tools.RequiresGrad(self.manager_value):
+            with torch.cuda.amp.autocast(self._use_amp):
+                m_val = self.manager_value(imag_feat[:-1].detach())
+                m_val_loss = -m_val.log_prob(m_target_st.detach())
+                if self._config.critic["slow_target"]:
+                    m_slow_val = self._manager_slow_value(imag_feat[:-1].detach())
+                    m_val_loss -= m_val.log_prob(m_slow_val.mode().detach())
+                m_val_loss = torch.mean(m_weights[:-1] * m_val_loss[:, :, None])
+
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
-                value = self.value(value_input[:-1].detach())
-                target = torch.stack(target, dim=1)
-                value_loss = -value.log_prob(target.detach())
+                w_val = self.value(w_inp[:-1].detach())
+                w_val_loss = -w_val.log_prob(w_target_st.detach())
                 if self._config.critic["slow_target"]:
-                    slow_target = self._slow_value(value_input[:-1].detach())
-                    value_loss -= value.log_prob(slow_target.mode().detach())
-                value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
+                    w_slow_val = self._slow_value(w_inp[:-1].detach())
+                    w_val_loss -= w_val.log_prob(w_slow_val.mode().detach())
+                w_val_loss = torch.mean(w_weights[:-1] * w_val_loss[:, :, None])
 
-        metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
-        metrics.update(tools.tensorstats(reward, "imag_reward"))
-        
+        # ==========================================
+        # 6. 梯度截断与统一更新
+        # ==========================================
         with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            metrics.update(self._value_opt(value_loss, self.value.parameters()))
-            
-        return imag_feat, imag_state, imag_action, weights, metrics
+            metrics.update(self._manager_actor_opt(m_actor_loss, self.manager_actor.parameters()))
+            metrics.update(self._manager_value_opt(m_val_loss, self.manager_value.parameters()))
+            metrics.update(self._actor_opt(w_actor_loss, self.actor.parameters()))
+            metrics.update(self._value_opt(w_val_loss, self.value.parameters()))
 
-    def _imagine(self, start, policy, horizon):
+        # 记录关键指标以便于您在 TensorBoard 观察
+        metrics.update(tools.tensorstats(m_val.mode(), "manager_value"))
+        metrics.update(tools.tensorstats(w_val.mode(), "worker_value"))
+        metrics.update(tools.tensorstats(m_reward, "manager_reward"))
+        metrics.update(tools.tensorstats(w_reward, "worker_reward"))
+        metrics.update(tools.tensorstats(m_ent, "manager_entropy"))
+        metrics.update(tools.tensorstats(w_ent, "worker_entropy"))
+
+        return imag_feat, imag_state, imag_action, w_weights, metrics
+
+    def _compute_worker_reward(self, current_feat, goal_feat):
+        import torch.nn.functional as F
+        # 计算当前特征和目标特征的余弦相似度
+        cos_sim = F.cosine_similarity(current_feat, goal_feat, dim=-1)
+        # 将其拉伸到 [0, 1] 区间
+        worker_reward = (cos_sim + 1.0) / 2.0 
+        return worker_reward.unsqueeze(-1)
+
+    def _imagine(self, start, horizon):
         dynamics = self._world_model.dynamics
 
-        def step(prev, _):
-            state, _, _ = prev
+        def step(prev, t):
+            # prev 包含5个元素，记录了上一步的状态
+            state, prev_goal, _, _, _ = prev
             feat = dynamics.get_feat(state)
-            action = policy(feat.detach()).sample()
+
+            # 初始化第一步的 goal
+            if prev_goal is None:
+                prev_goal = torch.zeros_like(feat)
+
+            # 判断当前步是否需要 Manager 更新目标 (返回 0.0 或 1.0 的标量张量)
+            update_mask = (t % self._config.manager_freq == 0).float()
+
+            # --- Manager 行动 ---
+            manager_dist = self.manager_actor(feat.detach())
+            manager_action = manager_dist.sample()
+            
+            # 生成新的绝对地标 S_goal
+            new_goal = (feat.detach() + manager_action).detach()
+
+            # 利用 mask 选择是更新目标还是保持上一步的目标 (PyTorch 自动广播机制)
+            goal_feat = update_mask * new_goal + (1.0 - update_mask) * prev_goal
+
+            # --- Worker 行动 ---
+            # Worker 接收当前特征和目标地标
+            worker_inp = torch.cat([feat, goal_feat], dim=-1)
+            action = self.actor(worker_inp.detach()).sample()
+
             succ = dynamics.img_step(state, action)
-            return succ, feat, action
+            # 返回: 转移后状态, 当前地标, 当前特征, Worker动作, Manager动作
+            return succ, goal_feat, feat, action, manager_action
 
-        succ, feats, actions = tools.static_scan(step, [torch.arange(horizon)], (start, None, None))
+        # 调用您原生的 static_scan
+        succ, goals, feats, actions, manager_actions = tools.static_scan(
+            step, [torch.arange(horizon)], (start, None, None, None, None)
+        )
+        
         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+        
         if horizon == 1:
-            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0)
-        return feats, states, actions
+            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0)
+            
+        return feats, states, actions, goals, manager_actions
 
-    def _compute_target(self, imag_feat, imag_state, reward, is_end):
+    def _compute_target(self, value_input, imag_state, reward, is_end, value_net):
         end = is_end(imag_state) 
         gamma = self._config.discount * torch.ones_like(reward)
-        value = self.value(imag_feat).mode()
+        # 显式使用传入的 value_net
+        value = value_net(value_input).mode()
         discount = gamma * (1.0 - end)
         
-        # 恢复使用最标准的 lambda_return
+        # 原汁原味的 lambda_return
         target = tools.lambda_return(
             reward[1:],
             value[:-1],
@@ -490,6 +616,10 @@ class ImagBehavior(nn.Module):
         if self._config.critic["slow_target"]:
             if self._updates % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
+                # 1. 更新 Worker 的 Slow Target
                 for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                    d.data = mix * s.data + (1 - mix) * d.data
+                # 2. 更新 Manager 的 Slow Target
+                for s, d in zip(self.manager_value.parameters(), self._manager_slow_value.parameters()):
                     d.data = mix * s.data + (1 - mix) * d.data
             self._updates += 1
