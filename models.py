@@ -320,11 +320,11 @@ class ImagBehavior(nn.Module):
         self._world_model = world_model
         
         if config.dyn_discrete:
-            stoch_size = config.dyn_stoch * config.dyn_discrete
-            feat_size = stoch_size + config.dyn_deter
+            stoch_size = (config.dyn_stoch // 2) * config.dyn_discrete
+            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            stoch_size = config.dyn_stoch
-            feat_size = stoch_size + config.dyn_deter
+            stoch_size = config.dyn_stoch // 2
+            feat_size = config.dyn_stoch + config.dyn_deter
             
         # 2. Manager 现在只输出 stoch_size 的 \Delta S
         self.manager_actor = networks.MLP(
@@ -441,8 +441,8 @@ class ImagBehavior(nn.Module):
         # ==========================================
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # 提取想象轨迹中的 stoch 特征来算奖励，而不是完整的 feat
-                imag_stoch = imag_state["stoch"]
+                # 提取想象轨迹中的 受控分支 特征来算奖励
+                imag_stoch = imag_state["stoch_s"]
                 if len(imag_stoch.shape) > 3:
                     imag_stoch = imag_stoch.reshape(imag_stoch.shape[0], imag_stoch.shape[1], -1)
                 
@@ -522,8 +522,8 @@ class ImagBehavior(nn.Module):
             state, prev_goal, _, _, _, _ = prev
             feat = dynamics.get_feat(state)
             
-            # 提取当前的物理 stoch 内容
-            stoch_feat = state["stoch"]
+            # 【提取当前的物理 受控 stoch 内容】
+            stoch_feat = state["stoch_s"]
             if len(stoch_feat.shape) > 2:
                 stoch_feat = stoch_feat.reshape(stoch_feat.shape[0], -1)
 

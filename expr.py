@@ -80,18 +80,17 @@ class LS_Imagine(nn.Module):
         return policy_output, state
 
     def _policy(self, obs, state, training):
-        # 【修复1】抛弃 obs["reward"]，使用任何阶段绝对都存在的 obs["image"] 提取 Batch Size
         batch_size = obs["image"].shape[0]
 
         if state is None:
             latent = self._wm.dynamics.initial(batch_size)
             action = torch.zeros((batch_size, self._config.num_actions)).to(self._config.device)
             
-            # 获取 stoch_size
+            # 【终极修复1】目标地标的大小必须只有 stoch_s 的维度 (原 dyn_stoch 的一半)
             if self._config.dyn_discrete:
-                stoch_size = self._config.dyn_stoch * self._config.dyn_discrete
+                stoch_size = (self._config.dyn_stoch // 2) * self._config.dyn_discrete
             else:
-                stoch_size = self._config.dyn_stoch
+                stoch_size = self._config.dyn_stoch // 2
                 
             goal = torch.zeros((batch_size, stoch_size)).to(self._config.device)
             step_count = torch.zeros((batch_size,), dtype=torch.long).to(self._config.device)
@@ -103,13 +102,14 @@ class LS_Imagine(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         
-        if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+        if self._config.eval_state_mean and "s_mean" in latent:
+            latent["stoch_s"] = latent["s_mean"]
+            latent["stoch_z"] = latent["z_mean"]
             
         feat = self._wm.dynamics.get_feat(latent)
         
-        # 提取特征
-        stoch_feat = latent["stoch"]
+        # 【终极修复2】读取属于你的 stoch_s
+        stoch_feat = latent["stoch_s"]
         if len(stoch_feat.shape) > 2:
             stoch_feat = stoch_feat.reshape(stoch_feat.shape[0], -1)
             
@@ -121,7 +121,6 @@ class LS_Imagine(nn.Module):
         else:
             manager_action = manager_dist.sample()
             
-        # 约束管理器步长与方向
         import torch.nn.functional as F
         manager_direction = F.normalize(manager_action, p=2, dim=-1)
         scaled_action = manager_direction * 3.0
@@ -134,7 +133,7 @@ class LS_Imagine(nn.Module):
         if not training:
             actor = self._task_behavior.actor(worker_inp)
             action = actor.mode()
-        elif self._should_expl(self._step) and self._config.expl_behavior != "greedy":
+        elif hasattr(self, '_should_expl') and self._should_expl(self._step) and self._config.expl_behavior != "greedy":
             actor = self._expl_behavior.actor(feat)
             action = actor.sample()
         else:
@@ -143,7 +142,6 @@ class LS_Imagine(nn.Module):
 
         logprob = actor.log_prob(action)
         
-        # 脱离计算图，防止 GPU 显存泄漏
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
         goal = goal.detach()
