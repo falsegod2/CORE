@@ -391,7 +391,7 @@ class ImagBehavior(nn.Module):
         start = {k: flatten(v) for k, v in start.items()} 
 
         # 2. 双层想象 (不再需要传 actor 进去)
-        imag_feat, imag_state, imag_action, imag_goal, imag_manager_action, imag_manager_mask = self._imagine(
+        imag_feat, imag_state, imag_next_state, imag_action, imag_goal, imag_manager_action, imag_manager_mask = self._imagine(
             start, self._config.imag_horizon
         )
 
@@ -433,7 +433,7 @@ class ImagBehavior(nn.Module):
                 m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach() * imag_manager_mask[:-1]
                 
                 m_ent = m_policy.entropy()
-                m_actor_loss -= self._config.actor["entropy"] * m_ent[:-1, ..., None]
+                m_actor_loss -= self._config.actor["entropy"] * m_ent[:-1, ..., None] * imag_manager_mask[:-1]
                 m_actor_loss = torch.mean(m_actor_loss)
 
         # ==========================================
@@ -441,20 +441,19 @@ class ImagBehavior(nn.Module):
         # ==========================================
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # 提取想象轨迹中的 受控分支 特征来算奖励
-                imag_stoch = imag_state["stoch_s"]
-                if len(imag_stoch.shape) > 3:
-                    imag_stoch = imag_stoch.reshape(imag_stoch.shape[0], imag_stoch.shape[1], -1)
-                
-                # 【闭环修复 1】: 奖励不应该只看当前步，应该看 "走到下一步后，是不是更接近目标了"
-                # 由于 imag_stoch 是从 t=1 到 horizon 的预测状态
-                # 我们计算它与 goal 的相似度。因为 _compute_worker_reward 已经把输出平移到了 [0, 1]
-                w_reward = self._compute_worker_reward(imag_stoch, imag_goal)
-                
-                # 还可以加入一个小小的 action penalty 防止乱动
-                action_penalty = torch.norm(imag_action, p=2, dim=-1, keepdim=True) * 0.01
-                w_reward = w_reward - action_penalty
-                
+                # Worker 奖励必须评价“动作后是否更接近 Manager goal”。
+                # current_stoch 对应执行 action 前的 s_t；next_stoch 对应 dynamics.img_step 后的 s_{t+1}。
+                current_stoch = imag_state["stoch_s"]
+                next_stoch = imag_next_state["stoch_s"]
+                if len(current_stoch.shape) > 3:
+                    current_stoch = current_stoch.reshape(current_stoch.shape[0], current_stoch.shape[1], -1)
+                if len(next_stoch.shape) > 3:
+                    next_stoch = next_stoch.reshape(next_stoch.shape[0], next_stoch.shape[1], -1)
+
+                w_reward, w_progress, w_cos_before, w_cos_after = self._compute_worker_reward(
+                    current_stoch, next_stoch, imag_goal
+                )
+
                 w_inp = torch.cat([imag_feat, imag_goal], dim=-1)
                 w_target, w_weights, w_base = self._compute_target(
                     w_inp, imag_state, w_reward, is_end, self.value
@@ -510,23 +509,41 @@ class ImagBehavior(nn.Module):
         metrics.update(tools.tensorstats(reward, "manager_reward_env"))
         metrics.update(tools.tensorstats(intrinsic_reward, "manager_reward_clip"))
         
-        metrics.update(tools.tensorstats(w_reward, "worker_reward_cosine"))
+        metrics.update(tools.tensorstats(w_reward, "worker_reward"))
+        metrics.update(tools.tensorstats(w_progress, "worker_progress"))
+        metrics.update(tools.tensorstats(w_cos_before, "worker_cos_before"))
+        metrics.update(tools.tensorstats(w_cos_after, "worker_cos_after"))
         metrics.update(tools.tensorstats(m_ent, "manager_entropy"))
         metrics.update(tools.tensorstats(w_ent, "worker_entropy"))
+
+        with torch.no_grad():
+            action_idx = torch.argmax(imag_action, dim=-1)
+            for i in range(self._config.num_actions):
+                metrics[f"worker_action_{i}_frac"] = to_np((action_idx == i).float().mean())
 
         # 记录 Manager 跳跃幅度和更新比例
         metrics["manager_update_ratio"] = to_np(imag_manager_mask.mean())
         metrics["manager_jump_norm"] = to_np(torch.norm(imag_manager_action, p=2, dim=-1).mean())
+        metrics["manager_goal_norm"] = to_np(torch.norm(imag_goal, p=2, dim=-1).mean())
         
         return imag_feat, imag_state, imag_action, w_weights, metrics
 
-    def _compute_worker_reward(self, current_feat, goal_feat):
+    def _compute_worker_reward(self, current_feat, next_feat, goal_feat):
         import torch.nn.functional as F
-        # 计算当前特征和目标特征的余弦相似度
-        cos_sim = F.cosine_similarity(current_feat, goal_feat, dim=-1)
-        # 将其拉伸到 [0, 1] 区间
-        worker_reward = (cos_sim + 1.0) / 2.0 
-        return worker_reward.unsqueeze(-1)
+        cos_before = F.cosine_similarity(current_feat, goal_feat, dim=-1)
+        cos_after = F.cosine_similarity(next_feat, goal_feat, dim=-1)
+        progress = cos_after - cos_before
+
+        scale = getattr(self._config, "worker_reward_scale", 5.0)
+        clip = getattr(self._config, "worker_reward_clip", 1.0)
+        worker_reward = torch.clamp(scale * progress, -clip, clip)
+
+        return (
+            worker_reward.unsqueeze(-1),
+            progress.unsqueeze(-1),
+            cos_before.unsqueeze(-1),
+            cos_after.unsqueeze(-1),
+        )
 
     def _imagine(self, start, horizon):
         dynamics = self._world_model.dynamics
@@ -544,14 +561,15 @@ class ImagBehavior(nn.Module):
             if prev_goal is None:
                 prev_goal = torch.zeros_like(stoch_feat)
 
-            update_mask = (t % self._config.manager_freq == 0).float()
+            update_mask = (t % self._config.manager_freq == 0).to(device=stoch_feat.device, dtype=stoch_feat.dtype)
 
             manager_dist = self.manager_actor(feat.detach())
             manager_action = manager_dist.sample()
             
             import torch.nn.functional as F
             manager_direction = F.normalize(manager_action, p=2, dim=-1)
-            scaled_action = manager_direction * 3.0  # 3.0是可到达的合理半径
+            goal_scale = getattr(self._config, "goal_scale", 1.0)
+            scaled_action = manager_direction * goal_scale
             
             new_goal = (stoch_feat.detach() + scaled_action).detach()
             goal_stoch = update_mask * new_goal + (1.0 - update_mask) * prev_goal
@@ -570,11 +588,20 @@ class ImagBehavior(nn.Module):
         )
         
         states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+        next_states = succ
         
         if horizon == 1:
-            return feats.squeeze(0), {k: v.squeeze(0) for k, v in succ.items()}, actions.squeeze(0), goals.squeeze(0), manager_actions.squeeze(0), manager_masks.squeeze(0)
+            return (
+                feats.squeeze(0),
+                {k: v.squeeze(0) for k, v in states.items()},
+                {k: v.squeeze(0) for k, v in next_states.items()},
+                actions.squeeze(0),
+                goals.squeeze(0),
+                manager_actions.squeeze(0),
+                manager_masks.squeeze(0),
+            )
             
-        return feats, states, actions, goals, manager_actions, manager_masks
+        return feats, states, next_states, actions, goals, manager_actions, manager_masks
 
     def _compute_target(self, value_input, imag_state, reward, is_end, value_net):
         end = is_end(imag_state) 

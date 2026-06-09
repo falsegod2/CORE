@@ -28,7 +28,10 @@ defaults:
   # ==========================================
   inverse_loss_scale: 1.0         # 创新1：S分支逆动力学约束权重
   affordance_s_scale: 2.0         # 创新2：S分支可供性地图(Heatmap)对齐约束权重
-  intrinsic_reward_scale: 1.0     # 创新3：MineCLIP语义奖励给Manager的权重
+  intrinsic_reward_scale: 5.0     # MineCLIP语义奖励给Manager的权重（先放大，避免Manager信号太弱）
+  goal_scale: 1.0                 # Manager在stoch_s空间生成子目标的步长
+  worker_reward_scale: 5.0        # Worker progress reward 放大系数
+  worker_reward_clip: 1.0         # Worker reward clip范围 [-x, x]
   # 【已移除 long_term_branch_weight】
 
   gaussian_reward_weight: 0.0  
@@ -113,13 +116,13 @@ defaults:
   # 7. 策略与价值网络 (Actor-Critic & Heads)
   # ==========================================
   # 【新增】Manager 的配置：输出连续的相对隐状态偏移量 \Delta S
-  manager_freq: 10   # K=10，每 10 步 Manager 下达一次新地标
+  manager_freq: 5    # K=5，每 5 步 Manager 下达一次新地标
   manager:
     {layers: 5, dist: 'trunc_normal', std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, unimix_ratio: 0.01}
   
   # 【修改】Worker (Actor) 需要扩大输入维度，但配置参数本身不用大改
   actor:
-    {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+    {layers: 5, dist: 'onehot', entropy: 1e-3, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic: 
     {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
   

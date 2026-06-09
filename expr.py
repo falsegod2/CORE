@@ -141,7 +141,8 @@ class LS_Imagine(nn.Module):
             
         import torch.nn.functional as F
         manager_direction = F.normalize(manager_action, p=2, dim=-1)
-        scaled_action = manager_direction * 3.0
+        goal_scale = getattr(self._config, "goal_scale", 1.0)
+        scaled_action = manager_direction * goal_scale
         
         new_goal = stoch_feat + scaled_action
         goal = update_mask * new_goal + (1.0 - update_mask) * goal
