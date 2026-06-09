@@ -320,23 +320,20 @@ class ImagBehavior(nn.Module):
         self._world_model = world_model
         
         if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            stoch_size = config.dyn_stoch * config.dyn_discrete
+            feat_size = stoch_size + config.dyn_deter
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+            stoch_size = config.dyn_stoch
+            feat_size = stoch_size + config.dyn_deter
             
-        # ==========================================
-        # 2. Manager 网络 (高层，负责设定地标)
-        # ==========================================
-        # Manager Actor: 观察当前 feat_size，输出 \Delta S (维度也是 feat_size)
+        # 2. Manager 现在只输出 stoch_size 的 \Delta S
         self.manager_actor = networks.MLP(
-            feat_size, (feat_size,), config.manager["layers"], config.units,
+            feat_size, (stoch_size,), config.manager["layers"], config.units,
             config.act, config.norm, config.manager["dist"], config.manager["std"],
             config.manager["min_std"], config.manager["max_std"], absmax=1.0,
             temp=config.manager["temp"], unimix_ratio=config.manager["unimix_ratio"],
             outscale=config.manager["outscale"], name="ManagerActor",
         )
-        
-        # Manager Value: 评估真实环境的稀疏奖励与 MineCLIP 奖励
         self.manager_value = networks.MLP(
             feat_size, (255,) if config.critic["dist"] == "symlog_disc" else (),
             config.critic["layers"], config.units, config.act, config.norm,
@@ -350,16 +347,14 @@ class ImagBehavior(nn.Module):
         # ==========================================
         # Worker Actor: 【注意这里】输入变成了 feat_size * 2 (当前状态拼接 Manager给的S_goal)
         self.actor = networks.MLP(
-            feat_size * 2, (config.num_actions,), config.actor["layers"], config.units,
+            feat_size + stoch_size, (config.num_actions,), config.actor["layers"], config.units,
             config.act, config.norm, config.actor["dist"], config.actor["std"],
             config.actor["min_std"], config.actor["max_std"], absmax=1.0,
             temp=config.actor["temp"], unimix_ratio=config.actor["unimix_ratio"],
             outscale=config.actor["outscale"], name="WorkerActor",
         )
-        
-        # Worker Value: 评估与 S_goal 之间的余弦相似度奖励
         self.value = networks.MLP(
-            feat_size * 2, (255,) if config.critic["dist"] == "symlog_disc" else (),
+            feat_size + stoch_size, (255,) if config.critic["dist"] == "symlog_disc" else (),
             config.critic["layers"], config.units, config.act, config.norm,
             config.critic["dist"], outscale=config.critic["outscale"],
             device=config.device, name="WorkerValue",
@@ -445,8 +440,13 @@ class ImagBehavior(nn.Module):
         # ==========================================
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # Worker 仅关注是否到达 Manager 指定的地标 (余弦相似度)
-                w_reward = self._compute_worker_reward(imag_feat, imag_goal)
+                # 提取想象轨迹中的 stoch 特征来算奖励，而不是完整的 feat
+                imag_stoch = imag_state["stoch"]
+                if len(imag_stoch.shape) > 3:
+                    imag_stoch = imag_stoch.reshape(imag_stoch.shape[0], imag_stoch.shape[1], -1)
+                
+                # 现在它能正确计算 1024 维度的余弦相似度了！
+                w_reward = self._compute_worker_reward(imag_stoch, imag_goal)
                 
                 w_inp = torch.cat([imag_feat, imag_goal], dim=-1)
                 w_target, w_weights, w_base = self._compute_target(
@@ -517,36 +517,36 @@ class ImagBehavior(nn.Module):
         dynamics = self._world_model.dynamics
 
         def step(prev, t):
-            # prev 包含5个元素，记录了上一步的状态
-            state, prev_goal, _, _, _, _ = prev
+            state, prev_goal, _, _, _ = prev
             feat = dynamics.get_feat(state)
+            
+            # 【提取当前的物理 stoch 内容】
+            stoch_feat = state["stoch"]
+            if len(stoch_feat.shape) > 2:
+                stoch_feat = stoch_feat.reshape(stoch_feat.shape[0], -1)
 
-            # 初始化第一步的 goal
             if prev_goal is None:
-                prev_goal = torch.zeros_like(feat)
+                prev_goal = torch.zeros_like(stoch_feat)
 
-            # 判断当前步是否需要 Manager 更新目标 (返回 0.0 或 1.0 的标量张量)
             update_mask = (t % self._config.manager_freq == 0).float()
-            manager_mask = update_mask.reshape(1, 1)
 
-            # --- Manager 行动 ---
             manager_dist = self.manager_actor(feat.detach())
             manager_action = manager_dist.sample()
             
-            # 生成新的绝对地标 S_goal
-            new_goal = (feat.detach() + manager_action).detach()
+            # 【神级修复：L2归一化 + 约束步长】，只给方向，不给虚无的距离
+            import torch.nn.functional as F
+            manager_direction = F.normalize(manager_action, p=2, dim=-1)
+            scaled_action = manager_direction * 3.0  # 3.0是可到达的合理半径
+            
+            new_goal = (stoch_feat.detach() + scaled_action).detach()
+            goal_stoch = update_mask * new_goal + (1.0 - update_mask) * prev_goal
 
-            # 利用 mask 选择是更新目标还是保持上一步的目标 (PyTorch 自动广播机制)
-            goal_feat = update_mask * new_goal + (1.0 - update_mask) * prev_goal
-
-            # --- Worker 行动 ---
-            # Worker 接收当前特征和目标地标
-            worker_inp = torch.cat([feat, goal_feat], dim=-1)
+            # Worker 接收 feat 和 stoch 目标
+            worker_inp = torch.cat([feat, goal_stoch], dim=-1)
             action = self.actor(worker_inp.detach()).sample()
 
             succ = dynamics.img_step(state, action)
-            # 返回: 转移后状态, 当前地标, 当前特征, Worker动作, Manager动作
-            return succ, goal_feat, feat, action, manager_action, manager_mask.expand(feat.shape[0], 1)
+            return succ, goal_stoch, feat, action, manager_action
 
         # 调用您原生的 static_scan
         succ, goals, feats, actions, manager_actions, manager_masks = tools.static_scan(
