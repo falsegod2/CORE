@@ -446,8 +446,14 @@ class ImagBehavior(nn.Module):
                 if len(imag_stoch.shape) > 3:
                     imag_stoch = imag_stoch.reshape(imag_stoch.shape[0], imag_stoch.shape[1], -1)
                 
-                # 现在它能正确计算 1024 维度的余弦相似度了！
+                # 【闭环修复 1】: 奖励不应该只看当前步，应该看 "走到下一步后，是不是更接近目标了"
+                # 由于 imag_stoch 是从 t=1 到 horizon 的预测状态
+                # 我们计算它与 goal 的相似度。因为 _compute_worker_reward 已经把输出平移到了 [0, 1]
                 w_reward = self._compute_worker_reward(imag_stoch, imag_goal)
+                
+                # 还可以加入一个小小的 action penalty 防止乱动
+                action_penalty = torch.norm(imag_action, p=2, dim=-1, keepdim=True) * 0.01
+                w_reward = w_reward - action_penalty
                 
                 w_inp = torch.cat([imag_feat, imag_goal], dim=-1)
                 w_target, w_weights, w_base = self._compute_target(
@@ -499,11 +505,19 @@ class ImagBehavior(nn.Module):
         # 记录关键指标以便于您在 TensorBoard 观察
         metrics.update(tools.tensorstats(m_val.mode(), "manager_value"))
         metrics.update(tools.tensorstats(w_val.mode(), "worker_value"))
-        metrics.update(tools.tensorstats(m_reward, "manager_reward"))
-        metrics.update(tools.tensorstats(w_reward, "worker_reward"))
+        metrics.update(tools.tensorstats(m_reward, "manager_reward_total"))
+        # 【闭环修复 3】: 单独记录环境和 CLIP 奖励，证明 Manager 的目标来源
+        metrics.update(tools.tensorstats(reward, "manager_reward_env"))
+        metrics.update(tools.tensorstats(intrinsic_reward, "manager_reward_clip"))
+        
+        metrics.update(tools.tensorstats(w_reward, "worker_reward_cosine"))
         metrics.update(tools.tensorstats(m_ent, "manager_entropy"))
         metrics.update(tools.tensorstats(w_ent, "worker_entropy"))
 
+        # 记录 Manager 跳跃幅度和更新比例
+        metrics["manager_update_ratio"] = to_np(imag_manager_mask.mean())
+        metrics["manager_jump_norm"] = to_np(torch.norm(imag_manager_action, p=2, dim=-1).mean())
+        
         return imag_feat, imag_state, imag_action, w_weights, metrics
 
     def _compute_worker_reward(self, current_feat, goal_feat):
