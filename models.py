@@ -425,9 +425,10 @@ class ImagBehavior(nn.Module):
                 m_policy = self.manager_actor(imag_feat.detach())
                 m_log_prob = m_policy.log_prob(imag_manager_action)[:-1][:, :, None]
 
+                # 【修复】极其鲁棒的动态扩维，强制与 m_weights 的维度对齐
                 imag_manager_mask = imag_manager_mask.to(device=m_weights.device, dtype=m_weights.dtype)
-                if imag_manager_mask.dim() == 2:
-                    imag_manager_mask = imag_manager_mask[:, :, None]
+                while imag_manager_mask.dim() < m_weights.dim():
+                    imag_manager_mask = imag_manager_mask.unsqueeze(-1)
 
                 m_actor_loss = -m_weights[:-1] * m_log_prob * m_adv.detach() * imag_manager_mask[:-1]
                 
@@ -517,10 +518,11 @@ class ImagBehavior(nn.Module):
         dynamics = self._world_model.dynamics
 
         def step(prev, t):
-            state, prev_goal, _, _, _ = prev
+            # 【修复1】这里必须是 6 个变量来接收，多加一个 '_'
+            state, prev_goal, _, _, _, _ = prev
             feat = dynamics.get_feat(state)
             
-            # 【提取当前的物理 stoch 内容】
+            # 提取当前的物理 stoch 内容
             stoch_feat = state["stoch"]
             if len(stoch_feat.shape) > 2:
                 stoch_feat = stoch_feat.reshape(stoch_feat.shape[0], -1)
@@ -533,7 +535,6 @@ class ImagBehavior(nn.Module):
             manager_dist = self.manager_actor(feat.detach())
             manager_action = manager_dist.sample()
             
-            # 【神级修复：L2归一化 + 约束步长】，只给方向，不给虚无的距离
             import torch.nn.functional as F
             manager_direction = F.normalize(manager_action, p=2, dim=-1)
             scaled_action = manager_direction * 3.0  # 3.0是可到达的合理半径
@@ -541,14 +542,15 @@ class ImagBehavior(nn.Module):
             new_goal = (stoch_feat.detach() + scaled_action).detach()
             goal_stoch = update_mask * new_goal + (1.0 - update_mask) * prev_goal
 
-            # Worker 接收 feat 和 stoch 目标
             worker_inp = torch.cat([feat, goal_stoch], dim=-1)
             action = self.actor(worker_inp.detach()).sample()
 
             succ = dynamics.img_step(state, action)
-            return succ, goal_stoch, feat, action, manager_action
+            
+            # 【修复2】这里必须 return 6 个返回值，加上 update_mask
+            return succ, goal_stoch, feat, action, manager_action, update_mask
 
-        # 调用您原生的 static_scan
+        # 调用原生的 static_scan
         succ, goals, feats, actions, manager_actions, manager_masks = tools.static_scan(
             step, [torch.arange(horizon)], (start, None, None, None, None, None)
         )
