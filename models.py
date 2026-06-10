@@ -529,9 +529,9 @@ class ImagBehavior(nn.Module):
         metrics.update(tools.tensorstats(intrinsic_reward, "manager_reward_clip"))
         
         metrics.update(tools.tensorstats(w_reward, "worker_reward"))
-        metrics.update(tools.tensorstats(w_progress, "worker_progress"))
-        metrics.update(tools.tensorstats(w_cos_before, "worker_cos_before"))
-        metrics.update(tools.tensorstats(w_cos_after, "worker_cos_after"))
+        metrics.update(tools.tensorstats(progress, "worker_progress"))
+        metrics.update(tools.tensorstats(cos_prev, "worker_cos_before"))
+        metrics.update(tools.tensorstats(cos_next, "worker_cos_after"))
         metrics.update(tools.tensorstats(m_ent, "manager_entropy"))
         metrics.update(tools.tensorstats(w_ent, "worker_entropy"))
 
