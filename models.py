@@ -441,19 +441,38 @@ class ImagBehavior(nn.Module):
         # ==========================================
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # Worker 奖励必须评价“动作后是否更接近 Manager goal”。
-                # current_stoch 对应执行 action 前的 s_t；next_stoch 对应 dynamics.img_step 后的 s_{t+1}。
-                current_stoch = imag_state["stoch_s"]
-                next_stoch = imag_next_state["stoch_s"]
-                if len(current_stoch.shape) > 3:
-                    current_stoch = current_stoch.reshape(current_stoch.shape[0], current_stoch.shape[1], -1)
-                if len(next_stoch.shape) > 3:
-                    next_stoch = next_stoch.reshape(next_stoch.shape[0], next_stoch.shape[1], -1)
-
-                w_reward, w_progress, w_cos_before, w_cos_after = self._compute_worker_reward(
-                    current_stoch, next_stoch, imag_goal
-                )
-
+                # 提取想象轨迹中的受控分支(stoch_s)
+                imag_stoch = imag_state["stoch_s"]
+                if len(imag_stoch.shape) > 3:
+                    imag_stoch = imag_stoch.reshape(imag_stoch.shape[0], imag_stoch.shape[1], -1)
+                
+                # 【神级修复：进度差分奖励 (Progress Reward)】
+                import torch.nn.functional as F
+                
+                # 1. 提取起点 start 的 stoch_s，并修正维度
+                start_stoch = start["stoch_s"]
+                if len(start_stoch.shape) > 2:
+                    start_stoch = start_stoch.reshape(start_stoch.shape[0], -1)
+                
+                # 2. 构造动作执行前的前一时刻状态 (stoch_prev)
+                # start_stoch: [batch, stoch_size] -> [1, batch, stoch_size]
+                # imag_stoch[:-1]: [horizon-1, batch, stoch_size]
+                stoch_prev = torch.cat([start_stoch.unsqueeze(0), imag_stoch[:-1]], dim=0)
+                
+                # 3. 计算 t+1 时刻 和 t 时刻与目标的余弦相似度
+                cos_next = F.cosine_similarity(imag_stoch, imag_goal, dim=-1)
+                cos_prev = F.cosine_similarity(stoch_prev, imag_goal, dim=-1)
+                
+                # 4. 进度差分：必须是因为刚才的动作，让我更接近了目标才能得分！
+                # 乘以 10.0 放大微小梯度，让 Worker 对进度更敏感
+                progress = (cos_next - cos_prev) * 10.0 
+                
+                # 5. 加入微小的动作范数惩罚，防止 Worker 抽搐或输出极大动作
+                action_penalty = torch.norm(imag_action, p=2, dim=-1) * 0.01
+                
+                # 最终 Worker 的严苛奖励
+                w_reward = (progress - action_penalty).unsqueeze(-1)
+                
                 w_inp = torch.cat([imag_feat, imag_goal], dim=-1)
                 w_target, w_weights, w_base = self._compute_target(
                     w_inp, imag_state, w_reward, is_end, self.value

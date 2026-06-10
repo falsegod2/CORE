@@ -75,7 +75,8 @@ defaults:
   discount: 0.997
   discount_lambda: 0.95
   # 【已移除 jump_prob 和 jump_prob_decay】
-  imag_horizon: 15             
+  # 【修改 1】将想象视野从 15 拉长到 20，给系统更多长线规划的空间
+  imag_horizon: 20             
   max_imag_sequences_num: 1024
   imag_gradient: 'reinforce'   
   imag_gradient_mix: 0.0
@@ -116,11 +117,13 @@ defaults:
   # 7. 策略与价值网络 (Actor-Critic & Heads)
   # ==========================================
   # 【新增】Manager 的配置：输出连续的相对隐状态偏移量 \Delta S
+  # 【修改 2】让 Manager 更新更频繁，每 5 步给出一次新地标
   manager_freq: 5    # K=5，每 5 步 Manager 下达一次新地标
   manager:
     {layers: 5, dist: 'trunc_normal', std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0, unimix_ratio: 0.01}
   
   # 【修改】Worker (Actor) 需要扩大输入维度，但配置参数本身不用大改
+  # 【修改 3】提高 Worker 的探索熵 entropy，从 3e-4 提高到 1e-3
   actor:
     {layers: 5, dist: 'onehot', entropy: 1e-3, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
   critic: 

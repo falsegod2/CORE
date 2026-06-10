@@ -99,19 +99,13 @@ class LS_Imagine(nn.Module):
         latent, action, goal, step_count = state
         
         obs = self._wm.preprocess(obs)
-        
-        # 【闭环修复 2】: 严格处理 Episode 边界，防止目标跨局污染
         is_first = obs["is_first"]
+        
+        # 【极其严格的 Episode 边界清理】
         if is_first.any():
-            # 获取 stoch_size
-            if self._config.dyn_discrete:
-                stoch_size = (self._config.dyn_stoch // 2) * self._config.dyn_discrete
-            else:
-                stoch_size = self._config.dyn_stoch // 2
-            
-            # 将 is_first 为 True 的位置的 goal 和 step_count 清零
+            # 当跨局发生时，将对应 batch 位置的 goal 和 step_count 强制清零
             reset_mask = is_first.float().unsqueeze(-1)
-            zeros_goal = torch.zeros((goal.shape[0], stoch_size)).to(self._config.device)
+            zeros_goal = torch.zeros_like(goal)
             goal = goal * (1.0 - reset_mask) + zeros_goal * reset_mask
             
             reset_mask_1d = is_first.float()
