@@ -3,7 +3,18 @@ import torch as th
 
 
 class ClipWrapper(Wrapper):
-    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', **kwargs):
+    def __init__(
+        self,
+        env,
+        clip,
+        prompts=None,
+        dense_reward=.01,
+        smoothing=1,
+        target_object='log',
+        emit_embedding=True,
+        embedding_dtype='float16',
+        **kwargs,
+    ):
         super().__init__(env)
         self.clip = clip # ClipReward
         self.wrapper_name = "ClipWrapper"
@@ -20,6 +31,26 @@ class ClipWrapper(Wrapper):
         self._expl_clip_state = None, None
         self.last_score = 0
         self.expl_last_score = 0
+        self.emit_embedding = bool(emit_embedding)
+        self.embedding_dim = int(self.clip.feature_dim)
+        if embedding_dtype not in ('float16', 'float32'):
+            raise ValueError(f"Unsupported MineCLIP embedding dtype: {embedding_dtype}")
+        self.embedding_dtype = embedding_dtype
+
+    def _zero_embedding(self):
+        import numpy as np
+        dtype = np.float16 if self.embedding_dtype == 'float16' else np.float32
+        return np.zeros((self.embedding_dim,), dtype=dtype)
+
+    def _format_embedding(self, embedding):
+        import numpy as np
+        dtype = np.float16 if self.embedding_dtype == 'float16' else np.float32
+        array = embedding.detach().cpu().numpy().astype(dtype, copy=False)
+        if array.shape != (self.embedding_dim,):
+            raise RuntimeError(
+                f"Expected MineCLIP embedding ({self.embedding_dim},), got {array.shape}"
+            )
+        return array
 
     def reset(self, **kwargs):
         self._clip_state = None, self._clip_state[1]
@@ -30,8 +61,12 @@ class ClipWrapper(Wrapper):
         self.expl_last_score = 0
 
         obs = self.env.reset(**kwargs)
-        obs['intrinsic'] = 0.0
-        obs['score'] = 0.0
+        obs['mineclip_reward'] = 0.0
+        # No MineCLIP video feature has been computed at reset. Using zero here
+        # avoids an additional MineCLIP pass and leaves the reward trajectory
+        # exactly unchanged from the baseline implementation.
+        if self.emit_embedding:
+            obs['mineclip_embedding'] = self._zero_embedding()
 
         return obs
     
@@ -39,24 +74,28 @@ class ClipWrapper(Wrapper):
         obs, reward, done, info = self.env.step(action)
 
         if len(self.prompt) > 0:
-            logits, self._clip_state = self.clip.get_logits(obs, self.prompt, self._clip_state)
+            logits, self._clip_state, global_embedding = self.clip.get_logits_and_embedding(
+                obs, self.prompt, self._clip_state
+            )
             logits = logits.detach().cpu()
+            if self.emit_embedding:
+                obs['mineclip_embedding'] = self._format_embedding(global_embedding)
 
             self.buffer = self._insert_buffer(self.buffer, logits[:1])
             score = self._get_score()
 
             if score > self.last_score:
-                obs['intrinsic'] = self.dense_reward * score
+                obs['mineclip_reward'] = self.dense_reward * score
                 self.last_score = score
             else:
-                obs['intrinsic'] = 0.0
+                obs['mineclip_reward'] = 0.0
 
-            obs['score'] = self.dense_reward * score
 
         else:
-            obs['intrinsic'] = 0.0
-            obs['score'] = 0.0
-
+            obs['mineclip_reward'] = 0.0
+            if self.emit_embedding:
+                obs['mineclip_embedding'] = self._zero_embedding()
+    
         if len(self.expl_prompt) > 0:
             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)
             logits = logits.detach().cpu()
@@ -73,9 +112,6 @@ class ClipWrapper(Wrapper):
         else:
             info['expl_intrinsic'] = 0.0
 
-        info["clip_score"] = obs['intrinsic']
-        info["clip_last_score"] = self.last_score
-        info["clip_dense_reward"] = self.dense_reward    
 
         return obs, reward, done, info 
 

@@ -22,9 +22,9 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-class LS_Imagine(nn.Module):
+class DreamerV3Agent(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super(LS_Imagine, self).__init__()
+        super().__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -88,7 +88,7 @@ class LS_Imagine(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+            latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -112,35 +112,22 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, post_zoomed, context, mets = self._wm._train(data)
+        post, _, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
 
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
+        mineclip_reward = lambda f, s, a: self._wm.heads["mineclip_reward"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
-
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
-
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
-
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
 
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, mineclip_reward, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
@@ -237,10 +224,6 @@ def main(config): # config is namespace
     task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
 
     config.episode_max_steps = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
-    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
-    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
     
     train_envs = [make("train", i) for i in range(config.envs)]
     eval_envs = [make("eval", i) for i in range(config.envs)]
@@ -254,8 +237,6 @@ def main(config): # config is namespace
     acts = train_envs[0].action_space
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
@@ -286,9 +267,7 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
@@ -300,7 +279,7 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = LS_Imagine(
+    agent = DreamerV3Agent(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -330,9 +309,7 @@ def main(config): # config is namespace
                 eval_eps,
                 config.evaldir,
                 logger,
-                step_calculator,
                 config.episode_max_steps,
-                config.discount,
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
@@ -344,14 +321,12 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent, # LS_Imagine
+            agent,
             train_envs, 
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=config.eval_every, 
             state=state,

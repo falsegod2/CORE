@@ -1,0 +1,14 @@
+ACTIVE COMPONENTS
+- RGB-only trainable DreamerV3 convolutional encoder
+- Frozen 512-D global temporal MineCLIP embedding
+- Learned gated residual semantic fusion
+- Standard single-stream DreamerV3 RSSM
+- Environment reward + MineCLIP progress reward
+- Standard short-horizon imagination and lambda return
+
+ABSENT COMPONENTS
+- Heatmap or affordance map
+- Affordance reward
+- S/Z latent split or inverse dynamics
+- Zoomed observations or long-term latent jumps
+- Landmark/manager-worker modules

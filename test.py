@@ -10,7 +10,7 @@ from datetime import datetime
 import tools
 from parallel import Parallel, Damy
 
-from expr import LS_Imagine, make_env, make_dataset
+from expr import DreamerV3Agent, make_env, make_dataset
 
 os.environ["MUJOCO_GL"] = "osmesa"
 sys.path.append(str(pathlib.Path(__file__).parent))
@@ -56,10 +56,6 @@ def main(config):
     task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
 
     config.episode_max_steps = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
-    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
-    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
 
     eval_envs = [make("eval", i) for i in range(config.envs)]
     if config.parallel:
@@ -70,13 +66,12 @@ def main(config):
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
-    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
     print("Start evaluation.")
     eval_dataset = make_dataset(eval_eps, config)
-    agent = LS_Imagine(
+    agent = DreamerV3Agent(
         eval_envs[0].observation_space,
         eval_envs[0].action_space,
         config,
@@ -105,9 +100,7 @@ def main(config):
             eval_eps,
             config.evaldir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             is_eval=True,
             episodes=config.eval_episode_num,
             is_training=False,
