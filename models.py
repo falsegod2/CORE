@@ -40,10 +40,10 @@ class WorldModel(nn.Module):
         self._config = config
 
         shapes = {key: tuple(space.shape) for key, space in obs_space.spaces.items()}
-        patch_config = config.task_patch_fusion
-        if patch_config.get("enabled", False):
-            self.encoder = networks.TaskConditionedPatchEncoder(
-                shapes, config.encoder, patch_config
+        object_config = config.task_object_tokens
+        if object_config.get("enabled", False):
+            self.encoder = networks.TaskRelevantObjectEncoder(
+                shapes, config.encoder, object_config
             )
         else:
             self.encoder = networks.MultiEncoder(shapes, **config.encoder)
@@ -188,7 +188,20 @@ class WorldModel(nn.Module):
                     name: loss * self._scales.get(name, 1.0)
                     for name, loss in losses.items()
                 }
-                model_loss = sum(scaled_losses.values()) + kl_loss
+                encoder_aux_losses = {}
+                if hasattr(self.encoder, "get_aux_losses"):
+                    encoder_aux_losses = self.encoder.get_aux_losses()
+                    for name, loss in encoder_aux_losses.items():
+                        if loss.shape != embed.shape[:2]:
+                            raise RuntimeError(
+                                f"Encoder auxiliary loss {name} has shape "
+                                f"{loss.shape}; expected {embed.shape[:2]}"
+                            )
+                model_loss = (
+                    sum(scaled_losses.values())
+                    + sum(encoder_aux_losses.values())
+                    + kl_loss
+                )
                 mean_model_loss = torch.mean(model_loss)
 
             metrics = self._model_opt(mean_model_loss, self.parameters())
@@ -206,6 +219,8 @@ class WorldModel(nn.Module):
         metrics["rep_loss"] = to_np(torch.mean(rep_loss))
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(mean_model_loss)
+        for name, loss in encoder_aux_losses.items():
+            metrics[f"{name}_scaled_loss"] = to_np(torch.mean(loss))
         if hasattr(self.encoder, "get_metrics"):
             metrics.update({
                 key: to_np(value) if torch.is_tensor(value) else value
@@ -249,16 +264,21 @@ class WorldModel(nn.Module):
                 obs["reward"], dtype=np.float32
             )
 
-        task_key = self._config.task_patch_fusion.get(
-            "task_key", "task_embedding"
+        object_config = self._config.task_object_tokens
+        task_key = object_config.get("task_key", "task_embedding")
+        visual_key = object_config.get(
+            "visual_key", "mineclip_embedding"
         )
+        prefix_shape = np.asarray(obs["image"]).shape[:-3]
         if task_key not in obs:
-            prefix_shape = np.asarray(obs["image"]).shape[:-3]
-            task_dim = int(
-                self._config.task_patch_fusion.get("task_dim", 512)
-            )
+            task_dim = int(object_config.get("task_dim", 512))
             obs[task_key] = np.zeros(
                 prefix_shape + (task_dim,), dtype=np.float32
+            )
+        if visual_key not in obs:
+            visual_dim = int(object_config.get("visual_dim", 512))
+            obs[visual_key] = np.zeros(
+                prefix_shape + (visual_dim,), dtype=np.float32
             )
 
         return {

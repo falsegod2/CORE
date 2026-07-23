@@ -75,19 +75,30 @@ defaults:
   encoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
 
-  # MineCLIP text-conditioned selection/refinement of Dreamer RGB patch tokens.
-  # No global MineCLIP visual embedding, heatmap, or extra reward is introduced.
-  task_patch_fusion:
+  # Task-relevant object tokens. Frozen MineCLIP text and the already-computed
+  # global video embedding condition candidate selection and object queries.
+  # The global feature is a detached semantic teacher/condition, not a direct
+  # RSSM input. No pure Slot Attention, heatmap, or extra reward is introduced.
+  task_object_tokens:
     enabled: true
     task_key: 'task_embedding'
     task_dim: 512
-    attention_dim: 256
+    visual_key: 'mineclip_embedding'
+    visual_dim: 512
+    object_dim: 256
     hidden: 256
-    topk: 4
-    temperature: 0.2
+    num_objects: 4
+    candidate_topk: 8
+    object_iters: 2
+    relevance_temperature: 0.2
+    attention_temperature: 0.5
+    relevance_bias: 2.0
     normalize_task: true
     residual_scale: 0.05
     output_init: 0.001
+    coverage_scale: 0.02
+    diversity_scale: 0.005
+    semantic_align_scale: 0.02
   decoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
 

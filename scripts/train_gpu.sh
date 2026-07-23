@@ -17,4 +17,4 @@ python expr.py \
   --task "minedojo_${TASK_NAME}" \
   --seed "$SEED" \
   --device cuda:0 \
-  --logdir ./logdir_task_patch
+  --logdir ./logdir_task_object

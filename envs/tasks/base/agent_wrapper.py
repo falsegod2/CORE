@@ -79,6 +79,10 @@ class AgentWrapper(Wrapper, ABC):
             "task_embedding": spaces.Box(
                 -np.inf, np.inf, (512,), dtype=np.float16
             ),
+            # Frozen global MineCLIP video feature reused from reward scoring.
+            "mineclip_embedding": spaces.Box(
+                -np.inf, np.inf, (512,), dtype=np.float16
+            ),
         })
         self.action_space = spaces.discrete.Discrete(len(BASIC_ACTIONS))
         self.action_space.discrete = True
@@ -128,6 +132,10 @@ class AgentWrapper(Wrapper, ABC):
             "mineclip_reward": np.asarray(obs.get("mineclip_reward", 0.0), dtype=np.float32),
             "task_embedding": np.asarray(
                 obs.get("task_embedding", np.zeros((512,), dtype=np.float16)),
+                dtype=np.float16,
+            ),
+            "mineclip_embedding": np.asarray(
+                obs.get("mineclip_embedding", np.zeros((512,), dtype=np.float16)),
                 dtype=np.float16,
             ),
         }
