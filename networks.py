@@ -334,91 +334,165 @@ class MultiEncoder(nn.Module):
         return outputs
 
 
-class GatedMineCLIPEncoder(nn.Module):
-    """RGB encoder with residual, task-adaptive MineCLIP semantic fusion.
+class TaskConditionedPatchEncoder(nn.Module):
+    """Dreamer RGB patch tokens refined by a frozen MineCLIP task embedding.
 
-    The MineCLIP feature is frozen upstream and explicitly detached here. A
-    low-dimensional gate uses both the current RGB embedding and MineCLIP
-    embedding, then injects a small residual into the original RGB embedding.
-    Output dimensionality is unchanged, so the standard DreamerV3 RSSM remains
-    untouched.
+    The CNN remains trainable and provides a 4x4 grid of spatial tokens for the
+    default 64x64 input. A frozen text embedding queries these tokens. Only the
+    top-K task-relevant tokens receive a small residual refinement; all tokens
+    are then flattened exactly as in the baseline ConvEncoder, so the RSSM
+    dimensionality and the non-visual MLP branch remain unchanged.
     """
 
     def __init__(self, shapes, encoder_config, fusion_config):
         super().__init__()
         self._base = MultiEncoder(shapes, **encoder_config)
+        if not self._base.cnn_shapes or not hasattr(self._base, "_cnn"):
+            raise ValueError("Task patch fusion requires an RGB CNN encoder")
+        if "image" not in self._base.cnn_shapes:
+            raise ValueError("Task patch fusion expects the 'image' observation")
+
         self.outdim = self._base.outdim
-        self._key = fusion_config.get("key", "mineclip_embedding")
-        self._input_dim = int(fusion_config.get("input_dim", 512))
-        self._fusion_dim = int(fusion_config.get("fusion_dim", 512))
-        self._hidden = int(fusion_config.get("hidden", 512))
-        self._residual_scale = float(fusion_config.get("residual_scale", 0.1))
-        self._normalize_input = bool(fusion_config.get("normalize_input", True))
-        gate_bias = float(fusion_config.get("gate_bias", -2.0))
+        self._task_key = fusion_config.get("task_key", "task_embedding")
+        self._task_dim = int(fusion_config.get("task_dim", 512))
+        self._attn_dim = int(fusion_config.get("attention_dim", 256))
+        self._hidden = int(fusion_config.get("hidden", 256))
+        self._topk = int(fusion_config.get("topk", 4))
+        self._temperature = float(fusion_config.get("temperature", 0.2))
+        self._residual_scale = float(
+            fusion_config.get("residual_scale", 0.05)
+        )
+        self._normalize_task = bool(
+            fusion_config.get("normalize_task", True)
+        )
         output_init = float(fusion_config.get("output_init", 1e-3))
 
-        shape = tuple(shapes.get(self._key, ()))
-        if shape != (self._input_dim,):
+        shape = tuple(shapes.get(self._task_key, ()))
+        if shape != (self._task_dim,):
             raise ValueError(
-                f"Observation '{self._key}' must have shape ({self._input_dim},), "
-                f"got {shape}"
+                f"Observation '{self._task_key}' must have shape "
+                f"({self._task_dim},), got {shape}"
             )
 
-        self._rgb_proj = nn.Linear(self.outdim, self._fusion_dim, bias=False)
-        self._semantic_proj = nn.Linear(
-            self._input_dim, self._fusion_dim, bias=False
+        token_dim = self._base._cnn.token_dim
+        token_count = self._base._cnn.token_count
+        if not 1 <= self._topk <= token_count:
+            raise ValueError(
+                f"topk must be in [1, {token_count}], got {self._topk}"
+            )
+        if self._temperature <= 0:
+            raise ValueError("temperature must be positive")
+
+        self._patch_proj = nn.Linear(token_dim, self._attn_dim, bias=False)
+        self._task_proj = nn.Linear(
+            self._task_dim, self._attn_dim, bias=False
         )
-        self._rgb_norm = nn.LayerNorm(self._fusion_dim, eps=1e-3)
-        self._semantic_norm = nn.LayerNorm(self._fusion_dim, eps=1e-3)
-        self._gate = nn.Sequential(
-            nn.Linear(2 * self._fusion_dim, self._hidden),
+        self._patch_norm = nn.LayerNorm(self._attn_dim, eps=1e-3)
+        self._task_norm = nn.LayerNorm(self._attn_dim, eps=1e-3)
+        self._value = nn.Sequential(
+            nn.Linear(self._attn_dim, self._attn_dim),
+            nn.LayerNorm(self._attn_dim, eps=1e-3),
+            nn.SiLU(),
+        )
+        self._token_gate = nn.Sequential(
+            nn.Linear(2 * self._attn_dim, self._hidden),
             nn.LayerNorm(self._hidden, eps=1e-3),
             nn.SiLU(),
-            nn.Linear(self._hidden, self._fusion_dim),
+            nn.Linear(self._hidden, self._attn_dim),
         )
-        self._semantic_value = nn.Sequential(
-            nn.Linear(self._fusion_dim, self._fusion_dim),
-            nn.LayerNorm(self._fusion_dim, eps=1e-3),
-            nn.SiLU(),
+        self._token_out = nn.Linear(
+            self._attn_dim, token_dim, bias=False
         )
-        self._fusion_out = nn.Linear(self._fusion_dim, self.outdim, bias=False)
+        self._position = nn.Parameter(
+            torch.zeros(1, token_count, self._attn_dim)
+        )
 
         for module in (
-            self._rgb_proj,
-            self._semantic_proj,
-            self._gate,
-            self._semantic_value,
+            self._patch_proj,
+            self._task_proj,
+            self._value,
+            self._token_gate,
         ):
             module.apply(tools.weight_init)
-        nn.init.normal_(self._fusion_out.weight, mean=0.0, std=output_init)
-        # Start conservatively: sigmoid(-2) ~= 0.12, allowing the model to
-        # retain baseline RGB behavior while learning when semantics help.
-        nn.init.constant_(self._gate[-1].bias, gate_bias)
+        nn.init.trunc_normal_(self._position, std=0.02)
+        nn.init.normal_(self._token_out.weight, mean=0.0, std=output_init)
+        # Conservative start: selected patches initially alter RGB features only
+        # slightly, preserving the behavior of the baseline encoder.
+        nn.init.constant_(self._token_gate[-1].bias, -2.0)
         self._last_metrics = {}
 
     def forward(self, obs):
-        rgb_embed = self._base(obs)
-        semantic = obs[self._key].float().detach()
-        if self._normalize_input:
-            semantic = F.normalize(semantic, dim=-1, eps=1e-6)
-
-        rgb_context = self._rgb_norm(self._rgb_proj(rgb_embed))
-        semantic_context = self._semantic_norm(self._semantic_proj(semantic))
-        gate = torch.sigmoid(
-            self._gate(torch.cat([rgb_context, semantic_context], dim=-1))
+        cnn_inputs = torch.cat(
+            [obs[key] for key in self._base.cnn_shapes], dim=-1
         )
-        semantic_value = self._semantic_value(semantic_context)
-        delta = self._fusion_out(gate * semantic_value)
-        fused = rgb_embed + self._residual_scale * delta
+        raw_tokens = self._base._cnn.forward_tokens(cnn_inputs)
+        prefix = raw_tokens.shape[:-2]
+        token_count, token_dim = raw_tokens.shape[-2:]
+
+        task = obs[self._task_key].float().detach()
+        if self._normalize_task:
+            task = F.normalize(task, dim=-1, eps=1e-6)
+
+        patch = self._patch_norm(self._patch_proj(raw_tokens))
+        patch = patch + self._position.reshape(
+            (1,) * len(prefix) + self._position.shape[1:]
+        )
+        query = self._task_norm(self._task_proj(task))
+        patch_unit = F.normalize(patch, dim=-1, eps=1e-6)
+        query_unit = F.normalize(query, dim=-1, eps=1e-6)
+        scores = torch.sum(
+            patch_unit * query_unit.unsqueeze(-2), dim=-1
+        ) / self._temperature
+        soft_weights = torch.softmax(scores, dim=-1)
+
+        top_values, top_indices = torch.topk(
+            soft_weights, self._topk, dim=-1
+        )
+        mask = torch.zeros_like(soft_weights).scatter(
+            -1, top_indices, 1.0
+        )
+        selected_weights = soft_weights * mask
+        selected_mass = selected_weights.sum(dim=-1, keepdim=True)
+        selected_weights = selected_weights / (selected_mass + 1e-8)
+
+        query_tokens = query.unsqueeze(-2).expand_as(patch)
+        gate = torch.sigmoid(
+            self._token_gate(torch.cat([patch, query_tokens], dim=-1))
+        )
+        delta = self._token_out(gate * self._value(patch))
+        # Multiplying by top-K keeps the average selected-token modulation near
+        # one while non-selected patches remain exactly baseline RGB tokens.
+        strength = (selected_weights * self._topk).unsqueeze(-1)
+        refined_tokens = (
+            raw_tokens + self._residual_scale * strength * delta
+        )
+        cnn_embed = refined_tokens.reshape(prefix + (token_count * token_dim,))
+
+        outputs = [cnn_embed]
+        if self._base.mlp_shapes:
+            mlp_inputs = torch.cat(
+                [obs[key] for key in self._base.mlp_shapes], dim=-1
+            )
+            outputs.append(self._base._mlp(mlp_inputs))
+        fused = torch.cat(outputs, dim=-1)
 
         with torch.no_grad():
-            rgb_rms = torch.sqrt(torch.mean(rgb_embed.detach() ** 2) + 1e-8)
-            delta_rms = torch.sqrt(torch.mean(delta.detach() ** 2) + 1e-8)
+            raw_rms = torch.sqrt(torch.mean(raw_tokens.detach() ** 2) + 1e-8)
+            applied_delta = self._residual_scale * strength * delta
+            delta_rms = torch.sqrt(
+                torch.mean(applied_delta.detach() ** 2) + 1e-8
+            )
+            entropy = -torch.sum(
+                soft_weights.detach()
+                * torch.log(soft_weights.detach() + 1e-8),
+                dim=-1,
+            )
             self._last_metrics = {
-                "mineclip_gate_mean": gate.detach().mean(),
-                "mineclip_gate_std": gate.detach().std(unbiased=False),
-                "mineclip_embedding_norm": semantic.detach().norm(dim=-1).mean(),
-                "mineclip_delta_ratio": delta_rms / rgb_rms,
+                "task_patch_entropy": entropy.mean(),
+                "task_patch_top1": top_values[..., 0].detach().mean(),
+                "task_patch_topk_mass": selected_mass.detach().mean(),
+                "task_patch_gate_mean": gate.detach().mean(),
+                "task_patch_delta_ratio": delta_rms / raw_rms,
             }
         return fused
 
@@ -546,21 +620,30 @@ class ConvEncoder(nn.Module):
             out_dim *= 2
             h, w = h // 2, w // 2
 
-        self.outdim = out_dim // 2 * h * w
+        self.token_dim = out_dim // 2
+        self.token_height = h
+        self.token_width = w
+        self.token_count = h * w
+        self.outdim = self.token_dim * self.token_count
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
 
-    def forward(self, obs):
-        obs -= 0.5
-        # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
-        x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
-        # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
+    def forward_tokens(self, obs):
+        """Return the final spatial CNN map as patch tokens [..., N, C]."""
+        prefix_shape = list(obs.shape[:-3])
+        x = obs - 0.5
+        x = x.reshape((-1,) + tuple(obs.shape[-3:]))
         x = x.permute(0, 3, 1, 2)
         x = self.layers(x)
-        # (batch * time, ...) -> (batch * time, -1)
-        x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
-        # (batch * time, -1) -> (batch, time, -1)
-        return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
+        # N = H' * W'; preserve spatial token identity until task selection.
+        x = x.permute(0, 2, 3, 1).reshape(
+            x.shape[0], self.token_count, self.token_dim
+        )
+        return x.reshape(prefix_shape + [self.token_count, self.token_dim])
+
+    def forward(self, obs):
+        tokens = self.forward_tokens(obs)
+        return tokens.reshape(list(obs.shape[:-3]) + [self.outdim])
 
 
 class ConvDecoder(nn.Module):

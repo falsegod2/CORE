@@ -74,9 +74,9 @@ class AgentWrapper(Wrapper, ABC):
             "is_last": spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
             "is_terminal": spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
             "mineclip_reward": spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
-            # Frozen global temporal MineCLIP feature emitted by ClipWrapper.
-            # float16 limits replay growth; WorldModel.preprocess casts it to float32.
-            "mineclip_embedding": spaces.Box(
+            # Frozen MineCLIP text feature for the active task. It is constant
+            # within an environment/task and stored in float16 in replay.
+            "task_embedding": spaces.Box(
                 -np.inf, np.inf, (512,), dtype=np.float16
             ),
         })
@@ -126,8 +126,8 @@ class AgentWrapper(Wrapper, ABC):
             "is_last": np.asarray(obs["is_last"], dtype=np.uint8),
             "is_terminal": np.asarray(obs["is_terminal"], dtype=np.uint8),
             "mineclip_reward": np.asarray(obs.get("mineclip_reward", 0.0), dtype=np.float32),
-            "mineclip_embedding": np.asarray(
-                obs.get("mineclip_embedding", np.zeros((512,), dtype=np.float16)),
+            "task_embedding": np.asarray(
+                obs.get("task_embedding", np.zeros((512,), dtype=np.float16)),
                 dtype=np.float16,
             ),
         }

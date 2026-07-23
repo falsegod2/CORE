@@ -5,7 +5,6 @@ import types
 from types import SimpleNamespace
 
 import numpy as np
-import torch
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,11 +26,11 @@ class ObsSpace:
             key: Space(shape)
             for key, shape in {
                 "image": (64, 64, 3),
+                "task_embedding": (512,),
                 "is_first": (1,),
                 "is_last": (1,),
                 "is_terminal": (1,),
                 "mineclip_reward": (1,),
-                "mineclip_embedding": (512,),
             }.items()
         }
 
@@ -43,9 +42,15 @@ config.update(
     model_lr=1e-4, grad_clip=100.0, opt_eps=1e-8,
     weight_decay=0.0,
 )
-config["encoder"] = dict(config["encoder"], cnn_depth=8, mlp_layers=2, mlp_units=32)
-config["decoder"] = dict(config["decoder"], cnn_depth=8, mlp_layers=2, mlp_units=32)
-config["mineclip_fusion"] = dict(config["mineclip_fusion"], fusion_dim=32, hidden=32)
+config["encoder"] = dict(
+    config["encoder"], cnn_depth=8, mlp_layers=2, mlp_units=32
+)
+config["decoder"] = dict(
+    config["decoder"], cnn_depth=8, mlp_layers=2, mlp_units=32
+)
+config["task_patch_fusion"] = dict(
+    config["task_patch_fusion"], attention_dim=32, hidden=32
+)
 for key in ("reward_head", "end_head", "mineclip_head"):
     config[key] = dict(config[key], layers=2)
 config = SimpleNamespace(**config)
@@ -56,9 +61,13 @@ actions = np.eye(4, dtype=np.float32)[
     np.random.randint(0, 4, size=(batch, time))
 ]
 data = {
-    "image": np.random.randint(0, 256, (batch, time, 64, 64, 3), dtype=np.uint8),
-    "mineclip_embedding": np.random.randn(batch, time, 512).astype(np.float16),
-    "mineclip_reward": (0.01 * np.random.randn(batch, time, 1)).astype(np.float32),
+    "image": np.random.randint(
+        0, 256, (batch, time, 64, 64, 3), dtype=np.uint8
+    ),
+    "task_embedding": np.random.randn(batch, time, 512).astype(np.float16),
+    "mineclip_reward": (
+        0.01 * np.random.randn(batch, time, 1)
+    ).astype(np.float32),
     "action": actions,
     "is_first": np.zeros((batch, time), dtype=np.float32),
     "is_terminal": np.zeros((batch, time), dtype=np.float32),
@@ -68,12 +77,12 @@ data["is_first"][:, 0] = 1.0
 _, _, context, metrics = world_model._train(data)
 assert context["embed"].shape[:2] == (batch, time)
 for key in (
-    "mineclip_gate_mean", "mineclip_gate_std",
-    "mineclip_embedding_norm", "mineclip_delta_ratio",
+    "task_patch_entropy", "task_patch_top1", "task_patch_topk_mass",
+    "task_patch_gate_mean", "task_patch_delta_ratio",
 ):
     assert key in metrics, key
 print(
     "TEST PASSED: world-model update; "
     f"embed={tuple(context['embed'].shape)}, "
-    f"gate_mean={float(metrics['mineclip_gate_mean']):.4f}"
+    f"topk_mass={float(metrics['task_patch_topk_mass']):.4f}"
 )

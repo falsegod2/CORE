@@ -13,8 +13,8 @@ harvest_log_in_plains:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Cut a tree"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       log:
@@ -48,8 +48,8 @@ harvest_water_with_bucket:
         quantity: 1
   clip_specs:
     prompts: ["Obtain water"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       water_bucket:
@@ -78,8 +78,8 @@ harvest_sand:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Obtain sand"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       sand:
@@ -112,8 +112,8 @@ mine_iron_ore:
         quantity: 1
   clip_specs:
     prompts: ["Mine iron ore"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       iron_ore:
@@ -150,8 +150,8 @@ shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       wool:
@@ -335,8 +335,8 @@ test_harvest_log_in_plains:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Cut a tree"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       log:
@@ -370,8 +370,8 @@ test_harvest_water_with_bucket:
         quantity: 1
   clip_specs:
     prompts: ["Obtain water"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       water_bucket:
@@ -400,8 +400,8 @@ test_harvest_sand:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Obtain sand"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       sand:
@@ -434,8 +434,8 @@ test_mine_iron_ore:
         quantity: 1
   clip_specs:
     prompts: ["Mine iron ore"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       iron_ore:
@@ -472,8 +472,8 @@ test_shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
-    emit_embedding: true
-    embedding_dtype: 'float16'
+    emit_task_embedding: true
+    task_embedding_dtype: 'float16'
   reward_specs:
     item_rewards: 
       wool:

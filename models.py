@@ -40,10 +40,10 @@ class WorldModel(nn.Module):
         self._config = config
 
         shapes = {key: tuple(space.shape) for key, space in obs_space.spaces.items()}
-        fusion_config = config.mineclip_fusion
-        if fusion_config.get("enabled", False):
-            self.encoder = networks.GatedMineCLIPEncoder(
-                shapes, config.encoder, fusion_config
+        patch_config = config.task_patch_fusion
+        if patch_config.get("enabled", False):
+            self.encoder = networks.TaskConditionedPatchEncoder(
+                shapes, config.encoder, patch_config
             )
         else:
             self.encoder = networks.MultiEncoder(shapes, **config.encoder)
@@ -207,8 +207,10 @@ class WorldModel(nn.Module):
         metrics["kl"] = to_np(torch.mean(kl_value))
         metrics["model_loss"] = to_np(mean_model_loss)
         if hasattr(self.encoder, "get_metrics"):
-            for name, value in self.encoder.get_metrics().items():
-                metrics[name] = to_np(value)
+            metrics.update({
+                key: to_np(value) if torch.is_tensor(value) else value
+                for key, value in self.encoder.get_metrics().items()
+            })
 
         with torch.cuda.amp.autocast(self._use_amp):
             prior_ent = self.dynamics.get_dist(prior).entropy()
@@ -247,18 +249,16 @@ class WorldModel(nn.Module):
                 obs["reward"], dtype=np.float32
             )
 
-        embedding_key = self._config.mineclip_fusion.get(
-            "key", "mineclip_embedding"
+        task_key = self._config.task_patch_fusion.get(
+            "task_key", "task_embedding"
         )
-        if embedding_key not in obs:
-            # Robust fallback for reset/offline data. New online trajectories
-            # emit a real frozen MineCLIP feature at every non-reset step.
+        if task_key not in obs:
             prefix_shape = np.asarray(obs["image"]).shape[:-3]
-            embedding_dim = int(
-                self._config.mineclip_fusion.get("input_dim", 512)
+            task_dim = int(
+                self._config.task_patch_fusion.get("task_dim", 512)
             )
-            obs[embedding_key] = np.zeros(
-                prefix_shape + (embedding_dim,), dtype=np.float32
+            obs[task_key] = np.zeros(
+                prefix_shape + (task_dim,), dtype=np.float32
             )
 
         return {

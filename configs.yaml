@@ -75,17 +75,18 @@ defaults:
   encoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
 
-  # Frozen 512-D global temporal MineCLIP embedding with gated residual fusion.
-  # The standard RGB encoder and RSSM dimensions are unchanged.
-  mineclip_fusion:
+  # MineCLIP text-conditioned selection/refinement of Dreamer RGB patch tokens.
+  # No global MineCLIP visual embedding, heatmap, or extra reward is introduced.
+  task_patch_fusion:
     enabled: true
-    key: 'mineclip_embedding'
-    input_dim: 512
-    fusion_dim: 256
+    task_key: 'task_embedding'
+    task_dim: 512
+    attention_dim: 256
     hidden: 256
-    normalize_input: true
-    gate_bias: -2.0
-    residual_scale: 0.1
+    topk: 4
+    temperature: 0.2
+    normalize_task: true
+    residual_scale: 0.05
     output_init: 0.001
   decoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}

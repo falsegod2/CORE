@@ -9,4 +9,4 @@ export MINEDOJO_HEADLESS=1
 python expr.py \
     --configs minedojo \
     --task minedojo_$1 \
-    --logdir ./logdir
+    --logdir ./logdir_task_patch

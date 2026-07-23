@@ -11,8 +11,8 @@ class ClipWrapper(Wrapper):
         dense_reward=.01,
         smoothing=1,
         target_object='log',
-        emit_embedding=True,
-        embedding_dtype='float16',
+        emit_task_embedding=True,
+        task_embedding_dtype='float16',
         **kwargs,
     ):
         super().__init__(env)
@@ -31,24 +31,28 @@ class ClipWrapper(Wrapper):
         self._expl_clip_state = None, None
         self.last_score = 0
         self.expl_last_score = 0
-        self.emit_embedding = bool(emit_embedding)
-        self.embedding_dim = int(self.clip.feature_dim)
-        if embedding_dtype not in ('float16', 'float32'):
-            raise ValueError(f"Unsupported MineCLIP embedding dtype: {embedding_dtype}")
-        self.embedding_dtype = embedding_dtype
+        self.emit_task_embedding = bool(emit_task_embedding)
+        self.task_embedding_dim = int(self.clip.feature_dim)
+        if task_embedding_dtype not in ('float16', 'float32'):
+            raise ValueError(
+                f"Unsupported task embedding dtype: {task_embedding_dtype}"
+            )
+        self.task_embedding_dtype = task_embedding_dtype
+        # Text is constant for a task, so encode it exactly once.
+        self._task_embedding = self.clip.get_task_embedding(self.prompt)
 
-    def _zero_embedding(self):
+    def _format_task_embedding(self):
         import numpy as np
-        dtype = np.float16 if self.embedding_dtype == 'float16' else np.float32
-        return np.zeros((self.embedding_dim,), dtype=dtype)
-
-    def _format_embedding(self, embedding):
-        import numpy as np
-        dtype = np.float16 if self.embedding_dtype == 'float16' else np.float32
-        array = embedding.detach().cpu().numpy().astype(dtype, copy=False)
-        if array.shape != (self.embedding_dim,):
+        dtype = (
+            np.float16
+            if self.task_embedding_dtype == 'float16'
+            else np.float32
+        )
+        array = self._task_embedding.numpy().astype(dtype, copy=False)
+        if array.shape != (self.task_embedding_dim,):
             raise RuntimeError(
-                f"Expected MineCLIP embedding ({self.embedding_dim},), got {array.shape}"
+                f"Expected task embedding ({self.task_embedding_dim},), "
+                f"got {array.shape}"
             )
         return array
 
@@ -62,24 +66,19 @@ class ClipWrapper(Wrapper):
 
         obs = self.env.reset(**kwargs)
         obs['mineclip_reward'] = 0.0
-        # No MineCLIP video feature has been computed at reset. Using zero here
-        # avoids an additional MineCLIP pass and leaves the reward trajectory
-        # exactly unchanged from the baseline implementation.
-        if self.emit_embedding:
-            obs['mineclip_embedding'] = self._zero_embedding()
+        if self.emit_task_embedding:
+            obs['task_embedding'] = self._format_task_embedding()
 
         return obs
     
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
+        if self.emit_task_embedding:
+            obs['task_embedding'] = self._format_task_embedding()
 
         if len(self.prompt) > 0:
-            logits, self._clip_state, global_embedding = self.clip.get_logits_and_embedding(
-                obs, self.prompt, self._clip_state
-            )
+            logits, self._clip_state = self.clip.get_logits(obs, self.prompt, self._clip_state)
             logits = logits.detach().cpu()
-            if self.emit_embedding:
-                obs['mineclip_embedding'] = self._format_embedding(global_embedding)
 
             self.buffer = self._insert_buffer(self.buffer, logits[:1])
             score = self._get_score()
@@ -93,8 +92,6 @@ class ClipWrapper(Wrapper):
 
         else:
             obs['mineclip_reward'] = 0.0
-            if self.emit_embedding:
-                obs['mineclip_embedding'] = self._zero_embedding()
     
         if len(self.expl_prompt) > 0:
             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)
