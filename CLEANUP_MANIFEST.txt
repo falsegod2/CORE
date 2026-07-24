@@ -1,22 +1,22 @@
-Active method:
-RGB DreamerV3 + MineCLIP reward + frozen task/video-semantic-conditioned object tokens.
+Variant: DreamerV3 + Competitive Task-Relevant Object Tokens V2
 
-Semantic inputs:
-- task_embedding: frozen MineCLIP text feature
-- mineclip_embedding: frozen global video feature reused from reward scoring
-- neither feature is decoded or optimized by RL gradients
+Kept:
+- single-stream DreamerV3 RSSM
+- RGB reconstruction
+- environment reward prediction
+- MineCLIP reward prediction and shaping
+- frozen MineCLIP task/video semantic observations
+- task-relevant RGB patch candidate selection
+- two competitive object queries
+- balanced Sinkhorn object-patch assignment
+- global-only MineCLIP semantic alignment
 
-Absent from the active training path:
-- heatmap / affordance map input
+Removed / absent:
+- heatmap and affordance map
 - affordance intrinsic reward
-- zoomed image or long-term jump
-- S/Z split and inverse dynamics
+- long-term/jumpy transitions
+- S/Z latent split
+- inverse dynamics
 - pure unsupervised Slot Attention
-- direct global MineCLIP-to-RSSM concatenation
-
-Object-token implementation:
-- task/state semantic candidate selection
-- task/state-conditioned object queries
-- task-relevant scene token
-- coverage, diversity, and semantic-alignment regularization
-- conservative residual injection into the unchanged RGB token grid
+- V1 independent object softmax
+- V1 pooled-object global semantic alignment

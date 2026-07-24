@@ -75,10 +75,10 @@ defaults:
   encoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
 
-  # Task-relevant object tokens. Frozen MineCLIP text and the already-computed
-  # global video embedding condition candidate selection and object queries.
-  # The global feature is a detached semantic teacher/condition, not a direct
-  # RSSM input. No pure Slot Attention, heatmap, or extra reward is introduced.
+  # Task-relevant object tokens V2. Frozen MineCLIP text/video semantics
+  # produce a softened candidate prior, while object queries compete through a
+  # balanced Sinkhorn assignment. Only the global scene token is semantically
+  # aligned; individual objects remain free to specialize.
   task_object_tokens:
     enabled: true
     task_key: 'task_embedding'
@@ -87,18 +87,21 @@ defaults:
     visual_dim: 512
     object_dim: 256
     hidden: 256
-    num_objects: 4
-    candidate_topk: 8
+    num_objects: 2
+    candidate_topk: 6
     object_iters: 2
-    relevance_temperature: 0.2
+    relevance_temperature: 0.5
     attention_temperature: 0.5
-    relevance_bias: 2.0
+    relevance_bias: 0.25
+    assignment_uniform_mix: 0.5
+    sinkhorn_iters: 4
     normalize_task: true
-    residual_scale: 0.05
+    residual_scale: 0.03
     output_init: 0.001
-    coverage_scale: 0.02
+    competition_entropy_scale: 0.01
     diversity_scale: 0.005
-    semantic_align_scale: 0.02
+    feature_diversity_scale: 0.005
+    global_semantic_align_scale: 0.02
   decoder:
     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
 

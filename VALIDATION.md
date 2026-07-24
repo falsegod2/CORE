@@ -1,18 +1,19 @@
-# Validation status
+# Validation
 
-Completed in the artifact environment:
+Completed in the build environment:
 
-- Python syntax compilation for the full source tree;
+- full Python syntax compilation;
 - YAML parsing;
-- static audit of the active training path;
-- task-object encoder forward/backward test;
-- stop-gradient test for MineCLIP task embedding;
-- complete WorldModel optimization step with object auxiliary losses.
+- static architecture audit;
+- competitive object encoder forward/backward pass;
+- frozen task/video embedding gradient check;
+- Sinkhorn row/column marginal checks;
+- auxiliary-loss backward pass;
+- full synthetic DreamerV3 world-model optimization step.
 
 Not completed here:
 
-- MineDojo/Minecraft end-to-end launch;
-- full MineCLIP runtime integration in a live environment;
-- long training or performance comparison.
-
-Run the three scripts listed in README after installing the project environment.
+- MineDojo/Minecraft environment startup;
+- real MineCLIP checkpoint execution;
+- long-duration GPU training;
+- proof that learned objects correspond to human-interpretable entities.

@@ -335,14 +335,14 @@ class MultiEncoder(nn.Module):
 
 
 class TaskRelevantObjectEncoder(nn.Module):
-    """Task-guided object tokens built from Dreamer RGB patch features.
+    """V2 task-relevant object tokens with competitive balanced binding.
 
-    This is deliberately not pure unsupervised Slot Attention. The frozen
-    MineCLIP task embedding first identifies task-relevant spatial candidates.
-    A small set of task-conditioned object queries then aggregates only those
-    candidates. The resulting object tokens are projected back to the spatial
-    RGB token grid through a conservative residual path, so the RSSM input size
-    and the baseline Dreamer visual stream remain unchanged.
+    The frozen MineCLIP task and video embeddings provide a state-dependent
+    semantic prior over trainable Dreamer RGB patches. Unlike V1, object
+    queries do not independently softmax over patches. A log-space Sinkhorn
+    assignment enforces competition between objects and balanced object usage.
+    Only a task-relevant global scene token is aligned to the global MineCLIP
+    video embedding; individual object tokens are free to specialize.
     """
 
     def __init__(self, shapes, encoder_config, object_config):
@@ -362,32 +362,39 @@ class TaskRelevantObjectEncoder(nn.Module):
         self._visual_dim = int(object_config.get("visual_dim", 512))
         self._object_dim = int(object_config.get("object_dim", 256))
         self._hidden = int(object_config.get("hidden", 256))
-        self._num_objects = int(object_config.get("num_objects", 4))
-        self._candidate_topk = int(object_config.get("candidate_topk", 8))
+        self._num_objects = int(object_config.get("num_objects", 2))
+        self._candidate_topk = int(object_config.get("candidate_topk", 6))
         self._object_iters = int(object_config.get("object_iters", 2))
         self._relevance_temperature = float(
-            object_config.get("relevance_temperature", 0.2)
+            object_config.get("relevance_temperature", 0.5)
         )
         self._attention_temperature = float(
             object_config.get("attention_temperature", 0.5)
         )
         self._relevance_bias = float(
-            object_config.get("relevance_bias", 2.0)
+            object_config.get("relevance_bias", 0.25)
         )
+        self._assignment_uniform_mix = float(
+            object_config.get("assignment_uniform_mix", 0.5)
+        )
+        self._sinkhorn_iters = int(object_config.get("sinkhorn_iters", 4))
         self._residual_scale = float(
-            object_config.get("residual_scale", 0.05)
+            object_config.get("residual_scale", 0.03)
         )
         self._normalize_task = bool(
             object_config.get("normalize_task", True)
         )
-        self._coverage_scale = float(
-            object_config.get("coverage_scale", 0.02)
+        self._competition_entropy_scale = float(
+            object_config.get("competition_entropy_scale", 0.002)
         )
         self._diversity_scale = float(
-            object_config.get("diversity_scale", 0.005)
+            object_config.get("diversity_scale", 0.001)
         )
-        self._semantic_align_scale = float(
-            object_config.get("semantic_align_scale", 0.02)
+        self._feature_diversity_scale = float(
+            object_config.get("feature_diversity_scale", 0.001)
+        )
+        self._global_semantic_align_scale = float(
+            object_config.get("global_semantic_align_scale", 0.02)
         )
         output_init = float(object_config.get("output_init", 1e-3))
 
@@ -403,21 +410,25 @@ class TaskRelevantObjectEncoder(nn.Module):
                 f"Observation '{self._visual_key}' must have shape "
                 f"({self._visual_dim},), got {visual_shape}"
             )
-        if self._num_objects < 1:
-            raise ValueError("num_objects must be at least 1")
+        if self._num_objects < 2:
+            raise ValueError("V2 requires at least two competing objects")
         if self._object_iters < 1:
             raise ValueError("object_iters must be at least 1")
+        if self._sinkhorn_iters < 1:
+            raise ValueError("sinkhorn_iters must be at least 1")
         if self._relevance_temperature <= 0:
             raise ValueError("relevance_temperature must be positive")
         if self._attention_temperature <= 0:
             raise ValueError("attention_temperature must be positive")
+        if not 0.0 <= self._assignment_uniform_mix <= 1.0:
+            raise ValueError("assignment_uniform_mix must be in [0, 1]")
 
         token_dim = self._base._cnn.token_dim
         token_count = self._base._cnn.token_count
-        if not 1 <= self._candidate_topk <= token_count:
+        if not self._num_objects <= self._candidate_topk <= token_count:
             raise ValueError(
-                f"candidate_topk must be in [1, {token_count}], "
-                f"got {self._candidate_topk}"
+                "candidate_topk must be at least num_objects and no larger "
+                f"than {token_count}; got {self._candidate_topk}"
             )
         self._token_count = token_count
         self._token_dim = token_dim
@@ -458,7 +469,7 @@ class TaskRelevantObjectEncoder(nn.Module):
         self._global_to_rgb = nn.Linear(
             self._object_dim, token_dim, bias=False
         )
-        self._object_semantic = nn.Linear(
+        self._global_semantic = nn.Linear(
             self._object_dim, self._visual_dim, bias=False
         )
         self._patch_gate = nn.Sequential(
@@ -491,7 +502,7 @@ class TaskRelevantObjectEncoder(nn.Module):
         nn.init.trunc_normal_(self._position, std=0.02)
         nn.init.normal_(self._object_to_rgb.weight, mean=0.0, std=output_init)
         nn.init.normal_(self._global_to_rgb.weight, mean=0.0, std=output_init)
-        self._object_semantic.apply(tools.weight_init)
+        self._global_semantic.apply(tools.weight_init)
         nn.init.constant_(self._patch_gate[-1].bias, -2.0)
 
         self._last_metrics = {}
@@ -499,6 +510,49 @@ class TaskRelevantObjectEncoder(nn.Module):
 
     def _broadcast_parameter(self, parameter, prefix_rank):
         return parameter.reshape((1,) * prefix_rank + parameter.shape[1:])
+
+    def _sinkhorn_assignment(self, logits, column_prior, candidate_mask):
+        """Balanced object-patch assignment in log space.
+
+        The returned assignment has total mass one, approximately uniform row
+        mass (each object receives 1/K), and column mass equal to the softened
+        task-relevance prior. This makes patches compete across objects before
+        each object normalizes its own attention distribution.
+        """
+        dtype = logits.dtype
+        neg_large = torch.finfo(dtype).min / 4
+        log_scores = torch.where(
+            candidate_mask.unsqueeze(-2).bool(),
+            logits,
+            torch.full_like(logits, neg_large),
+        )
+        log_row_target = torch.full_like(
+            logits[..., :, 0], -math.log(float(self._num_objects))
+        )
+        log_col_target = torch.log(column_prior.clamp_min(1e-8))
+        log_col_target = torch.where(
+            candidate_mask.bool(),
+            log_col_target,
+            torch.full_like(log_col_target, neg_large),
+        )
+        log_u = torch.zeros_like(log_row_target)
+        log_v = torch.zeros_like(log_col_target)
+        for _ in range(self._sinkhorn_iters):
+            log_u = log_row_target - torch.logsumexp(
+                log_scores + log_v.unsqueeze(-2), dim=-1
+            )
+            log_v = log_col_target - torch.logsumexp(
+                log_scores + log_u.unsqueeze(-1), dim=-2
+            )
+        log_assignment = (
+            log_scores + log_u.unsqueeze(-1) + log_v.unsqueeze(-2)
+        )
+        assignment = torch.exp(log_assignment)
+        assignment = assignment * candidate_mask.unsqueeze(-2)
+        assignment = assignment / (
+            assignment.sum(dim=(-2, -1), keepdim=True) + 1e-8
+        )
+        return assignment
 
     def forward(self, obs):
         cnn_inputs = torch.cat(
@@ -545,6 +599,14 @@ class TaskRelevantObjectEncoder(nn.Module):
         candidate_weights = relevance * candidate_mask
         candidate_mass = candidate_weights.sum(dim=-1, keepdim=True)
         candidate_weights = candidate_weights / (candidate_mass + 1e-8)
+        candidate_uniform = candidate_mask / float(self._candidate_topk)
+        assignment_prior = (
+            (1.0 - self._assignment_uniform_mix) * candidate_weights
+            + self._assignment_uniform_mix * candidate_uniform
+        )
+        assignment_prior = assignment_prior / (
+            assignment_prior.sum(dim=-1, keepdim=True) + 1e-8
+        )
 
         task_objects = (
             self._task_to_objects(task)
@@ -555,29 +617,27 @@ class TaskRelevantObjectEncoder(nn.Module):
         )
         objects = self._object_norm(object_seed + task_objects)
 
-        mask_value = torch.finfo(raw_tokens.dtype).min
+        assignment = None
         attention = None
+        competition = None
         for _ in range(self._object_iters):
             object_query = F.normalize(
                 self._object_query(objects), dim=-1, eps=1e-6
             )
             key_unit = F.normalize(patch_key, dim=-1, eps=1e-6)
-            # Cosine attention: queries and keys are unit-normalized, so the
-            # explicit temperature (rather than an additional sqrt(d) factor)
-            # controls how strongly different object queries specialize.
             logits = torch.einsum(
                 "...kd,...nd->...kn", object_query, key_unit
             ) / self._attention_temperature
-            relevance_bias = self._relevance_bias * torch.log(
-                candidate_weights + 1e-8
+            logits = logits + self._relevance_bias * torch.log(
+                assignment_prior.unsqueeze(-2) + 1e-8
             )
-            logits = logits + relevance_bias.unsqueeze(-2)
-            logits = torch.where(
-                candidate_mask.unsqueeze(-2).bool(),
-                logits,
-                torch.full_like(logits, mask_value),
+            assignment = self._sinkhorn_assignment(
+                logits, assignment_prior, candidate_mask
             )
-            attention = torch.softmax(logits, dim=-1)
+            row_mass = assignment.sum(dim=-1, keepdim=True)
+            col_mass = assignment.sum(dim=-2, keepdim=True)
+            attention = assignment / (row_mass + 1e-8)
+            competition = assignment / (col_mass + 1e-8)
             context = torch.einsum(
                 "...kn,...nd->...kd", attention, patch_value
             )
@@ -586,22 +646,19 @@ class TaskRelevantObjectEncoder(nn.Module):
             )
             objects = self._object_norm(objects + update)
 
-        # A scene token preserves task-relevant context that is shared across
-        # objects, while the object tokens specialize through distinct queries.
+        # Global semantics supervise only this task-relevant scene token. The
+        # object tokens are not averaged toward the same MineCLIP target.
         global_token = torch.einsum(
-            "...n,...nd->...d", candidate_weights, patch_value
+            "...n,...nd->...d", assignment_prior, patch_value
         )
 
         object_rgb = self._object_to_rgb(objects)
-        patch_object_weights = attention.transpose(-1, -2)
-        patch_object_weights = patch_object_weights / (
-            patch_object_weights.sum(dim=-1, keepdim=True) + 1e-8
-        )
+        patch_object_weights = competition.transpose(-1, -2)
         object_delta = torch.einsum(
             "...nk,...kc->...nc", patch_object_weights, object_rgb
         )
         global_delta = self._global_to_rgb(global_token).unsqueeze(-2)
-        global_delta = candidate_weights.unsqueeze(-1) * global_delta
+        global_delta = assignment_prior.unsqueeze(-1) * global_delta
 
         task_tokens = task_query.unsqueeze(-2).expand_as(patch_key)
         gate = torch.sigmoid(
@@ -623,55 +680,81 @@ class TaskRelevantObjectEncoder(nn.Module):
             outputs.append(self._base._mlp(mlp_inputs))
         fused = torch.cat(outputs, dim=-1)
 
-        # Auxiliary terms are weak and local to object binding. Coverage keeps
-        # the object set on task-relevant candidates; diversity prevents every
-        # object query from collapsing onto the same patch.
-        coverage = attention.sum(dim=-2)
-        coverage = coverage / (coverage.sum(dim=-1, keepdim=True) + 1e-8)
-        coverage_loss = -torch.sum(
-            candidate_weights * torch.log(coverage + 1e-8), dim=-1
+        # Low competition entropy encourages each candidate patch to select a
+        # specific object. Sinkhorn row constraints prevent all patches from
+        # being captured by a single object.
+        competition_entropy = -torch.sum(
+            competition * torch.log(competition + 1e-8), dim=-2
         )
+        competition_entropy = torch.sum(
+            assignment_prior * competition_entropy, dim=-1
+        )
+
         if self._num_objects > 1:
             attn_unit = F.normalize(attention, p=2, dim=-1, eps=1e-6)
-            gram = torch.einsum(
+            attn_gram = torch.einsum(
                 "...kn,...jn->...kj", attn_unit, attn_unit
+            )
+            object_unit = F.normalize(objects, p=2, dim=-1, eps=1e-6)
+            object_gram = torch.einsum(
+                "...kd,...jd->...kj", object_unit, object_unit
             )
             eye = torch.eye(
                 self._num_objects,
-                device=gram.device,
-                dtype=gram.dtype,
+                device=attention.device,
+                dtype=attention.dtype,
             ).reshape(
                 (1,) * len(prefix)
                 + (self._num_objects, self._num_objects)
             )
-            off_diagonal = gram * (1.0 - eye)
+            off_attn = attn_gram * (1.0 - eye)
+            off_object = object_gram * (1.0 - eye)
+            denom = self._num_objects * (self._num_objects - 1)
             diversity_loss = torch.sum(
-                off_diagonal ** 2, dim=(-2, -1)
-            ) / (self._num_objects * (self._num_objects - 1))
+                off_attn ** 2, dim=(-2, -1)
+            ) / denom
+            feature_diversity_loss = torch.sum(
+                off_object ** 2, dim=(-2, -1)
+            ) / denom
             overlap = torch.sum(
-                off_diagonal.detach(), dim=(-2, -1)
-            ) / (self._num_objects * (self._num_objects - 1))
+                off_attn.detach(), dim=(-2, -1)
+            ) / denom
+            feature_overlap = torch.sum(
+                off_object.detach().abs(), dim=(-2, -1)
+            ) / denom
         else:
-            diversity_loss = torch.zeros_like(coverage_loss)
-            overlap = torch.zeros_like(coverage_loss)
+            zero = torch.zeros_like(competition_entropy)
+            diversity_loss = zero
+            feature_diversity_loss = zero
+            overlap = zero
+            feature_overlap = zero
 
-        object_summary = objects.mean(dim=-2)
         predicted_semantic = F.normalize(
-            self._object_semantic(object_summary), dim=-1, eps=1e-6
+            self._global_semantic(global_token), dim=-1, eps=1e-6
         )
         target_semantic = F.normalize(
             visual_semantic, dim=-1, eps=1e-6
         )
-        semantic_cosine = torch.sum(
+        global_semantic_cosine = torch.sum(
             predicted_semantic * target_semantic, dim=-1
         )
-        semantic_align_loss = (1.0 - semantic_cosine) * visual_valid
+        global_semantic_align_loss = (
+            1.0 - global_semantic_cosine
+        ) * visual_valid
 
         self._last_aux_losses = {
-            "task_object_coverage": self._coverage_scale * coverage_loss,
-            "task_object_diversity": self._diversity_scale * diversity_loss,
-            "task_object_semantic_align": (
-                self._semantic_align_scale * semantic_align_loss
+            "task_object_competition_entropy": (
+                self._competition_entropy_scale * competition_entropy
+            ),
+            "task_object_diversity": (
+                self._diversity_scale * diversity_loss
+            ),
+            "task_object_feature_diversity": (
+                self._feature_diversity_scale * feature_diversity_loss
+            ),
+            "task_object_global_semantic_align": (
+                self._global_semantic_align_scale
+                * global_semantic_align_loss
             ),
         }
 
@@ -688,18 +771,43 @@ class TaskRelevantObjectEncoder(nn.Module):
                 attention.detach() * torch.log(attention.detach() + 1e-8),
                 dim=-1,
             )
+            row_mass = assignment.detach().sum(dim=-1)
+            col_mass = assignment.detach().sum(dim=-2)
+            row_target = torch.full_like(
+                row_mass, 1.0 / float(self._num_objects)
+            )
+            row_error = torch.mean(torch.abs(row_mass - row_target))
+            col_error = torch.mean(
+                torch.abs(col_mass - assignment_prior.detach())
+            )
+            object_usage = row_mass / (row_mass.sum(dim=-1, keepdim=True) + 1e-8)
+            object_usage_entropy = -torch.sum(
+                object_usage * torch.log(object_usage + 1e-8), dim=-1
+            )
             self._last_metrics = {
                 "task_object_relevance_entropy": relevance_entropy.mean(),
                 "task_object_top1": top_values[..., 0].detach().mean(),
                 "task_object_candidate_mass": candidate_mass.detach().mean(),
+                "task_object_assignment_prior_top1": (
+                    assignment_prior.detach().max(dim=-1).values.mean()
+                ),
                 "task_object_attention_entropy": object_entropy.mean(),
                 "task_object_attention_overlap": overlap.mean(),
+                "task_object_feature_overlap": feature_overlap.mean(),
+                "task_object_competition_entropy": (
+                    competition_entropy.detach().mean()
+                ),
+                "task_object_usage_entropy": object_usage_entropy.mean(),
+                "task_object_sinkhorn_row_error": row_error,
+                "task_object_sinkhorn_col_error": col_error,
                 "task_object_gate_mean": gate.detach().mean(),
                 "task_object_delta_ratio": delta_rms / raw_rms,
-                "task_object_coverage_loss": coverage_loss.detach().mean(),
                 "task_object_diversity_loss": diversity_loss.detach().mean(),
-                "task_object_semantic_cosine": (
-                    semantic_cosine.detach() * visual_valid
+                "task_object_feature_diversity_loss": (
+                    feature_diversity_loss.detach().mean()
+                ),
+                "task_object_global_semantic_cosine": (
+                    global_semantic_cosine.detach() * visual_valid
                 ).sum() / (visual_valid.sum() + 1e-8),
                 "task_object_semantic_valid": visual_valid.detach().mean(),
             }
@@ -710,7 +818,6 @@ class TaskRelevantObjectEncoder(nn.Module):
 
     def get_aux_losses(self):
         return dict(self._last_aux_losses)
-
 
 class MultiDecoder(nn.Module):
     def __init__(

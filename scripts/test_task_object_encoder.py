@@ -37,16 +37,20 @@ object_config = {
     "visual_dim": 512,
     "object_dim": 32,
     "hidden": 32,
-    "num_objects": 4,
-    "candidate_topk": 8,
+    "num_objects": 2,
+    "candidate_topk": 6,
     "object_iters": 2,
-    "relevance_temperature": 0.2,
+    "relevance_temperature": 0.5,
     "attention_temperature": 0.5,
-    "relevance_bias": 2.0,
-    "residual_scale": 0.05,
+    "relevance_bias": 0.25,
+    "assignment_uniform_mix": 0.5,
+    "sinkhorn_iters": 4,
+    "residual_scale": 0.03,
     "output_init": 0.001,
-    "coverage_scale": 0.02,
-    "diversity_scale": 0.005,
+    "competition_entropy_scale": 0.002,
+    "diversity_scale": 0.001,
+    "feature_diversity_scale": 0.001,
+    "global_semantic_align_scale": 0.02,
 }
 model = networks.TaskRelevantObjectEncoder(
     shapes, encoder_config, object_config
@@ -60,9 +64,10 @@ out = model(obs)
 assert out.shape == (2, 3, model.outdim), out.shape
 aux = model.get_aux_losses()
 assert set(aux) == {
-    "task_object_coverage",
+    "task_object_competition_entropy",
     "task_object_diversity",
-    "task_object_semantic_align",
+    "task_object_feature_diversity",
+    "task_object_global_semantic_align",
 }
 loss = out.mean() + sum(value.mean() for value in aux.values())
 loss.backward()
@@ -76,14 +81,23 @@ for key in (
     "task_object_relevance_entropy",
     "task_object_top1",
     "task_object_candidate_mass",
+    "task_object_assignment_prior_top1",
     "task_object_attention_entropy",
     "task_object_attention_overlap",
+    "task_object_feature_overlap",
+    "task_object_competition_entropy",
+    "task_object_usage_entropy",
+    "task_object_sinkhorn_row_error",
+    "task_object_sinkhorn_col_error",
     "task_object_gate_mean",
     "task_object_delta_ratio",
-    "task_object_coverage_loss",
     "task_object_diversity_loss",
-    "task_object_semantic_cosine",
+    "task_object_feature_diversity_loss",
+    "task_object_global_semantic_cosine",
     "task_object_semantic_valid",
 ):
     assert key in metrics, key
+assert torch.isfinite(out).all()
+assert float(metrics["task_object_sinkhorn_row_error"]) < 1e-3
+assert float(metrics["task_object_sinkhorn_col_error"]) < 1e-3
 print("PASS", out.shape, {k: float(v) for k, v in metrics.items()})

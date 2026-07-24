@@ -93,16 +93,24 @@ for key in (
     "task_object_relevance_entropy",
     "task_object_candidate_mass",
     "task_object_attention_overlap",
+    "task_object_feature_overlap",
+    "task_object_competition_entropy",
+    "task_object_usage_entropy",
+    "task_object_sinkhorn_row_error",
+    "task_object_sinkhorn_col_error",
     "task_object_delta_ratio",
-    "task_object_coverage_scaled_loss",
+    "task_object_competition_entropy_scaled_loss",
     "task_object_diversity_scaled_loss",
-    "task_object_semantic_align_scaled_loss",
-    "task_object_semantic_cosine",
+    "task_object_feature_diversity_scaled_loss",
+    "task_object_global_semantic_align_scaled_loss",
+    "task_object_global_semantic_cosine",
 ):
     assert key in metrics, key
 print(
-    "TEST PASSED: world-model update; "
+    "TEST PASSED: V2 world-model update; "
     f"embed={tuple(context['embed'].shape)}, "
     f"candidate_mass={float(metrics['task_object_candidate_mass']):.4f}, "
-    f"overlap={float(metrics['task_object_attention_overlap']):.4f}"
+    f"overlap={float(metrics['task_object_attention_overlap']):.4f}, "
+    f"row_error={float(metrics['task_object_sinkhorn_row_error']):.6f}, "
+    f"col_error={float(metrics['task_object_sinkhorn_col_error']):.6f}"
 )
