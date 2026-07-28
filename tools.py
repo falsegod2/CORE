@@ -6,6 +6,7 @@ import pathlib
 import time
 import random
 import wandb
+import copy
 import numpy as np
 import torch
 
@@ -13,10 +14,44 @@ from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
+from collections import defaultdict
+from bisect import insort
 
 
 to_np = lambda x: x.detach().cpu().numpy()
 
+'''删除类 ScoreStorage
+class ScoreStorage:
+    def __init__(self, max_steps=1000):
+        self.data = defaultdict(list)
+        self.max_steps = max_steps
+    
+    def add(self, env_id, step, score_on_zoomed):
+        insort(self.data[env_id], (score_on_zoomed, step))
+    
+    def get_and_remove_less_than(self, env_id, current_step, score):
+        if env_id not in self.data:
+            return []
+        
+        removable_indices = []
+        steps = []
+        for i, (score_on_zoomed, step) in enumerate(self.data[env_id]):
+            if score_on_zoomed < score or (current_step - step >= self.max_steps):
+                removable_indices.append(i)
+                steps.append(step)
+        
+        for index in reversed(removable_indices):
+            del self.data[env_id][index]
+        
+        return steps
+    
+    def remove_all(self, env_id):
+        if env_id in self.data:
+            del self.data[env_id]
+    
+    def count_data_pairs(self, env_id):
+        return len(self.data[env_id])
+'''
 
 def symlog(x):
     return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
@@ -162,14 +197,30 @@ class Logger:
         if self._wandb:
             wandb.finish()
 
-
+'''删除函数 calculate_accumulated_reward
+def calculate_accumulated_reward(rewards, intrinsics, gamma):
+    if len(rewards) == 0:
+        return 0
+    
+    rewards = np.array(rewards)
+    intrinsics = np.array(intrinsics)
+    gammas = np.power(gamma, np.arange(len(rewards)))
+    discounted_rewards = rewards * gammas
+    discounted_intrinsics = intrinsics * gammas
+    total_reward = np.sum(discounted_rewards + discounted_intrinsics)
+    gamma_sum = np.sum(gammas)
+    
+    return total_reward / gamma_sum  
+'''
 def simulate(
     agent,
     envs, 
     cache, 
     directory, 
     logger, 
+    #step_calculator,
     max_steps,
+    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -193,7 +244,7 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            indices = [index for index in indices if information[index].get("real_done", True)]
+            #indices = [index for index in indices if information[index].get("real_done", True)]
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results] 
 
@@ -205,7 +256,11 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
-
+                '''清理 reset 逻辑
+                current_step = 0
+                if t["is_zoomed"] == True:
+                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
+                '''
                 # replace obs with done by initial state
                 obs[index] = result
 
@@ -252,18 +307,34 @@ def simulate(
             transition["success"] = info.get("success", False)
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
+            ''' 清理步进 (step) 逻辑
+            length = len(cache[env.id]["reward"]) 
+            current_step = length - 1
+            if transition["is_zoomed"] == True and not d:
+                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
 
-            information[tmp_index]['real_done'] = True
+            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+            if len(tmp_list) > 0:
+                for ss in tmp_list:
+                    cache[env.id]["jumping_steps"][ss] = current_step - ss
+                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                    cache[env.id]["is_calculated"][ss] = True
 
+            if step_calculator.count_data_pairs(env.id) == 0:
+                information[tmp_index]['real_done'] = True
+            '''
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
+                '''
                 if (not is_eval) and (not information[i].get("real_done", False)):
                     continue
-
+                '''
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-
+                '''清理 done 逻辑
+                step_calculator.remove_all(envs[i].id)
+                '''
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -375,8 +446,18 @@ def convert(value, precision=32):
     else:
         raise NotImplementedError(value.dtype)
     return value.astype(dtype)
+'''删除函数 selective_deepcopy
+def selective_deepcopy(episode):
+    episode_copy = episode.copy()
 
-
+    if "zoomed_image" in episode_copy:
+        episode_copy["zoomed_image"] = copy.deepcopy(episode_copy["zoomed_image"])
+    
+    if "heatmap_on_zoomed" in episode_copy:
+        episode_copy["heatmap_on_zoomed"] = copy.deepcopy(episode_copy["heatmap_on_zoomed"])
+    
+    return episode_copy
+'''
 def save_episodes(directory, episodes):
     directory = pathlib.Path(directory).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
@@ -384,15 +465,43 @@ def save_episodes(directory, episodes):
         length = len(episode["reward"])
         filename = directory / f"{filename}-{length}.npz"
         with io.BytesIO() as f1:
-            episode_copy = episode.copy()
-            np.savez_compressed(f1, **episode_copy)
+            '''清理数据落盘
+            episode_copy = selective_deepcopy(episode)
+            episode_copy = replace_none_with_zeros(episode_copy)
+            '''
+            #**episode_copy换成episode
+            np.savez_compressed(f1, **episode)
             f1.seek(0)
             with filename.open("wb") as f2:
                 f2.write(f1.read())
+            '''清理数据落盘
             del episode_copy
+            '''
     return True
-
-
+'''删除函数 replace_none_with_zeros
+def replace_none_with_zeros(episode):
+    if "image" in episode and episode["image"]:
+        reference_shape = episode["image"][0].shape
+    else:
+        raise ValueError("Image data is missing or malformed in episode.")
+    
+    if "zoomed_image" in episode:
+        episode["zoomed_image"] = [
+            np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
+        ]
+    
+    if "heatmap" in episode and episode["heatmap"]:
+        heatmap_shape = episode["heatmap"][0].shape
+    else:
+        heatmap_shape = None
+    
+    if "heatmap_on_zoomed" in episode and heatmap_shape:
+        episode["heatmap_on_zoomed"] = [
+            np.zeros(heatmap_shape) if hm is None else hm for hm in episode["heatmap_on_zoomed"]
+        ]
+    
+    return episode
+'''
 def from_generator(generator, batch_size):
 
     while True:
@@ -424,14 +533,16 @@ def sample_episodes(episodes, length, seed=0):
             # make sure at least one transition included
             if total < 2:
                 continue
-
-            episode_copy = episode.copy()
-
+            '''清理采样逻辑
+            episode_copy = selective_deepcopy(episode)
+            episode_copy = replace_none_with_zeros(episode_copy)
+            '''
             if not ret:
                 index = int(np_random.randint(0, total - 1))
                 ret = {
                     k: v[index : min(index + length, total)].copy()
-                    for k, v in episode_copy.items()
+                    #episode_copy换成episode，相当于直接使用episode
+                    for k, v in episode.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
@@ -444,13 +555,15 @@ def sample_episodes(episodes, length, seed=0):
                     k: np.append(
                         ret[k], v[index : min(index + possible, total)].copy(), axis=0
                     )
-                    for k, v in episode_copy.items()
+                    for k, v in episode.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
+            '''清理采样逻辑
             del episode_copy
+            '''
         yield ret
 
 
@@ -496,6 +609,7 @@ def load_episodes(directory, limit=None, reverse=True):
             
     print(f"Loading complete! Total episodes: {len(episodes)}, Total steps: {total}")
     return episodes
+
 
 class SampleDist:
     def __init__(self, dist, samples=100):
@@ -791,6 +905,41 @@ def static_scan_for_lambda_return(fn, inputs, start):
     return outputs
 
 
+def lambda_return_for_ls_imagine(reward, value, gamma, end, jumping_steps, accumulated_reward, bootstrap, lambda_, axis):
+    # Setting lambda=1 gives a discounted Monte Carlo return.
+    # Setting lambda=0 gives a fixed 1-step return.
+    # assert reward.shape.ndims == value.shape.ndims, (reward.shape, value.shape)
+    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
+    
+    if isinstance(gamma, (int, float)):
+        gamma = gamma * torch.ones_like(reward)
+
+    dims = list(range(len(reward.shape)))
+    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1 :]
+
+    if axis != 0:
+        reward = reward.permute(dims)
+        value = value.permute(dims)
+        gamma = gamma.permute(dims)
+
+    if bootstrap is None:
+        bootstrap = torch.zeros_like(value[-1])
+    next_values = torch.cat([value[1:], bootstrap[None]], 0)
+
+    new_reward = torch.pow(gamma, jumping_steps-1) * reward + accumulated_reward
+    discount = torch.pow(gamma, jumping_steps)
+            
+    inputs = new_reward + discount * next_values * (1 - lambda_)
+    # returns = static_scan(
+    #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
+    #    (inputs, pcont), bootstrap, reverse=True)
+    # reimplement to optimize performance
+    returns = static_scan_for_lambda_return(
+        lambda agg, cur0, cur1, cur2: (1.0 - cur2) * (cur0 + cur1 * lambda_ * agg), (inputs, discount, end), bootstrap
+    )
+    if axis != 0:
+        returns = returns.permute(dims)
+    return returns
 
 def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
     # Setting lambda=1 gives a discounted Monte Carlo return.
@@ -903,6 +1052,54 @@ def static_scan(fn, inputs, start):
     for index in indices:
         inp = lambda x: (_input[x] for _input in inputs)
         last = fn(last, *inp(index))
+        if flag:
+            if type(last) == type({}):
+                outputs = {
+                    key: value.clone().unsqueeze(0) for key, value in last.items()
+                }
+            else:
+                outputs = []
+                for _last in last:
+                    if type(_last) == type({}):
+                        outputs.append(
+                            {
+                                key: value.clone().unsqueeze(0)
+                                for key, value in _last.items()
+                            }
+                        )
+                    else:
+                        outputs.append(_last.clone().unsqueeze(0))
+            flag = False
+        else:
+            if type(last) == type({}):
+                for key in last.keys():
+                    outputs[key] = torch.cat(
+                        [outputs[key], last[key].unsqueeze(0)], dim=0
+                    )
+            else:
+                for j in range(len(outputs)):
+                    if type(last[j]) == type({}):
+                        for key in last[j].keys():
+                            outputs[j][key] = torch.cat(
+                                [outputs[j][key], last[j][key].unsqueeze(0)], dim=0
+                            )
+                    else:
+                        outputs[j] = torch.cat(
+                            [outputs[j], last[j].unsqueeze(0)], dim=0
+                        )
+    if type(last) == type({}):
+        outputs = [outputs]
+    return outputs
+
+def static_scan_zoomed(fn, inputs, rely):
+    indices = range(inputs[0].shape[0])
+    flag = True
+
+    for index in indices:
+        inp = lambda x: (_input[x] for _input in inputs)
+        rely_on_index = {k: v[index] for k, v in rely[0].items()}
+        last = fn(rely_on_index, *inp(index))
+
         if flag:
             if type(last) == type({}):
                 outputs = {

@@ -11,14 +11,6 @@ import tools
 
 
 class RSSM(nn.Module):
-    """Standard single-stream DreamerV3 recurrent state-space model.
-
-    State dictionary:
-      - deter: deterministic recurrent state h_t
-      - stoch: stochastic categorical/continuous state z_t
-      - logit, or mean/std: distribution parameters
-    """
-
     def __init__(
         self,
         stoch=30,
@@ -37,235 +29,298 @@ class RSSM(nn.Module):
         embed=None,
         device=None,
     ):
-        super().__init__()
-        if num_actions is None or embed is None or device is None:
-            raise ValueError("num_actions, embed, and device must be provided")
-
+        super(RSSM, self).__init__()
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
         self._min_std = min_std
         self._rec_depth = rec_depth
         self._discrete = discrete
+        act = getattr(torch.nn, act)
         self._mean_act = mean_act
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions
+        self._num_actions = num_actions #去掉+ 1
         self._embed = embed
         self._device = device
-        act_fn = getattr(torch.nn, act)
 
-        stoch_size = self._stoch * self._discrete if self._discrete else self._stoch
-        self._img_in_layers = nn.Sequential(
-            nn.Linear(stoch_size + self._num_actions, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        inp_layers = []
+        if self._discrete:
+            inp_dim = self._stoch * self._discrete + self._num_actions # 统一使用 self._num_actions
+            #inp_dim = self._stoch * self._discrete + num_actions + 1
+        else:
+            inp_dim = self._stoch + self._num_actions # 统一使用 self._num_actions
+            #inp_dim = self._stoch + num_actions + 1
+        inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        inp_layers.append(act())
+        self._img_in_layers = nn.Sequential(*inp_layers)
         self._img_in_layers.apply(tools.weight_init)
-
         self._cell = GRUCell(self._hidden, self._deter, norm=norm)
         self._cell.apply(tools.weight_init)
 
-        self._img_out_layers = nn.Sequential(
-            nn.Linear(self._deter, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        img_out_layers = []
+        inp_dim = self._deter
+        img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            img_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        img_out_layers.append(act())
+        self._img_out_layers = nn.Sequential(*img_out_layers)
         self._img_out_layers.apply(tools.weight_init)
 
-        self._obs_out_layers = nn.Sequential(
-            nn.Linear(self._deter + self._embed, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        obs_out_layers = []
+        inp_dim = self._deter + self._embed
+        obs_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            obs_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        obs_out_layers.append(act())
+        self._obs_out_layers = nn.Sequential(*obs_out_layers)
         self._obs_out_layers.apply(tools.weight_init)
 
-        stat_size = self._stoch * self._discrete if self._discrete else 2 * self._stoch
-        self._imgs_stat_layer = nn.Linear(self._hidden, stat_size)
-        self._obs_stat_layer = nn.Linear(self._hidden, stat_size)
-        self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-        self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        if self._discrete:
+            self._imgs_stat_layer = nn.Linear(
+                self._hidden, self._stoch * self._discrete
+            )
+            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
+            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        else:
+            self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
 
         if self._initial == "learned":
-            self.W = nn.Parameter(
-                torch.zeros((1, self._deter), device=torch.device(self._device))
+            self.W = torch.nn.Parameter(
+                torch.zeros((1, self._deter), device=torch.device(self._device)),
+                requires_grad=True,
             )
 
     def initial(self, batch_size):
-        deter = torch.zeros(batch_size, self._deter, device=self._device)
+        deter = torch.zeros(batch_size, self._deter).to(self._device)
         if self._discrete:
-            state = {
-                "logit": torch.zeros(
-                    batch_size, self._stoch, self._discrete, device=self._device
+            state = dict(
+                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
                 ),
-                "stoch": torch.zeros(
-                    batch_size, self._stoch, self._discrete, device=self._device
+                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
                 ),
-                "deter": deter,
-            }
+                deter=deter,
+            )
         else:
-            state = {
-                "mean": torch.zeros(batch_size, self._stoch, device=self._device),
-                "std": torch.zeros(batch_size, self._stoch, device=self._device),
-                "stoch": torch.zeros(batch_size, self._stoch, device=self._device),
-                "deter": deter,
-            }
-
+            state = dict(
+                mean=torch.zeros([batch_size, self._stoch]).to(self._device),
+                std=torch.zeros([batch_size, self._stoch]).to(self._device),
+                stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
+                deter=deter,
+            )
         if self._initial == "zeros":
             return state
-        if self._initial == "learned":
+        elif self._initial == "learned":
             state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
             state["stoch"] = self.get_stoch(state["deter"])
-            stats = self._suff_stats_layer("ims", self._img_out_layers(state["deter"]))
-            state.update(stats)
             return state
-        raise NotImplementedError(self._initial)
+        else:
+            raise NotImplementedError(self._initial)
 
     def observe(self, embed, action, is_first, state=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        # (batch, time, ch) -> (time, batch, ch)
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
+        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
         post, prior = tools.static_scan(
-            lambda prev, prev_action, current_embed, first: self.obs_step(
-                prev[0], prev_action, current_embed, first
+            lambda prev_state, prev_act, embed, is_first: self.obs_step(
+                prev_state[0], prev_act, embed, is_first
             ),
             (action, embed, is_first),
             (state, state),
         )
-        return (
-            {key: swap(value) for key, value in post.items()},
-            {key: swap(value) for key, value in prior.items()},
+
+        # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
+        post = {k: swap(v) for k, v in post.items()}
+        prior = {k: swap(v) for k, v in prior.items()}
+
+        return post, prior
+    '''彻底删除 observe_zoomed 方法
+    def observe_zoomed(self, embed_zoomed, action_zoomed, is_first_zoomed, rely_post, rely_prior):
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        # (batch, time, ch) -> (time, batch, ch)
+        embed_zoomed, action_zoomed, is_first_zoomed = swap(embed_zoomed), swap(action_zoomed), swap(is_first_zoomed)
+
+        rely_post = {k: swap(v) for k, v in rely_post.items()}
+        rely_prior = {k: swap(v) for k, v in rely_prior.items()}
+
+        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
+        post_zoomed, prior_zoomed = tools.static_scan_zoomed(
+            lambda rely_state, prev_act, embed_zoomed, is_first_zoomed: self.obs_step(
+                rely_state, prev_act, embed_zoomed, is_first_zoomed
+            ),
+            (action_zoomed, embed_zoomed, is_first_zoomed), 
+            (rely_post, rely_prior),
         )
 
+        post_zoomed = {k: swap(v) for k, v in post_zoomed.items()}
+        prior_zoomed = {k: swap(v) for k, v in prior_zoomed.items()}
+
+        return post_zoomed, prior_zoomed
+    '''
     def imagine_with_action(self, action, state):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        assert isinstance(state, dict), state
         action = swap(action)
-        prior = tools.static_scan(self.img_step, [action], state)[0]
-        return {key: swap(value) for key, value in prior.items()}
+        prior = tools.static_scan(self.img_step, [action], state)
+        prior = prior[0]
+        prior = {k: swap(v) for k, v in prior.items()}
+        return prior
 
     def get_feat(self, state):
         stoch = state["stoch"]
         if self._discrete:
-            stoch = stoch.reshape(
-                list(stoch.shape[:-2]) + [self._stoch * self._discrete]
-            )
+            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+            stoch = stoch.reshape(shape)
         return torch.cat([stoch, state["deter"]], -1)
 
     def get_dist(self, state, dtype=None):
-        del dtype
         if self._discrete:
-            return torchd.independent.Independent(
-                tools.OneHotDist(
-                    state["logit"], unimix_ratio=self._unimix_ratio
-                ),
-                1,
+            logit = state["logit"]
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
             )
-        return tools.ContDist(
-            torchd.independent.Independent(
-                torchd.normal.Normal(state["mean"], state["std"]), 1
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
             )
-        )
+        return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        batch_size = len(is_first)
-        if prev_state is None or torch.sum(is_first) == batch_size:
-            prev_state = self.initial(batch_size)
-            prev_action = torch.zeros(
-                batch_size, self._num_actions, device=self._device
-            )
-        elif torch.sum(is_first) > 0:
-            first = is_first[:, None]
-            prev_action = prev_action * (1.0 - first)
-            initial = self.initial(batch_size)
-            prev_state = dict(prev_state)
-            for key, value in prev_state.items():
-                first_r = torch.reshape(
-                    first,
-                    first.shape + (1,) * (len(value.shape) - len(first.shape)),
-                )
-                prev_state[key] = value * (1.0 - first_r) + initial[key] * first_r
+        '''清理 obs_step 中的动作维度强行对齐补丁
+        if prev_action is not None and prev_action.shape[-1] != self._num_actions:
+            shape = prev_action.shape
+            new_shape = list(shape[:-1]) + [1]
+            zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
+            prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
+        '''
 
-        prior = self.img_step(prev_state, prev_action, sample=sample)
-        x = self._obs_out_layers(torch.cat([prior["deter"], embed], -1))
+        if prev_state == None or torch.sum(is_first) == len(is_first):
+            prev_state = self.initial(len(is_first))
+            prev_action = torch.zeros((len(is_first), self._num_actions)).to(
+                self._device
+            )
+            # prev_action.requires_grad_()
+        # overwrite the prev_state only where is_first=True
+        elif torch.sum(is_first) > 0:
+            is_first = is_first[:, None]
+            prev_action *= 1.0 - is_first
+            init_state = self.initial(len(is_first))
+            for key, val in prev_state.items():
+                is_first_r = torch.reshape(
+                    is_first,
+                    is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+                )
+                prev_state[key] = (
+                    val * (1.0 - is_first_r) + init_state[key] * is_first_r
+                )
+
+        prior = self.img_step(prev_state, prev_action)
+        x = torch.cat([prior["deter"], embed], -1)
+        # (batch_size, prior_deter + embed) -> (batch_size, hidden)
+        x = self._obs_out_layers(x)
+        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("obs", x)
-        dist = self.get_dist(stats)
-        stoch = dist.sample() if sample else dist.mode()
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
+        # (batch, stoch, discrete_num)
         prev_stoch = prev_state["stoch"]
         if self._discrete:
-            prev_stoch = prev_stoch.reshape(
-                list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            )
-        x = self._img_in_layers(torch.cat([prev_stoch, prev_action], -1))
-        deter = prev_state["deter"]
-        for _ in range(self._rec_depth):
-            x, deter_state = self._cell(x, [deter])
-            deter = deter_state[0]
+            shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+            # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
+            prev_stoch = prev_stoch.reshape(shape)
+        # (batch, stoch * discrete_num) -> (batch, stoch * discrete_num + action)
+        x = torch.cat([prev_stoch, prev_action], -1)
+        # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
+        x = self._img_in_layers(x)
+        for _ in range(self._rec_depth):  # rec depth is not correctly implemented
+            deter = prev_state["deter"]
+            # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
+            x, deter = self._cell(x, [deter])
+            deter = deter[0]  # Keras wraps the state in a list.
+        # (batch, deter) -> (batch, hidden)
         x = self._img_out_layers(x)
+        # (batch, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("ims", x)
-        dist = self.get_dist(stats)
-        stoch = dist.sample() if sample else dist.mode()
-        return {"stoch": stoch, "deter": deter, **stats}
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
+        prior = {"stoch": stoch, "deter": deter, **stats}
+        return prior
 
     def get_stoch(self, deter):
         x = self._img_out_layers(deter)
         stats = self._suff_stats_layer("ims", x)
-        return self.get_dist(stats).mode()
+        dist = self.get_dist(stats)
+        return dist.mode()
 
     def _suff_stats_layer(self, name, x):
-        if name == "ims":
-            x = self._imgs_stat_layer(x)
-        elif name == "obs":
-            x = self._obs_stat_layer(x)
-        else:
-            raise NotImplementedError(name)
-
         if self._discrete:
-            return {
-                "logit": x.reshape(
-                    list(x.shape[:-1]) + [self._stoch, self._discrete]
-                )
-            }
-
-        mean, std = torch.split(x, [self._stoch] * 2, -1)
-        mean = {
-            "none": lambda: mean,
-            "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
-        }[self._mean_act]()
-        std = {
-            "softplus": lambda: F.softplus(std),
-            "abs": lambda: torch.abs(std + 1.0),
-            "sigmoid": lambda: torch.sigmoid(std),
-            "sigmoid2": lambda: 2.0 * torch.sigmoid(std / 2.0),
-        }[self._std_act]()
-        return {"mean": mean, "std": std + self._min_std}
+            if name == "ims":
+                x = self._imgs_stat_layer(x)
+            elif name == "obs":
+                x = self._obs_stat_layer(x)
+            else:
+                raise NotImplementedError
+            logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
+            return {"logit": logit}
+        else:
+            if name == "ims":
+                x = self._imgs_stat_layer(x)
+            elif name == "obs":
+                x = self._obs_stat_layer(x)
+            else:
+                raise NotImplementedError
+            mean, std = torch.split(x, [self._stoch] * 2, -1)
+            mean = {
+                "none": lambda: mean,
+                "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
+            }[self._mean_act]()
+            std = {
+                "softplus": lambda: torch.softplus(std),
+                "abs": lambda: torch.abs(std + 1),
+                "sigmoid": lambda: torch.sigmoid(std),
+                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
+            }[self._std_act]()
+            std = std + self._min_std
+            return {"mean": mean, "std": std}
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         kld = torchd.kl.kl_divergence
-        stop_gradient = lambda state: {
-            key: value.detach() for key, value in state.items()
-        }
+        dist = lambda x: self.get_dist(x)
+        sg = lambda x: {k: v.detach() for k, v in x.items()}
 
-        post_dist = self.get_dist(post)
-        prior_sg_dist = self.get_dist(stop_gradient(prior))
-        post_sg_dist = self.get_dist(stop_gradient(post))
-        prior_dist = self.get_dist(prior)
-
-        if self._discrete:
-            rep_loss = value = kld(post_dist, prior_sg_dist)
-            dyn_loss = kld(post_sg_dist, prior_dist)
-        else:
-            rep_loss = value = kld(post_dist._dist, prior_sg_dist._dist)
-            dyn_loss = kld(post_sg_dist._dist, prior_dist._dist)
-
+        rep_loss = value = kld(
+            dist(post) if self._discrete else dist(post)._dist,
+            dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
+        )
+        dyn_loss = kld(
+            dist(sg(post)) if self._discrete else dist(sg(post))._dist,
+            dist(prior) if self._discrete else dist(prior)._dist,
+        )
+        # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
-        return loss, value, dyn_loss, rep_loss
 
+        return loss, value, dyn_loss, rep_loss
 
 class MultiEncoder(nn.Module):
     def __init__(
@@ -333,491 +388,6 @@ class MultiEncoder(nn.Module):
         outputs = torch.cat(outputs, -1)
         return outputs
 
-
-class TaskRelevantObjectEncoder(nn.Module):
-    """V2 task-relevant object tokens with competitive balanced binding.
-
-    The frozen MineCLIP task and video embeddings provide a state-dependent
-    semantic prior over trainable Dreamer RGB patches. Unlike V1, object
-    queries do not independently softmax over patches. A log-space Sinkhorn
-    assignment enforces competition between objects and balanced object usage.
-    Only a task-relevant global scene token is aligned to the global MineCLIP
-    video embedding; individual object tokens are free to specialize.
-    """
-
-    def __init__(self, shapes, encoder_config, object_config):
-        super().__init__()
-        self._base = MultiEncoder(shapes, **encoder_config)
-        if not self._base.cnn_shapes or not hasattr(self._base, "_cnn"):
-            raise ValueError("Task object tokens require an RGB CNN encoder")
-        if "image" not in self._base.cnn_shapes:
-            raise ValueError("Task object tokens expect the 'image' observation")
-
-        self.outdim = self._base.outdim
-        self._task_key = object_config.get("task_key", "task_embedding")
-        self._task_dim = int(object_config.get("task_dim", 512))
-        self._visual_key = object_config.get(
-            "visual_key", "mineclip_embedding"
-        )
-        self._visual_dim = int(object_config.get("visual_dim", 512))
-        self._object_dim = int(object_config.get("object_dim", 256))
-        self._hidden = int(object_config.get("hidden", 256))
-        self._num_objects = int(object_config.get("num_objects", 2))
-        self._candidate_topk = int(object_config.get("candidate_topk", 6))
-        self._object_iters = int(object_config.get("object_iters", 2))
-        self._relevance_temperature = float(
-            object_config.get("relevance_temperature", 0.5)
-        )
-        self._attention_temperature = float(
-            object_config.get("attention_temperature", 0.5)
-        )
-        self._relevance_bias = float(
-            object_config.get("relevance_bias", 0.25)
-        )
-        self._assignment_uniform_mix = float(
-            object_config.get("assignment_uniform_mix", 0.5)
-        )
-        self._sinkhorn_iters = int(object_config.get("sinkhorn_iters", 4))
-        self._residual_scale = float(
-            object_config.get("residual_scale", 0.03)
-        )
-        self._normalize_task = bool(
-            object_config.get("normalize_task", True)
-        )
-        self._competition_entropy_scale = float(
-            object_config.get("competition_entropy_scale", 0.002)
-        )
-        self._diversity_scale = float(
-            object_config.get("diversity_scale", 0.001)
-        )
-        self._feature_diversity_scale = float(
-            object_config.get("feature_diversity_scale", 0.001)
-        )
-        self._global_semantic_align_scale = float(
-            object_config.get("global_semantic_align_scale", 0.02)
-        )
-        output_init = float(object_config.get("output_init", 1e-3))
-
-        shape = tuple(shapes.get(self._task_key, ()))
-        if shape != (self._task_dim,):
-            raise ValueError(
-                f"Observation '{self._task_key}' must have shape "
-                f"({self._task_dim},), got {shape}"
-            )
-        visual_shape = tuple(shapes.get(self._visual_key, ()))
-        if visual_shape != (self._visual_dim,):
-            raise ValueError(
-                f"Observation '{self._visual_key}' must have shape "
-                f"({self._visual_dim},), got {visual_shape}"
-            )
-        if self._num_objects < 2:
-            raise ValueError("V2 requires at least two competing objects")
-        if self._object_iters < 1:
-            raise ValueError("object_iters must be at least 1")
-        if self._sinkhorn_iters < 1:
-            raise ValueError("sinkhorn_iters must be at least 1")
-        if self._relevance_temperature <= 0:
-            raise ValueError("relevance_temperature must be positive")
-        if self._attention_temperature <= 0:
-            raise ValueError("attention_temperature must be positive")
-        if not 0.0 <= self._assignment_uniform_mix <= 1.0:
-            raise ValueError("assignment_uniform_mix must be in [0, 1]")
-
-        token_dim = self._base._cnn.token_dim
-        token_count = self._base._cnn.token_count
-        if not self._num_objects <= self._candidate_topk <= token_count:
-            raise ValueError(
-                "candidate_topk must be at least num_objects and no larger "
-                f"than {token_count}; got {self._candidate_topk}"
-            )
-        self._token_count = token_count
-        self._token_dim = token_dim
-
-        self._patch_key = nn.Linear(token_dim, self._object_dim, bias=False)
-        self._patch_value = nn.Linear(token_dim, self._object_dim, bias=False)
-        self._task_proj = nn.Linear(
-            self._task_dim, self._object_dim, bias=False
-        )
-        self._visual_proj = nn.Linear(
-            self._visual_dim, self._object_dim, bias=False
-        )
-        self._task_to_objects = nn.Linear(
-            self._task_dim,
-            self._num_objects * self._object_dim,
-            bias=False,
-        )
-        self._visual_to_objects = nn.Linear(
-            self._visual_dim,
-            self._num_objects * self._object_dim,
-            bias=False,
-        )
-        self._object_query = nn.Linear(
-            self._object_dim, self._object_dim, bias=False
-        )
-        self._object_update = nn.Sequential(
-            nn.Linear(2 * self._object_dim, self._hidden),
-            nn.LayerNorm(self._hidden, eps=1e-3),
-            nn.SiLU(),
-            nn.Linear(self._hidden, self._object_dim),
-        )
-        self._object_norm = nn.LayerNorm(self._object_dim, eps=1e-3)
-        self._patch_norm = nn.LayerNorm(self._object_dim, eps=1e-3)
-        self._task_norm = nn.LayerNorm(self._object_dim, eps=1e-3)
-        self._object_to_rgb = nn.Linear(
-            self._object_dim, token_dim, bias=False
-        )
-        self._global_to_rgb = nn.Linear(
-            self._object_dim, token_dim, bias=False
-        )
-        self._global_semantic = nn.Linear(
-            self._object_dim, self._visual_dim, bias=False
-        )
-        self._patch_gate = nn.Sequential(
-            nn.Linear(2 * self._object_dim, self._hidden),
-            nn.LayerNorm(self._hidden, eps=1e-3),
-            nn.SiLU(),
-            nn.Linear(self._hidden, token_dim),
-        )
-
-        self._object_seed = nn.Parameter(
-            torch.zeros(1, self._num_objects, self._object_dim)
-        )
-        self._position = nn.Parameter(
-            torch.zeros(1, token_count, self._object_dim)
-        )
-
-        for module in (
-            self._patch_key,
-            self._patch_value,
-            self._task_proj,
-            self._visual_proj,
-            self._task_to_objects,
-            self._visual_to_objects,
-            self._object_query,
-            self._object_update,
-            self._patch_gate,
-        ):
-            module.apply(tools.weight_init)
-        nn.init.trunc_normal_(self._object_seed, std=0.02)
-        nn.init.trunc_normal_(self._position, std=0.02)
-        nn.init.normal_(self._object_to_rgb.weight, mean=0.0, std=output_init)
-        nn.init.normal_(self._global_to_rgb.weight, mean=0.0, std=output_init)
-        self._global_semantic.apply(tools.weight_init)
-        nn.init.constant_(self._patch_gate[-1].bias, -2.0)
-
-        self._last_metrics = {}
-        self._last_aux_losses = {}
-
-    def _broadcast_parameter(self, parameter, prefix_rank):
-        return parameter.reshape((1,) * prefix_rank + parameter.shape[1:])
-
-    def _sinkhorn_assignment(self, logits, column_prior, candidate_mask):
-        """Balanced object-patch assignment in log space.
-
-        The returned assignment has total mass one, approximately uniform row
-        mass (each object receives 1/K), and column mass equal to the softened
-        task-relevance prior. This makes patches compete across objects before
-        each object normalizes its own attention distribution.
-        """
-        dtype = logits.dtype
-        neg_large = torch.finfo(dtype).min / 4
-        log_scores = torch.where(
-            candidate_mask.unsqueeze(-2).bool(),
-            logits,
-            torch.full_like(logits, neg_large),
-        )
-        log_row_target = torch.full_like(
-            logits[..., :, 0], -math.log(float(self._num_objects))
-        )
-        log_col_target = torch.log(column_prior.clamp_min(1e-8))
-        log_col_target = torch.where(
-            candidate_mask.bool(),
-            log_col_target,
-            torch.full_like(log_col_target, neg_large),
-        )
-        log_u = torch.zeros_like(log_row_target)
-        log_v = torch.zeros_like(log_col_target)
-        for _ in range(self._sinkhorn_iters):
-            log_u = log_row_target - torch.logsumexp(
-                log_scores + log_v.unsqueeze(-2), dim=-1
-            )
-            log_v = log_col_target - torch.logsumexp(
-                log_scores + log_u.unsqueeze(-1), dim=-2
-            )
-        log_assignment = (
-            log_scores + log_u.unsqueeze(-1) + log_v.unsqueeze(-2)
-        )
-        assignment = torch.exp(log_assignment)
-        assignment = assignment * candidate_mask.unsqueeze(-2)
-        assignment = assignment / (
-            assignment.sum(dim=(-2, -1), keepdim=True) + 1e-8
-        )
-        return assignment
-
-    def forward(self, obs):
-        cnn_inputs = torch.cat(
-            [obs[key] for key in self._base.cnn_shapes], dim=-1
-        )
-        raw_tokens = self._base._cnn.forward_tokens(cnn_inputs)
-        prefix = raw_tokens.shape[:-2]
-        prefix_rank = len(prefix)
-        token_count, token_dim = raw_tokens.shape[-2:]
-
-        task = obs[self._task_key].float().detach()
-        visual_semantic = obs[self._visual_key].float().detach()
-        visual_valid = (
-            torch.linalg.vector_norm(visual_semantic, dim=-1) > 1e-6
-        ).to(raw_tokens.dtype)
-        if self._normalize_task:
-            task = F.normalize(task, dim=-1, eps=1e-6)
-            visual_semantic = F.normalize(
-                visual_semantic, dim=-1, eps=1e-6
-            )
-
-        patch_key = self._patch_norm(self._patch_key(raw_tokens))
-        patch_key = patch_key + self._broadcast_parameter(
-            self._position, prefix_rank
-        )
-        patch_value = self._patch_value(raw_tokens)
-        task_query = self._task_norm(
-            self._task_proj(task) + self._visual_proj(visual_semantic)
-        )
-
-        patch_unit = F.normalize(patch_key, dim=-1, eps=1e-6)
-        task_unit = F.normalize(task_query, dim=-1, eps=1e-6)
-        relevance_logits = torch.sum(
-            patch_unit * task_unit.unsqueeze(-2), dim=-1
-        ) / self._relevance_temperature
-        relevance = torch.softmax(relevance_logits, dim=-1)
-
-        top_values, top_indices = torch.topk(
-            relevance, self._candidate_topk, dim=-1
-        )
-        candidate_mask = torch.zeros_like(relevance).scatter(
-            -1, top_indices, 1.0
-        )
-        candidate_weights = relevance * candidate_mask
-        candidate_mass = candidate_weights.sum(dim=-1, keepdim=True)
-        candidate_weights = candidate_weights / (candidate_mass + 1e-8)
-        candidate_uniform = candidate_mask / float(self._candidate_topk)
-        assignment_prior = (
-            (1.0 - self._assignment_uniform_mix) * candidate_weights
-            + self._assignment_uniform_mix * candidate_uniform
-        )
-        assignment_prior = assignment_prior / (
-            assignment_prior.sum(dim=-1, keepdim=True) + 1e-8
-        )
-
-        task_objects = (
-            self._task_to_objects(task)
-            + self._visual_to_objects(visual_semantic)
-        ).reshape(prefix + (self._num_objects, self._object_dim))
-        object_seed = self._broadcast_parameter(
-            self._object_seed, prefix_rank
-        )
-        objects = self._object_norm(object_seed + task_objects)
-
-        assignment = None
-        attention = None
-        competition = None
-        for _ in range(self._object_iters):
-            object_query = F.normalize(
-                self._object_query(objects), dim=-1, eps=1e-6
-            )
-            key_unit = F.normalize(patch_key, dim=-1, eps=1e-6)
-            logits = torch.einsum(
-                "...kd,...nd->...kn", object_query, key_unit
-            ) / self._attention_temperature
-            logits = logits + self._relevance_bias * torch.log(
-                assignment_prior.unsqueeze(-2) + 1e-8
-            )
-            assignment = self._sinkhorn_assignment(
-                logits, assignment_prior, candidate_mask
-            )
-            row_mass = assignment.sum(dim=-1, keepdim=True)
-            col_mass = assignment.sum(dim=-2, keepdim=True)
-            attention = assignment / (row_mass + 1e-8)
-            competition = assignment / (col_mass + 1e-8)
-            context = torch.einsum(
-                "...kn,...nd->...kd", attention, patch_value
-            )
-            update = self._object_update(
-                torch.cat([objects, context], dim=-1)
-            )
-            objects = self._object_norm(objects + update)
-
-        # Global semantics supervise only this task-relevant scene token. The
-        # object tokens are not averaged toward the same MineCLIP target.
-        global_token = torch.einsum(
-            "...n,...nd->...d", assignment_prior, patch_value
-        )
-
-        object_rgb = self._object_to_rgb(objects)
-        patch_object_weights = competition.transpose(-1, -2)
-        object_delta = torch.einsum(
-            "...nk,...kc->...nc", patch_object_weights, object_rgb
-        )
-        global_delta = self._global_to_rgb(global_token).unsqueeze(-2)
-        global_delta = assignment_prior.unsqueeze(-1) * global_delta
-
-        task_tokens = task_query.unsqueeze(-2).expand_as(patch_key)
-        gate = torch.sigmoid(
-            self._patch_gate(torch.cat([patch_key, task_tokens], dim=-1))
-        )
-        applied_delta = self._residual_scale * gate * (
-            object_delta + global_delta
-        )
-        refined_tokens = raw_tokens + applied_delta
-        cnn_embed = refined_tokens.reshape(
-            prefix + (token_count * token_dim,)
-        )
-
-        outputs = [cnn_embed]
-        if self._base.mlp_shapes:
-            mlp_inputs = torch.cat(
-                [obs[key] for key in self._base.mlp_shapes], dim=-1
-            )
-            outputs.append(self._base._mlp(mlp_inputs))
-        fused = torch.cat(outputs, dim=-1)
-
-        # Low competition entropy encourages each candidate patch to select a
-        # specific object. Sinkhorn row constraints prevent all patches from
-        # being captured by a single object.
-        competition_entropy = -torch.sum(
-            competition * torch.log(competition + 1e-8), dim=-2
-        )
-        competition_entropy = torch.sum(
-            assignment_prior * competition_entropy, dim=-1
-        )
-
-        if self._num_objects > 1:
-            attn_unit = F.normalize(attention, p=2, dim=-1, eps=1e-6)
-            attn_gram = torch.einsum(
-                "...kn,...jn->...kj", attn_unit, attn_unit
-            )
-            object_unit = F.normalize(objects, p=2, dim=-1, eps=1e-6)
-            object_gram = torch.einsum(
-                "...kd,...jd->...kj", object_unit, object_unit
-            )
-            eye = torch.eye(
-                self._num_objects,
-                device=attention.device,
-                dtype=attention.dtype,
-            ).reshape(
-                (1,) * len(prefix)
-                + (self._num_objects, self._num_objects)
-            )
-            off_attn = attn_gram * (1.0 - eye)
-            off_object = object_gram * (1.0 - eye)
-            denom = self._num_objects * (self._num_objects - 1)
-            diversity_loss = torch.sum(
-                off_attn ** 2, dim=(-2, -1)
-            ) / denom
-            feature_diversity_loss = torch.sum(
-                off_object ** 2, dim=(-2, -1)
-            ) / denom
-            overlap = torch.sum(
-                off_attn.detach(), dim=(-2, -1)
-            ) / denom
-            feature_overlap = torch.sum(
-                off_object.detach().abs(), dim=(-2, -1)
-            ) / denom
-        else:
-            zero = torch.zeros_like(competition_entropy)
-            diversity_loss = zero
-            feature_diversity_loss = zero
-            overlap = zero
-            feature_overlap = zero
-
-        predicted_semantic = F.normalize(
-            self._global_semantic(global_token), dim=-1, eps=1e-6
-        )
-        target_semantic = F.normalize(
-            visual_semantic, dim=-1, eps=1e-6
-        )
-        global_semantic_cosine = torch.sum(
-            predicted_semantic * target_semantic, dim=-1
-        )
-        global_semantic_align_loss = (
-            1.0 - global_semantic_cosine
-        ) * visual_valid
-
-        self._last_aux_losses = {
-            "task_object_competition_entropy": (
-                self._competition_entropy_scale * competition_entropy
-            ),
-            "task_object_diversity": (
-                self._diversity_scale * diversity_loss
-            ),
-            "task_object_feature_diversity": (
-                self._feature_diversity_scale * feature_diversity_loss
-            ),
-            "task_object_global_semantic_align": (
-                self._global_semantic_align_scale
-                * global_semantic_align_loss
-            ),
-        }
-
-        with torch.no_grad():
-            raw_rms = torch.sqrt(torch.mean(raw_tokens.detach() ** 2) + 1e-8)
-            delta_rms = torch.sqrt(
-                torch.mean(applied_delta.detach() ** 2) + 1e-8
-            )
-            relevance_entropy = -torch.sum(
-                relevance.detach() * torch.log(relevance.detach() + 1e-8),
-                dim=-1,
-            )
-            object_entropy = -torch.sum(
-                attention.detach() * torch.log(attention.detach() + 1e-8),
-                dim=-1,
-            )
-            row_mass = assignment.detach().sum(dim=-1)
-            col_mass = assignment.detach().sum(dim=-2)
-            row_target = torch.full_like(
-                row_mass, 1.0 / float(self._num_objects)
-            )
-            row_error = torch.mean(torch.abs(row_mass - row_target))
-            col_error = torch.mean(
-                torch.abs(col_mass - assignment_prior.detach())
-            )
-            object_usage = row_mass / (row_mass.sum(dim=-1, keepdim=True) + 1e-8)
-            object_usage_entropy = -torch.sum(
-                object_usage * torch.log(object_usage + 1e-8), dim=-1
-            )
-            self._last_metrics = {
-                "task_object_relevance_entropy": relevance_entropy.mean(),
-                "task_object_top1": top_values[..., 0].detach().mean(),
-                "task_object_candidate_mass": candidate_mass.detach().mean(),
-                "task_object_assignment_prior_top1": (
-                    assignment_prior.detach().max(dim=-1).values.mean()
-                ),
-                "task_object_attention_entropy": object_entropy.mean(),
-                "task_object_attention_overlap": overlap.mean(),
-                "task_object_feature_overlap": feature_overlap.mean(),
-                "task_object_competition_entropy": (
-                    competition_entropy.detach().mean()
-                ),
-                "task_object_usage_entropy": object_usage_entropy.mean(),
-                "task_object_sinkhorn_row_error": row_error,
-                "task_object_sinkhorn_col_error": col_error,
-                "task_object_gate_mean": gate.detach().mean(),
-                "task_object_delta_ratio": delta_rms / raw_rms,
-                "task_object_diversity_loss": diversity_loss.detach().mean(),
-                "task_object_feature_diversity_loss": (
-                    feature_diversity_loss.detach().mean()
-                ),
-                "task_object_global_semantic_cosine": (
-                    global_semantic_cosine.detach() * visual_valid
-                ).sum() / (visual_valid.sum() + 1e-8),
-                "task_object_semantic_valid": visual_valid.detach().mean(),
-            }
-        return fused
-
-    def get_metrics(self):
-        return dict(self._last_metrics)
-
-    def get_aux_losses(self):
-        return dict(self._last_aux_losses)
 
 class MultiDecoder(nn.Module):
     def __init__(
@@ -939,30 +509,21 @@ class ConvEncoder(nn.Module):
             out_dim *= 2
             h, w = h // 2, w // 2
 
-        self.token_dim = out_dim // 2
-        self.token_height = h
-        self.token_width = w
-        self.token_count = h * w
-        self.outdim = self.token_dim * self.token_count
+        self.outdim = out_dim // 2 * h * w
         self.layers = nn.Sequential(*layers)
         self.layers.apply(tools.weight_init)
 
-    def forward_tokens(self, obs):
-        """Return the final spatial CNN map as patch tokens [..., N, C]."""
-        prefix_shape = list(obs.shape[:-3])
-        x = obs - 0.5
-        x = x.reshape((-1,) + tuple(obs.shape[-3:]))
+    def forward(self, obs):
+        obs -= 0.5
+        # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
+        x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
+        # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
         x = x.permute(0, 3, 1, 2)
         x = self.layers(x)
-        # N = H' * W'; preserve spatial token identity until task selection.
-        x = x.permute(0, 2, 3, 1).reshape(
-            x.shape[0], self.token_count, self.token_dim
-        )
-        return x.reshape(prefix_shape + [self.token_count, self.token_dim])
-
-    def forward(self, obs):
-        tokens = self.forward_tokens(obs)
-        return tokens.reshape(list(obs.shape[:-3]) + [self.outdim])
+        # (batch * time, ...) -> (batch * time, -1)
+        x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+        # (batch * time, -1) -> (batch, time, -1)
+        return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
 
 
 class ConvDecoder(nn.Module):

@@ -1,5 +1,5 @@
 ############################################
-###       MineDojo task specifications       ###
+###       Env Specs for LS-Imagine       ###
 ############################################
 
 harvest_log_in_plains:
@@ -13,10 +13,9 @@ harvest_log_in_plains:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Cut a tree"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Cut a tree"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains"
   reward_specs:
     item_rewards: 
       log:
@@ -32,7 +31,7 @@ harvest_log_in_plains:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 harvest_water_with_bucket:
@@ -50,10 +49,9 @@ harvest_water_with_bucket:
         quantity: 1
   clip_specs:
     prompts: ["Obtain water"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain water"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_water_with_bucket"
   reward_specs:
     item_rewards: 
       water_bucket:
@@ -69,7 +67,7 @@ harvest_water_with_bucket:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 harvest_sand:
@@ -82,10 +80,9 @@ harvest_sand:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Obtain sand"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain sand"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_sand"
   reward_specs:
     item_rewards: 
       sand:
@@ -101,7 +98,7 @@ harvest_sand:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 mine_iron_ore:
@@ -118,10 +115,9 @@ mine_iron_ore:
         quantity: 1
   clip_specs:
     prompts: ["Mine iron ore"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Mine iron ore"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/mine_iron_ore"
   reward_specs:
     item_rewards: 
       iron_ore:
@@ -137,7 +133,7 @@ mine_iron_ore:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 shear_sheep:
@@ -158,10 +154,9 @@ shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain wool"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/shear_sheep"
   reward_specs:
     item_rewards: 
       wool:
@@ -177,7 +172,7 @@ shear_sheep:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 ############################################
@@ -209,7 +204,7 @@ collect_rollouts_harvest_log_in_plains:
     reset_flag: False
     step_flag: True
     save_freq: 50
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 collect_rollouts_harvest_water_with_bucket:
@@ -237,7 +232,7 @@ collect_rollouts_harvest_water_with_bucket:
     reset_flag: False
     step_flag: True
     save_freq: 50
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 collect_rollouts_harvest_sand:
@@ -264,7 +259,7 @@ collect_rollouts_harvest_sand:
     reset_flag: False
     step_flag: True
     save_freq: 50
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 collect_rollouts_mine_iron_ore:
@@ -295,7 +290,7 @@ collect_rollouts_mine_iron_ore:
     reset_flag: False
     step_flag: True
     save_freq: 50
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 collect_rollouts_shear_sheep:
@@ -326,7 +321,7 @@ collect_rollouts_shear_sheep:
     reset_flag: False
     step_flag: True
     save_freq: 20
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 
@@ -345,10 +340,9 @@ test_harvest_log_in_plains:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Cut a tree"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Cut a tree"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_log_in_plains"
   reward_specs:
     item_rewards: 
       log:
@@ -364,7 +358,7 @@ test_harvest_log_in_plains:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 test_harvest_water_with_bucket:
@@ -382,10 +376,9 @@ test_harvest_water_with_bucket:
         quantity: 1
   clip_specs:
     prompts: ["Obtain water"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain water"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_water_with_bucket"
   reward_specs:
     item_rewards: 
       water_bucket:
@@ -401,7 +394,7 @@ test_harvest_water_with_bucket:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 test_harvest_sand:
@@ -414,10 +407,9 @@ test_harvest_sand:
     break_speed_multiplier: 100
   clip_specs:
     prompts: ["Obtain sand"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain sand"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/harvest_sand"
   reward_specs:
     item_rewards: 
       sand:
@@ -433,7 +425,7 @@ test_harvest_sand:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 test_mine_iron_ore:
@@ -450,10 +442,9 @@ test_mine_iron_ore:
         quantity: 1
   clip_specs:
     prompts: ["Mine iron ore"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Mine iron ore"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/mine_iron_ore"
   reward_specs:
     item_rewards: 
       iron_ore:
@@ -469,7 +460,7 @@ test_mine_iron_ore:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1
 
 test_shear_sheep:
@@ -490,10 +481,9 @@ test_shear_sheep:
         quantity: 1
   clip_specs:
     prompts: ["Obtain wool"]
-    emit_task_embedding: true
-    task_embedding_dtype: 'float16'
-    emit_embedding: true
-    embedding_dtype: 'float16'
+  concentration_specs:
+    prompts: ["Obtain wool"]
+    unet_checkpoint_dir: "affordance_map/finetune_unet/finetune_checkpoints/shear_sheep"
   reward_specs:
     item_rewards: 
       wool:
@@ -509,5 +499,5 @@ test_shear_sheep:
   screenshot_specs:
     reset_flag: False
     step_flag: False
-  agent_specs:
+  LS_Imagine_specs:
     repeat: 1

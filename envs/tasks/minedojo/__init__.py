@@ -4,6 +4,7 @@ from minedojo.tasks import MetaTaskBase, _meta_task_make, _parse_inventory_dict,
 from minedojo.sim import MineDojoSim
 
 from envs.tasks.minedojo.wrappers import *
+'''启动底层 Minecraft 环境并套上各类“任务包装器”的集散地'''
 
 
 def _get_minedojo_specs(task_id, task_specs, sim_specs):
@@ -46,12 +47,13 @@ def _get_minedojo_specs(task_id, task_specs, sim_specs):
 def _add_wrappers(
     env: MetaTaskBase, 
     task_id: str, 
-    agent_specs: Dict = None,
+    LS_Imagine_specs: Dict = None,
     screenshot_specs: Dict = None,
     reward_specs: Dict = None,
     success_specs: Dict = None,
     terminal_specs: Dict = None,
     clip_specs: Dict = None,
+    #concentration_specs: Dict = None,
     fast_reset: int = None,
     log_dir: str = None,
     freeze_equipped: bool = True,
@@ -71,19 +73,20 @@ def _add_wrappers(
     
     env = MinedojoTerminalWrapper(env, **terminal_specs)
 
-    # Add MineCLIP reward shaping. Derive the target item in the same call
-    # that constructs the environment so the setting cannot be lost.
+    
+    # Add reward shaping wrapper
     if clip_specs is not None:
-        clip_specs = dict(clip_specs)
-        if "target_object" not in clip_specs and success_specs:
-            condition = success_specs.get("all") or success_specs.get("any")
-            if condition and "item" in condition:
-                clip_specs["target_object"] = condition["item"]["type"]
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
-
-
-    env = MinedojoAgentWrapper(env, **(agent_specs or {}))
+    
+    '''=== 【删除这整块代码】 ===
+    if concentration_specs is not None:
+        unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
+        gaussian_sigma_weight = concentration_specs["gaussian_sigma_weight"] if "gaussian_sigma_weight" in concentration_specs else 0.5
+        concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight)
+        env = ConcentrationWrapper(env, concentration_reward, **concentration_specs)
+    '''
+    env = MinedojoLSImagineWrapper(env, **LS_Imagine_specs)
 
     # If we don't care about start position, use fast reset to speed training and prevent memory leaks
     if fast_reset is not None:
