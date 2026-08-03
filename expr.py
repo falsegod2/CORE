@@ -113,7 +113,13 @@ class LS_Imagine(nn.Module):
     def _train(self, data):
         metrics = {}
         # 去掉 post_zoomed，只保留纯净的后验状态
-        post, _, context, mets = self._wm._train(data)
+        # Supply the actual environment step as a tensor. This keeps the
+        # curriculum tied to data collection and avoids torch.compile
+        # specializing on a changing Python integer.
+        env_step = torch.as_tensor(
+            self._step, device=self._config.device, dtype=torch.float32
+        )
+        post, _, context, mets = self._wm._train(data, env_step)
         metrics.update(mets)
 
         reward = lambda f, s, a: self._wm.heads["reward"](

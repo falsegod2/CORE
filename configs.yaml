@@ -31,6 +31,47 @@ defaults:
     projection_seed: 314159
     loss_scale: 0.05
 
+  # Experiment 5D: result-aware multi-step latent dynamics.
+  # Disabled by default; enabled by the `outcomeaware5d` profile.
+  outcome_aware_multistep:
+    enabled: false
+    horizons: [1, 2, 4, 8, 15]
+    horizon_weights: [0.25, 0.5, 0.75, 1.0, 1.0]
+    projection_dim: 512
+    starts_per_sequence: 4
+    projection_seed: 314159
+    discount: 0.997
+
+    # Component scales are internal to this objective.
+    absolute_loss_scale: 0.005
+    delta_loss_scale: 0.020
+    return_loss_scale: 0.010
+    return_rank_loss_scale: 0.005
+    action_margin_loss_scale: 0.005
+
+    # Conservative real-vs-shuffled action ranking.
+    action_margin: 0.10
+    action_negative_stop_gradient: true
+    compute_action_gap: true
+
+    # Deterministic auxiliary rollout avoids consuming the global RNG.
+    rollout_sample: false
+    detach_start_state: true
+    delta_min_norm: 1.0e-4
+
+    # Cumulative reward consistency and scale-free return weighting/ranking.
+    return_huber_delta: 1.0
+    return_weight_bonus: 1.0
+    return_weight_cap: 4.0
+    ranking_epsilon: 1.0e-4
+    ranking_temperature: 1.0
+
+    # Environment-step curriculum.
+    global_start_step: 50000
+    global_ramp_steps: 250000
+    horizon_start_steps: [50000, 50000, 50000, 150000, 300000]
+    horizon_ramp_steps: [100000, 100000, 100000, 100000, 100000]
+
   # Environment
   task: 'minedojo'
   size: [64, 64]
@@ -180,3 +221,69 @@ multistep5a:
     starts_per_sequence: 4
     projection_seed: 314159
     loss_scale: 0.05
+
+# Experiment 5D: Outcome-Aware Multi-Step RSSM Dynamics.
+# The original 5A objective is disabled to avoid double-counting absolute
+# consistency; 5D contains a weaker absolute term internally.
+outcomeaware5d:
+  logdir: ./logdir_outcomeaware5d
+  multi_step_consistency:
+    enabled: false
+  outcome_aware_multistep:
+    enabled: true
+    horizons: [1, 2, 4, 8, 15]
+    horizon_weights: [0.25, 0.5, 0.75, 1.0, 1.0]
+    projection_dim: 512
+    starts_per_sequence: 4
+    projection_seed: 314159
+    discount: 0.997
+    absolute_loss_scale: 0.005
+    delta_loss_scale: 0.020
+    return_loss_scale: 0.010
+    return_rank_loss_scale: 0.005
+    action_margin_loss_scale: 0.005
+    action_margin: 0.10
+    action_negative_stop_gradient: true
+    compute_action_gap: true
+    rollout_sample: false
+    detach_start_state: true
+    delta_min_norm: 1.0e-4
+    return_huber_delta: 1.0
+    return_weight_bonus: 1.0
+    return_weight_cap: 4.0
+    ranking_epsilon: 1.0e-4
+    ranking_temperature: 1.0
+    global_start_step: 50000
+    global_ramp_steps: 250000
+    horizon_start_steps: [50000, 50000, 50000, 150000, 300000]
+    horizon_ramp_steps: [100000, 100000, 100000, 100000, 100000]
+
+# Structural ablation: removes action-margin training but still logs action gap.
+outcomeaware5d_nomargin:
+  logdir: ./logdir_outcomeaware5d_nomargin
+  multi_step_consistency:
+    enabled: false
+  outcome_aware_multistep:
+    enabled: true
+    action_margin_loss_scale: 0.0
+    compute_action_gap: true
+
+# Structural ablation: no return ranking, retaining scalar return consistency.
+outcomeaware5d_norank:
+  logdir: ./logdir_outcomeaware5d_norank
+  multi_step_consistency:
+    enabled: false
+  outcome_aware_multistep:
+    enabled: true
+    return_rank_loss_scale: 0.0
+
+# Mechanism ablation: dynamics consistency only, without outcome supervision.
+outcomeaware5d_noreturn:
+  logdir: ./logdir_outcomeaware5d_noreturn
+  multi_step_consistency:
+    enabled: false
+  outcome_aware_multistep:
+    enabled: true
+    return_loss_scale: 0.0
+    return_rank_loss_scale: 0.0
+

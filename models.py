@@ -12,6 +12,7 @@ from torch import nn
 import networks
 import tools
 import multistep_consistency
+import outcome_aware_multistep
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -179,6 +180,49 @@ class WorldModel(nn.Module):
                 projection_dim=int(ms_cfg.get("projection_dim", 512)),
                 starts_per_sequence=int(ms_cfg.get("starts_per_sequence", 4)),
                 projection_seed=int(ms_cfg.get("projection_seed", 314159)),
+            )
+
+        # Experiment 5D: outcome-aware regularization is applied directly to the
+        # standard RSSM open-loop states used by Dreamer imagination. It does not
+        # add a second action-prefix predictor or change actor/critic inputs.
+        oa_cfg = getattr(config, "outcome_aware_multistep", {}) or {}
+        self._outcome_aware_enabled = bool(oa_cfg.get("enabled", False))
+        self._outcome_aware = None
+        if self._outcome_aware_enabled:
+            self._outcome_aware = outcome_aware_multistep.OutcomeAwareMultiStepRSSM(
+                feat_dim=feat_size,
+                horizons=oa_cfg.get("horizons", [1, 2, 4, 8, 15]),
+                horizon_weights=oa_cfg.get(
+                    "horizon_weights", [0.25, 0.5, 0.75, 1.0, 1.0]
+                ),
+                projection_dim=int(oa_cfg.get("projection_dim", 512)),
+                starts_per_sequence=int(oa_cfg.get("starts_per_sequence", 4)),
+                projection_seed=int(oa_cfg.get("projection_seed", 314159)),
+                discount=float(oa_cfg.get("discount", config.discount)),
+                absolute_loss_scale=float(oa_cfg.get("absolute_loss_scale", 0.005)),
+                delta_loss_scale=float(oa_cfg.get("delta_loss_scale", 0.020)),
+                return_loss_scale=float(oa_cfg.get("return_loss_scale", 0.010)),
+                return_rank_loss_scale=float(oa_cfg.get("return_rank_loss_scale", 0.005)),
+                action_margin_loss_scale=float(oa_cfg.get("action_margin_loss_scale", 0.005)),
+                action_margin=float(oa_cfg.get("action_margin", 0.10)),
+                action_negative_stop_gradient=bool(oa_cfg.get("action_negative_stop_gradient", True)),
+                rollout_sample=bool(oa_cfg.get("rollout_sample", False)),
+                detach_start_state=bool(oa_cfg.get("detach_start_state", True)),
+                delta_min_norm=float(oa_cfg.get("delta_min_norm", 1e-4)),
+                return_huber_delta=float(oa_cfg.get("return_huber_delta", 1.0)),
+                return_weight_bonus=float(oa_cfg.get("return_weight_bonus", 1.0)),
+                return_weight_cap=float(oa_cfg.get("return_weight_cap", 4.0)),
+                ranking_epsilon=float(oa_cfg.get("ranking_epsilon", 1e-4)),
+                ranking_temperature=float(oa_cfg.get("ranking_temperature", 1.0)),
+                global_start_step=int(oa_cfg.get("global_start_step", 50000)),
+                global_ramp_steps=int(oa_cfg.get("global_ramp_steps", 250000)),
+                horizon_start_steps=oa_cfg.get(
+                    "horizon_start_steps", [50000, 50000, 50000, 150000, 300000]
+                ),
+                horizon_ramp_steps=oa_cfg.get(
+                    "horizon_ramp_steps", [100000, 100000, 100000, 100000, 100000]
+                ),
+                compute_action_gap=bool(oa_cfg.get("compute_action_gap", True)),
             )
 
         self._model_opt = tools.Optimizer(
@@ -411,7 +455,7 @@ class WorldModel(nn.Module):
         else:
             return post, None, context, metrics
     '''
-    def _train(self, data_origin):
+    def _train(self, data_origin, env_step=None):
         
         data = self.preprocess(data_origin)
 
@@ -466,15 +510,38 @@ class WorldModel(nn.Module):
                         self.dynamics, post, data["action"], data["is_first"]
                     )
 
-                total_loss = torch.mean(model_loss) + \
-                    self._multistep_scale * multistep_loss
+                outcome_aware_metrics = {}
+                outcome_aware_loss = model_loss.mean() * 0.0
+                if self._outcome_aware_enabled:
+                    outcome_aware_loss, outcome_aware_metrics = self._outcome_aware(
+                        dynamics=self.dynamics,
+                        reward_head=self.heads["reward"],
+                        posterior=post,
+                        actions=data["action"],
+                        is_first=data["is_first"],
+                        rewards=data["reward"],
+                        ends=data["end"],
+                        env_step=env_step,
+                    )
+
+                total_loss = (
+                    torch.mean(model_loss)
+                    + self._multistep_scale * multistep_loss
+                    + outcome_aware_loss
+                )
 
             metrics = self._model_opt(total_loss, self.parameters())
 
         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
         metrics.update({name: to_np(value) for name, value in multistep_metrics.items()})
+        metrics.update(
+            {name: to_np(value) for name, value in outcome_aware_metrics.items()}
+        )
         metrics["multistep_scale"] = self._multistep_scale
         metrics["base_model_loss"] = to_np(torch.mean(model_loss))
+        metrics["model_plus_outcome_aware_loss"] = to_np(
+            torch.mean(model_loss) + outcome_aware_loss
+        )
         metrics["kl_free"] = kl_free
         metrics["dyn_scale"] = dyn_scale
         metrics["rep_scale"] = rep_scale
