@@ -982,6 +982,7 @@ class Optimizer:
         wd_pattern=r".*",
         opt="adam",
         use_amp=False,
+        skip_nonfinite=False,
     ):
         assert 0 <= wd < 1
         assert not clip or 1 <= clip
@@ -990,6 +991,7 @@ class Optimizer:
         self._clip = clip
         self._wd = wd
         self._wd_pattern = wd_pattern
+        self._skip_nonfinite = bool(skip_nonfinite)
         self._opt = {
             "adam": lambda: torch.optim.Adam(parameters, lr=lr, eps=eps),
             "nadam": lambda: NotImplemented(f"{opt} is not implemented"),
@@ -1007,6 +1009,23 @@ class Optimizer:
         self._scaler.scale(loss).backward(retain_graph=retain_graph)
         self._scaler.unscale_(self._opt)
         # loss.backward(retain_graph=retain_graph)
+        params = list(params)
+        if self._skip_nonfinite:
+            grad_norms = [
+                parameter.grad.detach().float().norm(2)
+                for parameter in params
+                if parameter.grad is not None
+            ]
+            if grad_norms:
+                raw_norm = torch.stack(grad_norms).norm(2)
+            else:
+                raw_norm = torch.zeros((), device=loss.device)
+            if not bool(torch.isfinite(raw_norm).detach().cpu().item()):
+                self._opt.zero_grad()
+                self._scaler.update()
+                metrics[f"{self._name}_grad_norm"] = raw_norm.detach().cpu().item()
+                metrics[f"{self._name}_step_skipped_nonfinite"] = 1.0
+                return metrics
         norm = torch.nn.utils.clip_grad_norm_(params, self._clip)
         if self._wd:
             self._apply_weight_decay(params)
@@ -1015,6 +1034,7 @@ class Optimizer:
         # self._opt.step()
         self._opt.zero_grad()
         metrics[f"{self._name}_grad_norm"] = norm.item()
+        metrics[f"{self._name}_step_skipped_nonfinite"] = 0.0
         return metrics
 
     def _apply_weight_decay(self, varibs):

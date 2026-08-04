@@ -13,6 +13,7 @@ import networks
 import tools
 import multistep_consistency
 import outcome_aware_multistep
+import gradient_balance
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -207,6 +208,7 @@ class WorldModel(nn.Module):
                 action_margin=float(oa_cfg.get("action_margin", 0.10)),
                 action_negative_stop_gradient=bool(oa_cfg.get("action_negative_stop_gradient", True)),
                 rollout_sample=bool(oa_cfg.get("rollout_sample", False)),
+                preserve_rng_state=bool(oa_cfg.get("preserve_rng_state", False)),
                 detach_start_state=bool(oa_cfg.get("detach_start_state", True)),
                 delta_min_norm=float(oa_cfg.get("delta_min_norm", 1e-4)),
                 return_huber_delta=float(oa_cfg.get("return_huber_delta", 1.0)),
@@ -214,6 +216,7 @@ class WorldModel(nn.Module):
                 return_weight_cap=float(oa_cfg.get("return_weight_cap", 4.0)),
                 ranking_epsilon=float(oa_cfg.get("ranking_epsilon", 1e-4)),
                 ranking_temperature=float(oa_cfg.get("ranking_temperature", 1.0)),
+                ranking_std_floor=float(oa_cfg.get("ranking_std_floor", 0.05)),
                 global_start_step=int(oa_cfg.get("global_start_step", 50000)),
                 global_ramp_steps=int(oa_cfg.get("global_ramp_steps", 250000)),
                 horizon_start_steps=oa_cfg.get(
@@ -225,6 +228,19 @@ class WorldModel(nn.Module):
                 compute_action_gap=bool(oa_cfg.get("compute_action_gap", True)),
             )
 
+        self._outcome_aware_grad_balance = bool(
+            oa_cfg.get("grad_balance_enabled", False)
+        )
+        self._outcome_aware_grad_ratio = float(
+            oa_cfg.get("grad_balance_max_ratio", 0.10)
+        )
+        self._outcome_aware_grad_max_norm = float(
+            oa_cfg.get("grad_balance_max_norm", 25.0)
+        )
+        self._outcome_aware_grad_eps = float(
+            oa_cfg.get("grad_balance_eps", 1e-8)
+        )
+
         self._model_opt = tools.Optimizer(
             "model",
             self.parameters(),
@@ -234,6 +250,9 @@ class WorldModel(nn.Module):
             config.weight_decay,
             opt=config.opt,
             use_amp=self._use_amp,
+            skip_nonfinite=bool(
+                oa_cfg.get("skip_nonfinite_model_step", False)
+            ),
         )
 
         print(
@@ -524,11 +543,28 @@ class WorldModel(nn.Module):
                         env_step=env_step,
                     )
 
-                total_loss = (
+                base_loss = (
                     torch.mean(model_loss)
                     + self._multistep_scale * multistep_loss
-                    + outcome_aware_loss
                 )
+                grad_balance_metrics = {}
+                balanced_outcome_aware_loss = outcome_aware_loss
+                if (
+                    self._outcome_aware_enabled
+                    and self._outcome_aware_grad_balance
+                ):
+                    balanced_outcome_aware_loss, grad_balance_metrics = (
+                        gradient_balance.balance_auxiliary_loss(
+                            base_loss=base_loss,
+                            auxiliary_loss=outcome_aware_loss,
+                            parameters=self.parameters(),
+                            max_ratio=self._outcome_aware_grad_ratio,
+                            max_norm=self._outcome_aware_grad_max_norm,
+                            eps=self._outcome_aware_grad_eps,
+                        )
+                    )
+
+                total_loss = base_loss + balanced_outcome_aware_loss
 
             metrics = self._model_opt(total_loss, self.parameters())
 
@@ -536,6 +572,12 @@ class WorldModel(nn.Module):
         metrics.update({name: to_np(value) for name, value in multistep_metrics.items()})
         metrics.update(
             {name: to_np(value) for name, value in outcome_aware_metrics.items()}
+        )
+        metrics.update(
+            {name: to_np(value) for name, value in grad_balance_metrics.items()}
+        )
+        metrics["balanced_outcome_aware_loss"] = to_np(
+            balanced_outcome_aware_loss
         )
         metrics["multistep_scale"] = self._multistep_scale
         metrics["base_model_loss"] = to_np(torch.mean(model_loss))

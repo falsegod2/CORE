@@ -287,3 +287,68 @@ outcomeaware5d_noreturn:
     return_loss_scale: 0.0
     return_rank_loss_scale: 0.0
 
+
+# Experiment 5E: stability-first outcome-aware RSSM.
+# Derived from 5D full/no-margin diagnostics:
+# - stochastic straight-through rollout instead of deterministic mode;
+# - preserve the main RNG stream;
+# - remove Action-margin and Return-ranking training;
+# - remove h=15 until h<=8 remains numerically stable;
+# - lower auxiliary weights and cap auxiliary gradient norm relative to Dreamer.
+outcomeaware5e:
+  logdir: ./logdir_outcomeaware5e
+  multi_step_consistency:
+    enabled: false
+  outcome_aware_multistep:
+    enabled: true
+    horizons: [1, 2, 4, 8]
+    horizon_weights: [0.25, 0.5, 0.75, 1.0]
+    projection_dim: 512
+    starts_per_sequence: 4
+    projection_seed: 314159
+    discount: 0.997
+
+    absolute_loss_scale: 0.0025
+    delta_loss_scale: 0.005
+    return_loss_scale: 0.005
+    return_rank_loss_scale: 0.0
+    action_margin_loss_scale: 0.0
+
+    action_margin: 0.10
+    action_negative_stop_gradient: true
+    compute_action_gap: true
+
+    rollout_sample: true
+    preserve_rng_state: true
+    detach_start_state: true
+    delta_min_norm: 1.0e-4
+
+    return_huber_delta: 1.0
+    return_weight_bonus: 1.0
+    return_weight_cap: 4.0
+    ranking_epsilon: 1.0e-4
+    ranking_temperature: 1.0
+    ranking_std_floor: 0.05
+
+    global_start_step: 100000
+    global_ramp_steps: 300000
+    horizon_start_steps: [100000, 100000, 150000, 300000]
+    horizon_ramp_steps: [150000, 150000, 200000, 200000]
+
+    grad_balance_enabled: true
+    grad_balance_max_ratio: 0.10
+    grad_balance_max_norm: 25.0
+    grad_balance_eps: 1.0e-8
+    skip_nonfinite_model_step: true
+
+# Ablation: identical 5E objective without dynamic auxiliary-gradient balancing.
+outcomeaware5e_nobalance:
+  logdir: ./logdir_outcomeaware5e_nobalance
+  outcome_aware_multistep:
+    grad_balance_enabled: false
+
+# Ablation: removes return supervision; keeps absolute/delta dynamics and diagnostics.
+outcomeaware5e_noreturn:
+  logdir: ./logdir_outcomeaware5e_noreturn
+  outcome_aware_multistep:
+    return_loss_scale: 0.0

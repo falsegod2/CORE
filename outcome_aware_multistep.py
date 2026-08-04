@@ -62,6 +62,7 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
         action_margin: float = 0.10,
         action_negative_stop_gradient: bool = True,
         rollout_sample: bool = False,
+        preserve_rng_state: bool = False,
         detach_start_state: bool = True,
         delta_min_norm: float = 1e-4,
         return_huber_delta: float = 1.0,
@@ -69,6 +70,7 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
         return_weight_cap: float = 4.0,
         ranking_epsilon: float = 1e-4,
         ranking_temperature: float = 1.0,
+        ranking_std_floor: float = 0.05,
         global_start_step: int = 50_000,
         global_ramp_steps: int = 250_000,
         horizon_start_steps: Sequence[int] = (50_000, 50_000, 50_000, 150_000, 300_000),
@@ -104,6 +106,8 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
             raise ValueError((return_weight_bonus, return_weight_cap))
         if ranking_epsilon < 0.0 or ranking_temperature <= 0.0:
             raise ValueError((ranking_epsilon, ranking_temperature))
+        if ranking_std_floor <= 0.0:
+            raise ValueError(ranking_std_floor)
 
         self.horizons = horizons
         self.max_horizon = max(horizons)
@@ -117,6 +121,7 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
         self.action_margin = float(action_margin)
         self.action_negative_stop_gradient = bool(action_negative_stop_gradient)
         self.rollout_sample = bool(rollout_sample)
+        self.preserve_rng_state = bool(preserve_rng_state)
         self.detach_start_state = bool(detach_start_state)
         self.delta_min_norm = float(delta_min_norm)
         self.return_huber_delta = float(return_huber_delta)
@@ -124,6 +129,7 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
         self.return_weight_cap = float(return_weight_cap)
         self.ranking_epsilon = float(ranking_epsilon)
         self.ranking_temperature = float(ranking_temperature)
+        self.ranking_std_floor = float(ranking_std_floor)
         self.global_start_step = int(global_start_step)
         self.global_ramp_steps = int(global_ramp_steps)
         self.compute_action_gap = bool(compute_action_gap)
@@ -353,6 +359,17 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
             flat_count, self.max_horizon
         )
 
+        cpu_rng_state = None
+        cuda_rng_state = None
+        cuda_device = None
+        if self.rollout_sample and self.preserve_rng_state:
+            cpu_rng_state = torch.random.get_rng_state()
+            if actions.device.type == "cuda":
+                cuda_device = actions.device.index
+                if cuda_device is None:
+                    cuda_device = torch.cuda.current_device()
+                cuda_rng_state = torch.cuda.get_rng_state(cuda_device)
+
         for step in range(1, self.max_horizon + 1):
             current_real = dynamics.img_step(
                 current_real,
@@ -476,20 +493,22 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
                 torch.abs(target_difference) > self.ranking_epsilon
             )
             target_sign = torch.sign(target_difference).detach()
-            normalized_prediction_difference = prediction_difference / return_std.detach().clamp_min(
-                self.eps
-            )
-            ranking_vector = F.softplus(
-                -target_sign
-                * normalized_prediction_difference
-                / self.ranking_temperature
-            )
-            rank_loss = self._masked_mean(ranking_vector, informative_pair)
             rank_accuracy = self._masked_mean(
                 (torch.sign(prediction_difference) == target_sign).float(),
                 informative_pair,
             )
             rank_count = informative_pair.float().sum()
+            rank_loss = zero
+            if self.return_rank_loss_scale > 0.0:
+                normalized_prediction_difference = prediction_difference / return_std.detach().clamp_min(
+                    self.ranking_std_floor
+                )
+                ranking_vector = F.softplus(
+                    -target_sign
+                    * normalized_prediction_difference
+                    / self.ranking_temperature
+                )
+                rank_loss = self._masked_mean(ranking_vector, informative_pair)
 
             action_loss = zero
             action_gap = zero.detach()
@@ -506,15 +525,16 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
                     shuffled_delta_unit * target_delta_unit, dim=-1
                 )
                 action_mask = delta_mask & valid_shuffle
-                negative = (
-                    shuffled_cosine.detach()
-                    if self.action_negative_stop_gradient
-                    else shuffled_cosine
-                )
-                action_vector = F.relu(
-                    self.action_margin - delta_cosine + negative
-                )
-                action_loss = self._masked_mean(action_vector, action_mask)
+                if self.action_margin_loss_scale > 0.0:
+                    negative = (
+                        shuffled_cosine.detach()
+                        if self.action_negative_stop_gradient
+                        else shuffled_cosine
+                    )
+                    action_vector = F.relu(
+                        self.action_margin - delta_cosine + negative
+                    )
+                    action_loss = self._masked_mean(action_vector, action_mask)
                 action_gap = self._masked_mean(
                     delta_cosine - shuffled_cosine, action_mask
                 ).detach()
@@ -572,6 +592,11 @@ class OutcomeAwareMultiStepRSSM(nn.Module):
             metrics[f"oa_valid_h{step}"] = valid_real.float().mean().detach()
             metrics[f"oa_delta_valid_h{step}"] = delta_mask.float().mean().detach()
             metrics[f"oa_horizon_gate_h{step}"] = horizon_gate.detach()
+
+        if cpu_rng_state is not None:
+            torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_state is not None and cuda_device is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, cuda_device)
 
         raw_absolute = self._weighted_horizon_average(
             component_sums["absolute"], component_weights["absolute"], zero
