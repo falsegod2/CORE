@@ -1,3 +1,15 @@
+# ISO3-RGB-Aux-NoLong (project modification)
+
+> This repository is modified from the LS-Imagine codebase. The active method is an ISO-Dream-inspired, no-long-branch world model with an **RGB-only observation encoder**. Affordance maps remain training-time auxiliary targets and are not fed into the encoder. See [`METHOD_CHANGES.md`](METHOD_CHANGES.md) for the exact implementation, corrected inverse-dynamics alignment, Z-branch adversarial action invariance, metrics, and ablations.
+
+Run the static audit before training:
+
+```bash
+python audit_rgb_only_iso.py
+```
+
+---
+
 <h1 align="center">
  [ICLR 2025 Oral] <img src="./assets/minecraft.png" alt="logo" style="width: 32px; height: 32px; margin-right: 7px; margin-bottom: 0px;">Open-World Reinforcement Learning over Long Short-Term Imagination </h1>
 <p align="center">

@@ -56,11 +56,7 @@ class ClipWrapper(Wrapper):
         else:
             obs['intrinsic'] = 0.0
             obs['score'] = 0.0
-        
-        # 【唯一的改动】：将算好的 obs['intrinsic'] 累加到环境真实 reward 中
-        reward += obs['intrinsic']
 
-        # 探索目标的 CLIP 分数计算
         if len(self.expl_prompt) > 0:
             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)
             logits = logits.detach().cpu()

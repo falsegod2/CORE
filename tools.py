@@ -20,7 +20,6 @@ from bisect import insort
 
 to_np = lambda x: x.detach().cpu().numpy()
 
-'''删除类 ScoreStorage
 class ScoreStorage:
     def __init__(self, max_steps=1000):
         self.data = defaultdict(list)
@@ -51,7 +50,7 @@ class ScoreStorage:
     
     def count_data_pairs(self, env_id):
         return len(self.data[env_id])
-'''
+
 
 def symlog(x):
     return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
@@ -197,7 +196,6 @@ class Logger:
         if self._wandb:
             wandb.finish()
 
-'''删除函数 calculate_accumulated_reward
 def calculate_accumulated_reward(rewards, intrinsics, gamma):
     if len(rewards) == 0:
         return 0
@@ -211,16 +209,14 @@ def calculate_accumulated_reward(rewards, intrinsics, gamma):
     gamma_sum = np.sum(gammas)
     
     return total_reward / gamma_sum  
-'''
+
 def simulate(
     agent,
     envs, 
     cache, 
     directory, 
     logger, 
-    #step_calculator,
     max_steps,
-    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -244,7 +240,7 @@ def simulate(
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
-            #indices = [index for index in indices if information[index].get("real_done", True)]
+            indices = [index for index in indices if information[index].get("real_done", True)]
             results = [envs[i].reset() for i in indices]
             results = [r() for r in results] 
 
@@ -256,11 +252,7 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
-                '''清理 reset 逻辑
-                current_step = 0
-                if t["is_zoomed"] == True:
-                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
-                '''
+
                 # replace obs with done by initial state
                 obs[index] = result
 
@@ -307,34 +299,18 @@ def simulate(
             transition["success"] = info.get("success", False)
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
-            ''' 清理步进 (step) 逻辑
-            length = len(cache[env.id]["reward"]) 
-            current_step = length - 1
-            if transition["is_zoomed"] == True and not d:
-                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
 
-            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
-            if len(tmp_list) > 0:
-                for ss in tmp_list:
-                    cache[env.id]["jumping_steps"][ss] = current_step - ss
-                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
-                    cache[env.id]["is_calculated"][ss] = True
+            information[tmp_index]['real_done'] = True
 
-            if step_calculator.count_data_pairs(env.id) == 0:
-                information[tmp_index]['real_done'] = True
-            '''
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
             # logging for done episode
             for i in indices:
-                '''
                 if (not is_eval) and (not information[i].get("real_done", False)):
                     continue
-                '''
+
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
-                '''清理 done 逻辑
-                step_calculator.remove_all(envs[i].id)
-                '''
+
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -446,7 +422,7 @@ def convert(value, precision=32):
     else:
         raise NotImplementedError(value.dtype)
     return value.astype(dtype)
-'''删除函数 selective_deepcopy
+
 def selective_deepcopy(episode):
     episode_copy = episode.copy()
 
@@ -457,7 +433,7 @@ def selective_deepcopy(episode):
         episode_copy["heatmap_on_zoomed"] = copy.deepcopy(episode_copy["heatmap_on_zoomed"])
     
     return episode_copy
-'''
+
 def save_episodes(directory, episodes):
     directory = pathlib.Path(directory).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
@@ -465,22 +441,17 @@ def save_episodes(directory, episodes):
         length = len(episode["reward"])
         filename = directory / f"{filename}-{length}.npz"
         with io.BytesIO() as f1:
-            '''清理数据落盘
             episode_copy = selective_deepcopy(episode)
             episode_copy = replace_none_with_zeros(episode_copy)
-            '''
-            #**episode_copy换成episode
-            np.savez_compressed(f1, **episode)
+            np.savez_compressed(f1, **episode_copy)
             f1.seek(0)
             with filename.open("wb") as f2:
                 f2.write(f1.read())
-            '''清理数据落盘
             del episode_copy
-            '''
     return True
-'''删除函数 replace_none_with_zeros
+
 def replace_none_with_zeros(episode):
-    if "image" in episode and episode["image"]:
+    if "image" in episode and len(episode["image"]) > 0:
         reference_shape = episode["image"][0].shape
     else:
         raise ValueError("Image data is missing or malformed in episode.")
@@ -490,7 +461,7 @@ def replace_none_with_zeros(episode):
             np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
         ]
     
-    if "heatmap" in episode and episode["heatmap"]:
+    if "heatmap" in episode and len(episode["heatmap"]) > 0:
         heatmap_shape = episode["heatmap"][0].shape
     else:
         heatmap_shape = None
@@ -501,7 +472,7 @@ def replace_none_with_zeros(episode):
         ]
     
     return episode
-'''
+
 def from_generator(generator, batch_size):
 
     while True:
@@ -533,16 +504,15 @@ def sample_episodes(episodes, length, seed=0):
             # make sure at least one transition included
             if total < 2:
                 continue
-            '''清理采样逻辑
+
             episode_copy = selective_deepcopy(episode)
             episode_copy = replace_none_with_zeros(episode_copy)
-            '''
+
             if not ret:
                 index = int(np_random.randint(0, total - 1))
                 ret = {
                     k: v[index : min(index + length, total)].copy()
-                    #episode_copy换成episode，相当于直接使用episode
-                    for k, v in episode.items()
+                    for k, v in episode_copy.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
@@ -555,15 +525,13 @@ def sample_episodes(episodes, length, seed=0):
                     k: np.append(
                         ret[k], v[index : min(index + possible, total)].copy(), axis=0
                     )
-                    for k, v in episode.items()
+                    for k, v in episode_copy.items()
                     if "log_" not in k
                 }
                 if "is_first" in ret:
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
-            '''清理采样逻辑
             del episode_copy
-            '''
         yield ret
 
 
@@ -609,7 +577,6 @@ def load_episodes(directory, limit=None, reverse=True):
             
     print(f"Loading complete! Total episodes: {len(episodes)}, Total steps: {total}")
     return episodes
-
 
 class SampleDist:
     def __init__(self, dist, samples=100):
@@ -982,7 +949,6 @@ class Optimizer:
         wd_pattern=r".*",
         opt="adam",
         use_amp=False,
-        skip_nonfinite=False,
     ):
         assert 0 <= wd < 1
         assert not clip or 1 <= clip
@@ -991,7 +957,6 @@ class Optimizer:
         self._clip = clip
         self._wd = wd
         self._wd_pattern = wd_pattern
-        self._skip_nonfinite = bool(skip_nonfinite)
         self._opt = {
             "adam": lambda: torch.optim.Adam(parameters, lr=lr, eps=eps),
             "nadam": lambda: NotImplemented(f"{opt} is not implemented"),
@@ -1009,23 +974,6 @@ class Optimizer:
         self._scaler.scale(loss).backward(retain_graph=retain_graph)
         self._scaler.unscale_(self._opt)
         # loss.backward(retain_graph=retain_graph)
-        params = list(params)
-        if self._skip_nonfinite:
-            grad_norms = [
-                parameter.grad.detach().float().norm(2)
-                for parameter in params
-                if parameter.grad is not None
-            ]
-            if grad_norms:
-                raw_norm = torch.stack(grad_norms).norm(2)
-            else:
-                raw_norm = torch.zeros((), device=loss.device)
-            if not bool(torch.isfinite(raw_norm).detach().cpu().item()):
-                self._opt.zero_grad()
-                self._scaler.update()
-                metrics[f"{self._name}_grad_norm"] = raw_norm.detach().cpu().item()
-                metrics[f"{self._name}_step_skipped_nonfinite"] = 1.0
-                return metrics
         norm = torch.nn.utils.clip_grad_norm_(params, self._clip)
         if self._wd:
             self._apply_weight_decay(params)
@@ -1034,7 +982,6 @@ class Optimizer:
         # self._opt.step()
         self._opt.zero_grad()
         metrics[f"{self._name}_grad_norm"] = norm.item()
-        metrics[f"{self._name}_step_skipped_nonfinite"] = 0.0
         return metrics
 
     def _apply_weight_decay(self, varibs):
