@@ -70,6 +70,7 @@ def main(config):
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
+    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
@@ -104,7 +105,9 @@ def main(config):
             eval_eps,
             config.evaldir,
             logger,
+            step_calculator,
             config.episode_max_steps,
+            config.discount,
             is_eval=True,
             episodes=config.eval_episode_num,
             is_training=False,

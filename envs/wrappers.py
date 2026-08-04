@@ -45,10 +45,14 @@ class NormalizeActions(gym.Wrapper):
 
 
 class OneHotAction(gym.Wrapper):
-    def __init__(self, env):
+    def __init__(self, env, seed=None):
         assert isinstance(env.action_space, gym.spaces.Discrete)
         super().__init__(env)
-        self._random = np.random.RandomState()
+        self._random = np.random.RandomState(seed)
+        try:
+            self.env.action_space.seed(seed)
+        except Exception:
+            pass
         shape = (self.env.action_space.n,)
         space = gym.spaces.Box(low=0, high=1, shape=shape, dtype=np.float32)
         space.discrete = True

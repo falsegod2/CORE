@@ -216,7 +216,9 @@ def simulate(
     cache, 
     directory, 
     logger, 
+    step_calculator,
     max_steps,
+    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -252,6 +254,10 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
+
+                current_step = 0
+                if t["is_zoomed"] == True:
+                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
                 obs[index] = result
@@ -300,7 +306,20 @@ def simulate(
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
 
-            information[tmp_index]['real_done'] = True
+            length = len(cache[env.id]["reward"]) 
+            current_step = length - 1
+            if transition["is_zoomed"] == True and not d:
+                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
+
+            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+            if len(tmp_list) > 0:
+                for ss in tmp_list:
+                    cache[env.id]["jumping_steps"][ss] = current_step - ss
+                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                    cache[env.id]["is_calculated"][ss] = True
+
+            if step_calculator.count_data_pairs(env.id) == 0:
+                information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -311,6 +330,7 @@ def simulate(
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
 
+                step_calculator.remove_all(envs[i].id)
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -1216,17 +1236,66 @@ def tensorstats(tensor, prefix=None):
 
 
 def set_seed_everywhere(seed):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
 
 def enable_deterministic_run():
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    # These variables should also be exported before Python imports torch.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda"):
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+        if hasattr(torch.backends.cuda, "enable_math_sdp"):
+            torch.backends.cuda.enable_math_sdp(True)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("highest")
+    torch.use_deterministic_algorithms(True, warn_only=False)
+
+
+def get_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        torch.cuda.synchronize()
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+class PreserveRNGState:
+    """Prevent evaluation and diagnostics from changing training RNG streams."""
+
+    def __enter__(self):
+        self._state = get_rng_state()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        set_rng_state(self._state)
+        return False
 
 
 def recursively_collect_optim_state_dict(
