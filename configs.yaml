@@ -26,9 +26,9 @@ defaults:
   # ==========================================
   # 2. 核心创新点与消融实验控制 (CJJ Innovations)
   # ==========================================
-  inverse_loss_scale: 1.0      # S分支逆动力学分类约束（已修正动作时间对齐）
+  inverse_loss_scale: 0.0      # 本消融关闭inverse监督；inverse head保留实例以维持初始化/RNG路径可比性
   affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
-  z_action_adv_scale: 0.0      # 本实验关闭Z对抗：严格基于ISO3-SAff+Inverse
+  z_action_adv_scale: 0.0      # 关闭Z对抗；只测试S-Aff + S-only 5A
   z_action_grl_scale: 1.0      # Gradient Reversal强度
 
   # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
