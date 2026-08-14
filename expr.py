@@ -86,10 +86,9 @@ class LS_Imagine(nn.Module):
             latent, action = state
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(
-            latent, action, embed, obs["is_first"], sample=training
-        )
-        # Evaluation uses posterior mode and does not consume training RNG.
+        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        if self._config.eval_state_mean:
+            latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -113,9 +112,8 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, post_zoomed, context, mets = self._wm._train(data)
+        post, _, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
 
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
@@ -125,23 +123,11 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode() 
 
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
-
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
-
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
-
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
@@ -154,17 +140,10 @@ class LS_Imagine(nn.Module):
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
-def make_dataset(episodes, config, seed):
-    generator = tools.sample_episodes(episodes, config.batch_length, seed=seed)
+def make_dataset(episodes, config):
+    generator = tools.sample_episodes(episodes, config.batch_length)
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
-
-
-def _call_env_method(env, name, *args):
-    """Call both local/Damy and Parallel environment methods."""
-    result = getattr(env, name)(*args)
-    return result() if callable(result) else result
-
 
 def make_env(config, mode, id):
     suite, task = config.task.split("_", 1)
@@ -172,26 +151,12 @@ def make_env(config, mode, id):
         import envs.minedojo as minedojo
         log_dir = os.path.join(config.results_dir, config.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
 
-        mode_offset = 0 if mode == "train" else 100000
-        env_seed = int(config.seed) * 1000 + mode_offset + int(id)
-        world_seed = f"{config.world_seed}-seed{int(config.seed)}-{mode}"
         kwargs=dict(
                 log_dir=log_dir,
-                target_item=config.target_item,
-                sim_seed=env_seed,
-                world_seed=world_seed,
-                force_hard_reset=config.hard_reset,
-                clip_score_quantum=config.mineclip_score_quantum,
-                clip_improvement_eps=config.mineclip_improvement_eps,
-                affordance_score_quantum=config.affordance_score_quantum,
-                affordance_map_quantum=config.affordance_map_quantum,
+                target_item=config.target_item
             )
         env = minedojo.make_env(task, **kwargs)
-        try:
-            env.seed(env_seed)
-        except Exception:
-            pass
-        env = wrappers.OneHotAction(env, seed=env_seed)
+        env = wrappers.OneHotAction(env)
 
     else:
         raise NotImplementedError(suite)
@@ -277,29 +242,27 @@ def main(config): # config is namespace
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
-    train_step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
-    eval_step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
-
     state = None
 
     if not config.offline_traindir: 
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
-        prefill_rng = np.random.RandomState(int(config.seed) + 12345)
+        if hasattr(acts, "discrete"):
+            random_actor = tools.OneHotDist(
+                torch.zeros(config.num_actions).repeat(config.envs, 1)
+            )
+        else:
+            random_actor = torchd.independent.Independent(
+                torchd.uniform.Uniform(
+                    torch.Tensor(acts.low).repeat(config.envs, 1),
+                    torch.Tensor(acts.high).repeat(config.envs, 1),
+                ),
+                1,
+            )
 
         def random_agent(o, d, s):
-            if hasattr(acts, "discrete"):
-                indices = prefill_rng.randint(0, config.num_actions, size=config.envs)
-                action = torch.nn.functional.one_hot(
-                    torch.as_tensor(indices), num_classes=config.num_actions
-                ).to(torch.float32)
-                logprob = torch.full((config.envs,), -np.log(config.num_actions))
-            else:
-                action_np = prefill_rng.uniform(
-                    acts.low, acts.high, size=(config.envs, *acts.shape)
-                )
-                action = torch.as_tensor(action_np, dtype=torch.float32)
-                logprob = torch.zeros(config.envs, dtype=torch.float32)
+            action = random_actor.sample()
+            logprob = random_actor.log_prob(action)
             return {"action": action, "logprob": logprob}, None
 
         state = tools.simulate(
@@ -308,9 +271,7 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
-            train_step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
@@ -320,12 +281,8 @@ def main(config): # config is namespace
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config, seed=int(config.seed) + 20000)
-    eval_dataset = make_dataset(eval_eps, config, seed=int(config.seed) + 30000)
-
-    # MineDojo, MineCLIP and U-Net construction can consume global RNG.
-    # Reseed immediately before initializing the trainable agent.
-    tools.set_seed_everywhere(config.seed)
+    train_dataset = make_dataset(train_eps, config)
+    eval_dataset = make_dataset(eval_eps, config)
     agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,
@@ -340,10 +297,6 @@ def main(config): # config is namespace
         checkpoint = torch.load(logdir / "latest.pt")
         agent.load_state_dict(checkpoint["agent_state_dict"])
         tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
-        if "rng_state" in checkpoint:
-            tools.set_rng_state(checkpoint["rng_state"])
-        if "jump_rng_state" in checkpoint:
-            agent._task_behavior._jump_generator.set_state(checkpoint["jump_rng_state"])
         agent._should_pretrain._once = False
 
     
@@ -353,40 +306,21 @@ def main(config): # config is namespace
         
         if config.eval_episode_num > 0:
             print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            # Every checkpoint is evaluated on the same seeded environment
-            # sequence and fresh affordance thresholds. This affects evaluation
-            # only and does not feed data back into training.
-            for env_id, env in enumerate(eval_envs):
-                eval_seed = int(config.seed) * 1000 + 100000 + env_id
-                try:
-                    _call_env_method(env, "seed", eval_seed)
-                except Exception:
-                    pass
-                try:
-                    _call_env_method(env, "reset_reproducibility_state")
-                except Exception:
-                    pass
-            eval_step_calculator = tools.ScoreStorage(
-                max_steps=config.episode_max_steps
+            eval_policy = functools.partial(agent, training=False) 
+            tools.simulate(
+                eval_policy,
+                eval_envs,
+                eval_eps,
+                config.evaldir,
+                logger,
+                config.episode_max_steps,
+                is_eval=True,
+                episodes=config.eval_episode_num,
+                is_training=False,
             )
-            with tools.PreserveRNGState():
-                tools.simulate(
-                    eval_policy,
-                    eval_envs,
-                    eval_eps,
-                    config.evaldir,
-                    logger,
-                    eval_step_calculator,
-                    config.episode_max_steps,
-                    config.discount,
-                    is_eval=True,
-                    episodes=config.eval_episode_num,
-                    is_training=False,
-                )
-                if config.video_pred_log:
-                    video_pred = agent._wm.video_pred(next(eval_dataset))
-                    logger.video("eval_openl", to_np(video_pred))
+            if config.video_pred_log:
+                video_pred = agent._wm.video_pred(next(eval_dataset))
+                logger.video("eval_openl", to_np(video_pred))
 
         print("Start training.")
 
@@ -396,9 +330,7 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
-            train_step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=config.eval_every, 
             state=state,
@@ -408,8 +340,6 @@ def main(config): # config is namespace
         items_to_save = {
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-            "rng_state": tools.get_rng_state(),
-            "jump_rng_state": agent._task_behavior._jump_generator.get_state(),
         }
         
         torch.save(items_to_save, logdir / "latest.pt")

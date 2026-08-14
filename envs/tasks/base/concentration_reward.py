@@ -214,9 +214,6 @@ class ConcentrationReward(ABC):
         self.prompts = None
         self.unet_checkpoint_dir = unet_checkpoint_dir
         self.output_dir = output_dir
-        self.score_quantum = float(kwargs.pop("score_quantum", 0.0))
-        self.map_quantum = float(kwargs.pop("map_quantum", 0.0))
-        self.improvement_eps = float(kwargs.pop("improvement_eps", 0.0))
 
         self.resolution = self.get_resolution() # (160, 256)
         self.u_net_resolution = 224
@@ -261,15 +258,6 @@ class ConcentrationReward(ABC):
         self.zoomed_frame = None
 
         
-    def reset_running_statistics(self):
-        self.check_threshold_buffer = ThresholdBuffer()
-        self.gaussian_buffer = ThresholdBuffer()
-        self.check_threshold = 1
-        self.gaussian_score = 0
-        self.zoom_in_prob = 0
-        self.best_value_on_mask = 0
-        self.have_center = False
-
     @abstractstaticmethod
     def get_resolution():
         raise NotImplementedError()
@@ -313,7 +301,7 @@ class ConcentrationReward(ABC):
                        prompts: List[str]):
         self.index += 1
         self.curr_frame = self.get_curr_frame(obs) # shape: [160, 256, 3]
-        random_lable = np.zeros((self.u_net_resolution, self.u_net_resolution, 1), dtype=np.float32)
+        random_lable = np.random.rand(self.u_net_resolution, self.u_net_resolution, 1)
         img, _ = self.preprocess(self.curr_frame, random_lable)
         img = img.unsqueeze(0) # shape: [1, 3, 224, 224]
 
@@ -326,8 +314,6 @@ class ConcentrationReward(ABC):
             out_np = resized_if_need(out_np, target_size=(self.resolution[1], self.resolution[0]))
             out_np = out_np.transpose((2, 0, 1)).squeeze(0)
             out_np = cv2.GaussianBlur(out_np, (self.blur_x, self.blur_y), 0)
-            if self.map_quantum > 0:
-                out_np = np.round(out_np / self.map_quantum) * self.map_quantum
             out_np = out_np[np.newaxis, :]
 
         return out_np
@@ -343,12 +329,6 @@ class ConcentrationReward(ABC):
 
         return gaussian
 
-    def _quantize_scalar(self, value):
-        value = float(value)
-        if self.score_quantum <= 0:
-            return value
-        return round(value / self.score_quantum) * self.score_quantum
-
     def get_reward(
             self,
             obs: Dict,
@@ -363,7 +343,6 @@ class ConcentrationReward(ABC):
         for mask in masks:
             score += (np.mean(mask * self.gaussian)/self.gaussian_mean)
 
-        score = self._quantize_scalar(score)
         self.gaussian_score = score
         self.gaussian_buffer.add(self.gaussian_score)
         heatmap_normalized = self.mask / 255.0
@@ -371,11 +350,9 @@ class ConcentrationReward(ABC):
         kurtosis_value = kurtosis(heatmap_normalized.flatten())
         normalized_kurtosis = sigmoid(kurtosis_value)
 
-        self.zoom_in_prob = self._quantize_scalar(
-            normalized_kurtosis * (np.max(heatmap_normalized) - np.mean(heatmap_normalized))
-        )
+        self.zoom_in_prob = normalized_kurtosis * (np.max(heatmap_normalized) - np.mean(heatmap_normalized))
         self.check_threshold_buffer.add(self.zoom_in_prob)
-        self.check_threshold = self._quantize_scalar(self.check_threshold_buffer.get_threshold())
+        self.check_threshold = self.check_threshold_buffer.get_threshold()   
         
         return score, self.zoom_in_prob, self.check_threshold
         
@@ -448,7 +425,7 @@ class ConcentrationReward(ABC):
         return self.zoomed_frame, True
     
     def compute_reward_on_zoomed_image(self):
-        random_lable = np.zeros((self.u_net_resolution, self.u_net_resolution, 1), dtype=np.float32)
+        random_lable = np.random.rand(self.u_net_resolution, self.u_net_resolution, 1)
         img, _ = self.preprocess(self.zoomed_frame, random_lable)
         img = img.unsqueeze(0)
 
@@ -462,8 +439,6 @@ class ConcentrationReward(ABC):
             out_np = resized_if_need(out_np, target_size=(self.resolution[1], self.resolution[0]))
             out_np = out_np.transpose((2, 0, 1)).squeeze(0)
             out_np = cv2.GaussianBlur(out_np, (self.blur_x, self.blur_y), 0)
-            if self.map_quantum > 0:
-                out_np = np.round(out_np / self.map_quantum) * self.map_quantum
             out_np = out_np[np.newaxis, :]
 
         self.mask_on_zoomed_image = np.max(out_np, axis=0)
@@ -474,16 +449,10 @@ class ConcentrationReward(ABC):
 
         kurtosis_value = kurtosis(self.mask_on_zoomed_image.flatten())
         normalized_kurtosis = sigmoid(kurtosis_value)
-        zoom_in_prob_on_zoomed_image = self._quantize_scalar(
-            normalized_kurtosis * (np.max(self.mask_on_zoomed_image) - np.mean(self.mask_on_zoomed_image))
-        )
-        zoomed_reward = self._quantize_scalar(self.best_value_on_mask)
-        zoomed_gaussian = self._quantize_scalar(zoomed_gaussian)
-        threshold = self._quantize_scalar(
-            self.gaussian_score + 2.0 * self.gaussian_buffer.std_dev()
-        )
+        zoom_in_prob_on_zoomed_image = normalized_kurtosis * (np.max(self.mask_on_zoomed_image) - np.mean(self.mask_on_zoomed_image))
+        zoomed_reward = self.best_value_on_mask
 
-        if zoomed_gaussian + self.improvement_eps < threshold:
+        if zoomed_gaussian < self.gaussian_score + 2.0 * self.gaussian_buffer.std_dev():
             is_zoomed = False
         else:
             is_zoomed = True

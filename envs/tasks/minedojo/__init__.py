@@ -77,19 +77,13 @@ def _add_wrappers(
         clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
+    
     if concentration_specs is not None:
         unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
         gaussian_sigma_weight = concentration_specs["gaussian_sigma_weight"] if "gaussian_sigma_weight" in concentration_specs else 0.5
-        concentration_reward = MinedojoConcentrationReward(
-            unet_checkpoint_dir=unet_checkpoint_dir,
-            output_dir=log_dir,
-            gaussian_sigma_weight=gaussian_sigma_weight,
-            score_quantum=concentration_specs.get("score_quantum", 0.0),
-            map_quantum=concentration_specs.get("map_quantum", 0.0),
-            improvement_eps=concentration_specs.get("improvement_eps", 0.0),
-        )
+        concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight)
         env = ConcentrationWrapper(env, concentration_reward, **concentration_specs)
-
+    
     env = MinedojoLSImagineWrapper(env, **LS_Imagine_specs)
 
     # If we don't care about start position, use fast reset to speed training and prevent memory leaks

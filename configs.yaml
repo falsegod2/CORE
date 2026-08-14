@@ -1,77 +1,109 @@
 defaults:
-
-  use_wandb: False
-  wandb_key: None
+  # ==========================================
+  # 1. 系统与日志配置 (System & Logging)
+  # ==========================================
   logdir: null
   traindir: null
   evaldir: null
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
+
+  video_pred_log: True
+  
   deterministic_run: False
-  hard_reset: False
-  world_seed: 'ls-imagine-repro-v1'
-  mineclip_score_quantum: 0.0
-  mineclip_improvement_eps: 0.0
-  affordance_score_quantum: 0.0
-  affordance_map_quantum: 0.0
-  steps: 1e6
-  parallel: False
-  eval_every: 20000
-  eval_episode_num: 10
-  log_every: 20000
-  reset_every: 0
   device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
-  video_pred_log: True
+  
+  use_wandb: False
+  wandb_key: None
+  resume_path: null
+  enable_cloud_backup: False
+  cloud_backup_interval: 7200
 
-  # Environment
+  # ==========================================
+  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
+  # ==========================================
+  inverse_loss_scale: 1.0      # S分支逆动力学分类约束（已修正动作时间对齐）
+  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
+  z_action_adv_scale: 0.0      # 本实验关闭Z对抗：严格基于ISO3-SAff+Inverse
+  z_action_grl_scale: 1.0      # Gradient Reversal强度
+
+  # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
+  # 与原5A保持同一 horizons / weights / scale；Z不参与该辅助损失。
+  s_multi_step_consistency:
+    enabled: true
+    horizons: [1, 2, 4, 8, 15]
+    horizon_weights: [1.0, 1.0, 0.75, 0.5, 0.25]
+    projection_dim: 512
+    starts_per_sequence: 4
+    projection_seed: 314159
+    loss_scale: 0.05
+  # 【已移除 long_term_branch_weight】
+
+  gaussian_reward_weight: 0.0  
+  gaussian_sigma_weight: 0.5   
+
+  # ==========================================
+  # 3. 强化学习与训练超参 (RL & Training Params)
+  # ==========================================
+  steps: 1e6                   
+  parallel: False
+  eval_every: 10000            
+  eval_episode_num: 10          # 减少3-episode评估造成的离散高方差
+  log_every: 20000
+  reset_every: 0
+  train_ratio: 16              
+  pretrain: 100                
+  prefill: 2500                
+  dataset_size: 1000000
+  batch_size: 16
+  batch_length: 32
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  opt: 'adam'
+  reward_EMA: True             
+
+  # ==========================================
+  # 4. 环境设置 (Environment)
+  # ==========================================
   task: 'minedojo'
   size: [64, 64]
   envs: 1
   action_repeat: 1
-  time_limit: 1000
+  time_limit: 36000
   grayscale: False
-  prefill: 2500
-  reward_EMA: True
+  break_speed: 100.0
 
-  # Model
-  dyn_hidden: 512
-  dyn_deter: 512
+  # ==========================================
+  # 5. 行为策略与长短期想象 (Behavior & Imagination)
+  # ==========================================
+  discount: 0.997
+  discount_lambda: 0.95
+  # 【已移除 jump_prob 和 jump_prob_decay】
+  imag_horizon: 15             
+  max_imag_sequences_num: 1024
+  imag_gradient: 'reinforce'   
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  # ==========================================
+  # 6. 世界模型架构 (World Model Architecture)
+  # ==========================================
+  dyn_hidden: 1024
+  dyn_deter: 4096
   dyn_stoch: 32
   dyn_discrete: 32
   dyn_rec_depth: 1
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
-  units: 512
+  units: 1024
   act: 'SiLU'
   norm: True
-  encoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
-  decoder:
-    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  actor:
-    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic:
-    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  end_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  jump_head:
-    {layers: 2, loss_scale: 1.0, outscale: 1.0}
-  concentration_score_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  intrinsic_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  jumping_steps_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  accumulated_reward_head:
-    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -80,30 +112,31 @@ defaults:
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
+  
+  encoder:
+    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  
+  # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
 
-  # Training
-  batch_size: 16
-  batch_length: 32
-  train_ratio: 512
-  pretrain: 100
-  model_lr: 1e-4
-  opt_eps: 1e-8
-  grad_clip: 1000
-  dataset_size: 1000000
-  opt: 'adam'
+  # ==========================================
+  # 7. 策略与价值网络 (Actor-Critic & Heads)
+  # ==========================================
+  actor:
+    {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic: 
+    {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  
+  reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  end_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
+  intrinsic_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  # 【已移除 jump_head, jumping_steps_head, accumulated_reward_head, concentration_score_head】
 
-  # Behavior.
-  discount: 0.997
-  discount_lambda: 0.95
-  jump_prob: 0.7
-  jump_prob_decay: 0.9997
-  imag_horizon: 15
-  max_imag_sequences_num: 1024
-  imag_gradient: 'dynamics'
-  imag_gradient_mix: 0.0
-  eval_state_mean: False
-
-  # Exploration
+  # ==========================================
+  # 8. 探索参数 (Exploration)
+  # ==========================================
   expl_behavior: 'greedy'
   expl_until: 0
   expl_extr_scale: 0.0
@@ -116,61 +149,14 @@ defaults:
   disag_units: 400
   disag_action_cond: False
 
-
-reproducible:
-  # Cross-device statistical reproducibility profile. The LS-Imagine method
-  # itself remains enabled: affordance, zoom, jump and mixed imagination.
-  deterministic_run: True
-  compile: False
-  precision: 32
-  video_pred_log: False
-  eval_episode_num: 10
-  hard_reset: True
-  world_seed: 'ls-imagine-repro-v1'
-  mineclip_score_quantum: 0.00001
-  mineclip_improvement_eps: 0.0
-  affordance_score_quantum: 0.00001
-  affordance_map_quantum: 0.0001
-
 minedojo:
-
-  long_term_branch_weight: 1.0
-  gaussian_reward_weight: 1.0
-  gaussian_sigma_weight: 0.5
-
-  # rollout
-  is_random: True
-  agent_checkpoint_dir: ""
-  rollout_image_num: 2000
-
-  unet_batch_size: 64
-  results_dir: "./results"
-  name: "test"
   target_item: "log"
-  steps: 1e6
-  parallel: False
-  envs: 1
-  eval_episode_num: 3
-  eval_every: 10000
-  action_repeat: 1
-  train_ratio: 16
-  video_pred_log: true
-  dyn_hidden: 1024
-  dyn_deter: 4096
-  units: 1024
-  encoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  decoder: {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
-  actor: {layers: 5, dist: 'onehot', std: 'none'}
-  value: {layers: 5}
-  reward_head: {layers: 5}
-  intrinsic_head: {layers: 5}
-  jumping_steps_head: {layers: 5}
-  accumulated_reward_head: {layers: 5}
-  end_head: {layers: 5}
-  jump_head: {layers: 5}
-  imag_gradient: 'reinforce'
-  break_speed: 100.0
-  time_limit: 36000
+  name: "test"
+  results_dir: "./results"
+  agent_checkpoint_dir: ""
+  unet_batch_size: 64
+  rollout_image_num: 2000
+  is_random: True
 
 debug:
   debug: True

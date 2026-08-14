@@ -3,7 +3,7 @@ import torch as th
 
 
 class ClipWrapper(Wrapper):
-    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', score_quantum=0.0, improvement_eps=0.0, **kwargs):
+    def __init__(self, env, clip, prompts=None, dense_reward=.01, smoothing=1, target_object='log', **kwargs):
         super().__init__(env)
         self.clip = clip # ClipReward
         self.wrapper_name = "ClipWrapper"
@@ -13,8 +13,6 @@ class ClipWrapper(Wrapper):
         self.expl_prompt = [f"Explore the widest possible area to find {target_object}"]
         self.dense_reward = dense_reward
         self.smoothing = smoothing
-        self.score_quantum = float(score_quantum)
-        self.improvement_eps = float(improvement_eps)
         
         self.buffer = None
         self._clip_state = None, None
@@ -45,9 +43,9 @@ class ClipWrapper(Wrapper):
             logits = logits.detach().cpu()
 
             self.buffer = self._insert_buffer(self.buffer, logits[:1])
-            score = self._quantize_score(self._get_score())
+            score = self._get_score()
 
-            if score > self.last_score + self.improvement_eps:
+            if score > self.last_score:
                 obs['intrinsic'] = self.dense_reward * score
                 self.last_score = score
             else:
@@ -64,9 +62,9 @@ class ClipWrapper(Wrapper):
             logits = logits.detach().cpu()
 
             self.expl_buffer = self._insert_buffer(self.expl_buffer, logits[:1])
-            expl_score = self._quantize_score(self._get_expl_score())
+            expl_score = self._get_expl_score()
 
-            if expl_score > self.expl_last_score + self.improvement_eps:
+            if expl_score > self.expl_last_score:
                 info['expl_intrinsic'] = self.dense_reward * expl_score
                 self.expl_last_score = expl_score
             else:
@@ -80,11 +78,6 @@ class ClipWrapper(Wrapper):
         info["clip_dense_reward"] = self.dense_reward    
 
         return obs, reward, done, info 
-
-    def _quantize_score(self, score):
-        if self.score_quantum <= 0:
-            return float(score)
-        return round(float(score) / self.score_quantum) * self.score_quantum
 
     def _get_score(self):
         score = th.mean(self.buffer)
