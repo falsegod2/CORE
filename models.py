@@ -196,6 +196,8 @@ class WorldModel(nn.Module):
                 self.dynamics._discrete if self.dynamics._discrete else 1
             )
             s_feat_dim = s_stoch_dim + self.dynamics._deter_s
+            diag_cfg = sms_cfg.get("diagnostics", {}) or {}
+            random_h_cfg = sms_cfg.get("random_horizon", {}) or {}
             self._s_multistep = s_multistep_consistency.SOnlyMultiStepRSSMConsistency(
                 feat_dim=s_feat_dim,
                 horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
@@ -205,6 +207,25 @@ class WorldModel(nn.Module):
                 projection_dim=int(sms_cfg.get("projection_dim", 512)),
                 starts_per_sequence=int(sms_cfg.get("starts_per_sequence", 4)),
                 projection_seed=int(sms_cfg.get("projection_seed", 314159)),
+                random_horizon_enabled=bool(random_h_cfg.get("enabled", False)),
+                random_horizon_count=int(random_h_cfg.get("sample_count", 3)),
+                random_horizon_seed=int(random_h_cfg.get("seed", 271828)),
+                random_horizon_unbiased_reweight=bool(
+                    random_h_cfg.get("unbiased_reweight", True)
+                ),
+                diagnostics_enabled=bool(diag_cfg.get("enabled", True)),
+                counterfactual_diagnostics=bool(
+                    diag_cfg.get("counterfactual_actions", True)
+                ),
+                direct_vs_composed_diagnostics=bool(
+                    diag_cfg.get("direct_vs_composed", True)
+                ),
+                direct_vs_composed_horizon=diag_cfg.get(
+                    "direct_vs_composed_horizon", None
+                ),
+                direct_vs_composed_midpoint=diag_cfg.get(
+                    "direct_vs_composed_midpoint", None
+                ),
             )
        
         for name in config.grad_heads:

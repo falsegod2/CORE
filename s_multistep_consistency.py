@@ -9,8 +9,10 @@ updated by the auxiliary rollout.
 
 from __future__ import annotations
 
+import itertools
 import math
-from typing import Dict, Mapping, Sequence, Tuple
+import random
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -48,6 +50,15 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         projection_dim: int = 512,
         starts_per_sequence: int = 4,
         projection_seed: int = 314159,
+        random_horizon_enabled: bool = False,
+        random_horizon_count: int = 3,
+        random_horizon_seed: int = 271828,
+        random_horizon_unbiased_reweight: bool = True,
+        diagnostics_enabled: bool = True,
+        counterfactual_diagnostics: bool = True,
+        direct_vs_composed_diagnostics: bool = True,
+        direct_vs_composed_horizon: Optional[int] = None,
+        direct_vs_composed_midpoint: Optional[int] = None,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -63,11 +74,49 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             raise ValueError(f"Invalid horizon weights: {weights}")
         if starts_per_sequence <= 0:
             raise ValueError(starts_per_sequence)
+        if random_horizon_count <= 0 or random_horizon_count > len(horizons):
+            raise ValueError(
+                f"random_horizon_count={random_horizon_count} must be in "
+                f"[1, {len(horizons)}]"
+            )
 
         self.horizons = horizons
         self.max_horizon = max(horizons)
         self.starts_per_sequence = int(starts_per_sequence)
         self.eps = float(eps)
+        self.random_horizon_enabled = bool(random_horizon_enabled)
+        self.random_horizon_count = int(random_horizon_count)
+        self.random_horizon_seed = int(random_horizon_seed)
+        self.random_horizon_unbiased_reweight = bool(
+            random_horizon_unbiased_reweight
+        )
+        self.diagnostics_enabled = bool(diagnostics_enabled)
+        self.counterfactual_diagnostics = bool(counterfactual_diagnostics)
+        self.direct_vs_composed_diagnostics = bool(direct_vs_composed_diagnostics)
+
+        dvc_horizon = (
+            self.max_horizon
+            if direct_vs_composed_horizon is None
+            else int(direct_vs_composed_horizon)
+        )
+        if dvc_horizon <= 1 or dvc_horizon > self.max_horizon:
+            raise ValueError(
+                f"direct_vs_composed_horizon={dvc_horizon} must be in "
+                f"[2, {self.max_horizon}]"
+            )
+        dvc_midpoint = (
+            max(1, dvc_horizon // 2)
+            if direct_vs_composed_midpoint is None
+            else int(direct_vs_composed_midpoint)
+        )
+        if dvc_midpoint <= 0 or dvc_midpoint >= dvc_horizon:
+            raise ValueError(
+                f"direct_vs_composed_midpoint={dvc_midpoint} must be in "
+                f"[1, {dvc_horizon - 1}]"
+            )
+        self.direct_vs_composed_horizon = dvc_horizon
+        self.direct_vs_composed_midpoint = dvc_midpoint
+
         self.projector = FixedRandomProjector(
             int(feat_dim), int(projection_dim), int(projection_seed)
         )
@@ -76,6 +125,66 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             torch.tensor(weights, dtype=torch.float32),
             persistent=True,
         )
+        # Checkpointed selector state.  RandomHorizon deliberately does NOT use
+        # torch.rand / NumPy / Python's global RNG: enabling it must not perturb
+        # RSSM categorical samples or any later stochastic training operation.
+        self.register_buffer(
+            "random_horizon_step",
+            torch.zeros((), dtype=torch.long),
+            persistent=True,
+        )
+
+        # Balanced random subset schedule.  For H=5 and m=3 this contains all
+        # C(5,3)=10 subsets exactly once per cycle, so every horizon is selected
+        # exactly 6/10=0.6 of updates.  Only a *local* Python Random object is
+        # used to permute the schedule at construction; global RNG is untouched.
+        combinations = list(
+            itertools.combinations(range(len(horizons)), self.random_horizon_count)
+        )
+        local_rng = random.Random(self.random_horizon_seed)
+        local_rng.shuffle(combinations)
+        schedule = torch.zeros(
+            len(combinations), len(horizons), dtype=torch.float32
+        )
+        for row, combo in enumerate(combinations):
+            schedule[row, list(combo)] = 1.0
+        self.register_buffer(
+            "random_horizon_schedule", schedule, persistent=True
+        )
+
+    def _random_horizon_selection(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return a checkpoint-safe balanced pseudo-random horizon subset.
+
+        The schedule contains every m-of-H subset once per cycle in a seed-based
+        shuffled order.  Consequently horizon coverage is exactly balanced over
+        each full cycle, while selection order is pseudo-random and reproducible.
+        The persistent counter makes resume-from-checkpoint continue the same
+        schedule and no global random stream is consumed.
+        """
+        count_h = len(self.horizons)
+        if not self.random_horizon_enabled:
+            return (
+                torch.ones(count_h, dtype=torch.float32, device=device),
+                torch.ones((), dtype=torch.float32, device=device),
+                self.random_horizon_step.to(device=device).detach().clone(),
+            )
+
+        selector_step = self.random_horizon_step.to(device=device).detach().clone()
+        schedule = self.random_horizon_schedule.to(device=device)
+        row = torch.remainder(
+            selector_step, torch.tensor(schedule.shape[0], device=device)
+        ).long().reshape(1)
+        selected_mask = schedule.index_select(0, row).squeeze(0)
+        inclusion_prob = torch.tensor(
+            float(self.random_horizon_count) / float(count_h),
+            dtype=torch.float32,
+            device=device,
+        )
+        with torch.no_grad():
+            self.random_horizon_step.add_(1)
+        return selected_mask, inclusion_prob, selector_step
 
     @staticmethod
     def _s_feature(dynamics: nn.Module, state: TensorDict) -> torch.Tensor:
@@ -127,6 +236,284 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             0, usable - 1, steps=count, device=device
         ).round().long()
 
+    @staticmethod
+    def _detach_state(state: TensorDict) -> Dict[str, torch.Tensor]:
+        return {key: value.detach() for key, value in state.items()}
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(values.dtype)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def _project_state(
+        self, dynamics: nn.Module, state: TensorDict
+    ) -> torch.Tensor:
+        feat = self._s_feature(dynamics, state)
+        raw = self.projector(feat.float())
+        return F.normalize(raw, dim=-1, eps=self.eps)
+
+    def _mode_rollout(
+        self,
+        dynamics: nn.Module,
+        start_state: TensorDict,
+        action_prefix: torch.Tensor,
+        capture_steps: Sequence[int],
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Deterministic S rollout used only by diagnostics.
+
+        ``sample=False`` is deliberate: diagnostics must not consume the global
+        torch RNG, otherwise simply enabling logging would change subsequent
+        training samples and break strict ablation comparability.
+        """
+        wanted = set(int(step) for step in capture_steps)
+        current = self._detach_state(start_state)
+        captured: Dict[int, Dict[str, torch.Tensor]] = {}
+        max_step = max(wanted) if wanted else 0
+        for step in range(1, max_step + 1):
+            current = dynamics.img_step_s(
+                current, action_prefix[:, step - 1], sample=False
+            )
+            if step in wanted:
+                captured[step] = self._detach_state(current)
+        return captured
+
+    def _counterfactual_action_diagnostics(
+        self,
+        dynamics: nn.Module,
+        posterior: TensorDict,
+        start_state: TensorDict,
+        action_prefix: torch.Tensor,
+        starts: torch.Tensor,
+        first_prefix: torch.Tensor,
+        batch: int,
+        num_starts: int,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[int, Dict[str, torch.Tensor]]]:
+        """Measure whether S predictions actually respond to the action prefix.
+
+        Three deterministic rollouts start from exactly the same posterior S_t:
+          * true: replay action prefix;
+          * shuffle: a deterministic cyclic permutation of prefixes across
+            batch/start samples (valid one-hot actions, wrong for this state);
+          * zero: an all-zero action vector at every step (OOD reference only).
+
+        No diagnostic is added to the training objective.  The cyclic shuffle
+        avoids torch.randperm so logging does not consume the global RNG.
+        """
+        horizons = self.horizons
+        true_states = self._mode_rollout(
+            dynamics, start_state, action_prefix.detach(), horizons
+        )
+
+        if action_prefix.shape[0] > 1:
+            shuffled_actions = torch.roll(action_prefix.detach(), shifts=1, dims=0)
+        else:
+            # Degenerate fallback; normal training uses B*starts >> 1.
+            shuffled_actions = torch.flip(action_prefix.detach(), dims=[1])
+        zero_actions = torch.zeros_like(action_prefix)
+
+        shuffled_states = self._mode_rollout(
+            dynamics, start_state, shuffled_actions, horizons
+        )
+        zero_states = self._mode_rollout(
+            dynamics, start_state, zero_actions, horizons
+        )
+
+        metrics: Dict[str, torch.Tensor] = {}
+        valid_prefix = torch.ones(
+            batch, num_starts, dtype=torch.bool, device=action_prefix.device
+        )
+
+        for step in range(1, self.max_horizon + 1):
+            valid_prefix = valid_prefix & (~first_prefix[:, :, step - 1])
+            if step not in true_states:
+                continue
+
+            target_indices = starts + step
+            target_state = self._flatten_batch_starts(
+                self._gather_s_state(posterior, target_indices)
+            )
+            target_proj = self._project_state(
+                dynamics, self._detach_state(target_state)
+            )
+            true_proj = self._project_state(dynamics, true_states[step])
+            shuffled_proj = self._project_state(dynamics, shuffled_states[step])
+            zero_proj = self._project_state(dynamics, zero_states[step])
+
+            true_target_cos = torch.sum(true_proj * target_proj, dim=-1)
+            shuffled_target_cos = torch.sum(shuffled_proj * target_proj, dim=-1)
+            zero_target_cos = torch.sum(zero_proj * target_proj, dim=-1)
+            true_shuffle_cos = torch.sum(true_proj * shuffled_proj, dim=-1)
+            true_zero_cos = torch.sum(true_proj * zero_proj, dim=-1)
+
+            mask = valid_prefix.reshape(-1)
+            true_target = self._masked_mean(true_target_cos, mask)
+            shuffle_target = self._masked_mean(shuffled_target_cos, mask)
+            zero_target = self._masked_mean(zero_target_cos, mask)
+
+            metrics[f"s_cf_true_target_cos_h{step}"] = true_target
+            metrics[f"s_cf_shuffle_target_cos_h{step}"] = shuffle_target
+            metrics[f"s_cf_zero_target_cos_h{step}"] = zero_target
+            # Positive margin: the correct replay prefix predicts the actual
+            # future S better than the counterfactual prefix.
+            metrics[f"s_cf_margin_shuffle_h{step}"] = (
+                true_target - shuffle_target
+            )
+            metrics[f"s_cf_margin_zero_h{step}"] = true_target - zero_target
+            # Response gap measures sensitivity only; a large gap is not by
+            # itself evidence that the action response is correct.
+            metrics[f"s_cf_response_gap_shuffle_h{step}"] = 1.0 - self._masked_mean(
+                true_shuffle_cos, mask
+            )
+            metrics[f"s_cf_response_gap_zero_h{step}"] = 1.0 - self._masked_mean(
+                true_zero_cos, mask
+            )
+            metrics[f"s_cf_valid_h{step}"] = mask.float().mean()
+
+        return metrics, true_states
+
+    def _direct_vs_composed_diagnostics(
+        self,
+        dynamics: nn.Module,
+        posterior: TensorDict,
+        start_state: TensorDict,
+        action_prefix: torch.Tensor,
+        starts: torch.Tensor,
+        first_prefix: torch.Tensor,
+        batch: int,
+        num_starts: int,
+        true_mode_states: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Open-loop vs posterior-reanchored terminal consistency diagnostic.
+
+        Fast-LeWM can compare a *direct prefix predictor* with a composed
+        prefix prediction.  This ISO3 S5A has only one autoregressive one-step
+        RSSM transition, so splitting the same predicted rollout in two would
+        be algebraically identical and therefore useless as a diagnostic.
+
+        We use the closest informative surrogate for this architecture:
+          direct: S_t --true actions--> S_hat_{t+h} fully open-loop;
+          composed/reanchored: take the replay posterior S_{t+m} as an
+            intermediate anchor, then roll the remaining action suffix to h.
+
+        High direct-vs-reanchored consistency means the terminal estimate is
+        insensitive to a real midpoint correction.  A large reanchor gain
+        means early open-loop drift is materially hurting the terminal state.
+        This is diagnostic/confidence only and never enters the loss.
+        """
+        horizon = self.direct_vs_composed_horizon
+        midpoint = self.direct_vs_composed_midpoint
+
+        if true_mode_states is not None and horizon in true_mode_states:
+            direct_state = true_mode_states[horizon]
+        else:
+            direct_state = self._mode_rollout(
+                dynamics, start_state, action_prefix.detach(), [horizon]
+            )[horizon]
+
+        midpoint_indices = starts + midpoint
+        composed_state = self._flatten_batch_starts(
+            self._gather_s_state(posterior, midpoint_indices)
+        )
+        composed_state = self._detach_state(composed_state)
+        for step in range(midpoint + 1, horizon + 1):
+            composed_state = dynamics.img_step_s(
+                composed_state, action_prefix[:, step - 1], sample=False
+            )
+        composed_state = self._detach_state(composed_state)
+
+        target_indices = starts + horizon
+        target_state = self._flatten_batch_starts(
+            self._gather_s_state(posterior, target_indices)
+        )
+        target_state = self._detach_state(target_state)
+
+        direct_proj = self._project_state(dynamics, direct_state)
+        composed_proj = self._project_state(dynamics, composed_state)
+        target_proj = self._project_state(dynamics, target_state)
+
+        direct_composed_cos = torch.sum(direct_proj * composed_proj, dim=-1)
+        direct_target_cos = torch.sum(direct_proj * target_proj, dim=-1)
+        composed_target_cos = torch.sum(composed_proj * target_proj, dim=-1)
+
+        valid_prefix = torch.ones(
+            batch, num_starts, dtype=torch.bool, device=action_prefix.device
+        )
+        for step in range(1, horizon + 1):
+            valid_prefix = valid_prefix & (~first_prefix[:, :, step - 1])
+        mask = valid_prefix.reshape(-1)
+
+        consistency_cos = self._masked_mean(direct_composed_cos, mask)
+        direct_target = self._masked_mean(direct_target_cos, mask)
+        composed_target = self._masked_mean(composed_target_cos, mask)
+
+        return {
+            f"s_dvc_reanchored_consistency_cos_h{horizon}": consistency_cos,
+            f"s_dvc_reanchored_gap_h{horizon}": 1.0 - consistency_cos,
+            # Convenience confidence in [0,1] derived from cosine [-1,1].
+            f"s_dvc_reanchored_confidence_h{horizon}": torch.clamp(
+                0.5 * (consistency_cos + 1.0), 0.0, 1.0
+            ),
+            f"s_dvc_direct_target_cos_h{horizon}": direct_target,
+            f"s_dvc_reanchored_target_cos_h{horizon}": composed_target,
+            f"s_dvc_reanchor_gain_h{horizon}": composed_target - direct_target,
+            f"s_dvc_valid_h{horizon}": mask.float().mean(),
+            "s_dvc_horizon": torch.tensor(
+                float(horizon), device=action_prefix.device
+            ),
+            "s_dvc_midpoint": torch.tensor(
+                float(midpoint), device=action_prefix.device
+            ),
+        }
+
+    def _run_diagnostics(
+        self,
+        dynamics: nn.Module,
+        posterior: TensorDict,
+        start_state: TensorDict,
+        action_prefix: torch.Tensor,
+        starts: torch.Tensor,
+        first_prefix: torch.Tensor,
+        batch: int,
+        num_starts: int,
+    ) -> Dict[str, torch.Tensor]:
+        if not self.diagnostics_enabled:
+            return {}
+
+        metrics: Dict[str, torch.Tensor] = {}
+        true_mode_states = None
+        with torch.no_grad():
+            if self.counterfactual_diagnostics:
+                cf_metrics, true_mode_states = self._counterfactual_action_diagnostics(
+                    dynamics,
+                    posterior,
+                    start_state,
+                    action_prefix,
+                    starts,
+                    first_prefix,
+                    batch,
+                    num_starts,
+                )
+                metrics.update(cf_metrics)
+
+            if self.direct_vs_composed_diagnostics:
+                metrics.update(
+                    self._direct_vs_composed_diagnostics(
+                        dynamics,
+                        posterior,
+                        start_state,
+                        action_prefix,
+                        starts,
+                        first_prefix,
+                        batch,
+                        num_starts,
+                        true_mode_states=true_mode_states,
+                    )
+                )
+
+        # Guarantee that diagnostic values are detached even if implementation
+        # changes later.  They are never added to the optimization objective.
+        return {name: value.detach() for name, value in metrics.items()}
+
     def forward(
         self,
         dynamics: nn.Module,
@@ -145,7 +532,8 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         num_starts = starts.numel()
 
         start_state = self._gather_s_state(posterior, starts)
-        current = self._flatten_batch_starts(start_state)
+        start_state_flat = self._flatten_batch_starts(start_state)
+        current = start_state_flat
 
         # In this replay convention action[:, t] leads INTO state/observation t.
         # Therefore the first transition from state t uses action[:, t + 1].
@@ -161,8 +549,16 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         )
 
         horizon_to_index = {h: i for i, h in enumerate(self.horizons)}
-        weighted_loss = actions.sum() * 0.0
-        weight_total = actions.sum() * 0.0
+        # RandomHorizon changes only which horizon losses contribute gradient.
+        # We still execute the same stochastic rollout to max_horizon and compute
+        # every legacy per-horizon metric, preserving apples-to-apples logging.
+        selected_mask, inclusion_prob, selector_step = self._random_horizon_selection(
+            actions.device
+        )
+        train_weighted_loss = actions.sum() * 0.0
+        selected_weight_total = actions.sum() * 0.0
+        full_weighted_loss = actions.sum() * 0.0
+        full_weight_total = actions.sum() * 0.0
         metrics: Dict[str, torch.Tensor] = {}
         valid_prefix = torch.ones(
             batch, num_starts, dtype=torch.bool, device=actions.device
@@ -199,11 +595,32 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             horizon_cosine = (cosine * mask).sum() / denom
             valid_fraction = mask.mean()
 
-            weight = self.horizon_weights[horizon_to_index[step]].to(
+            horizon_index = horizon_to_index[step]
+            weight = self.horizon_weights[horizon_index].to(
                 device=horizon_loss.device, dtype=horizon_loss.dtype
             )
-            weighted_loss = weighted_loss + weight * horizon_loss
-            weight_total = weight_total + weight
+            selected = selected_mask[horizon_index].to(
+                device=horizon_loss.device, dtype=horizon_loss.dtype
+            )
+
+            # Preserve the exact legacy 5-horizon aggregate as a diagnostic.
+            full_weighted_loss = full_weighted_loss + weight * horizon_loss
+            full_weight_total = full_weight_total + weight
+
+            # Training objective: uniformly sample m of H horizons without
+            # replacement.  Dividing by p=m/H gives a Horvitz-Thompson-style
+            # unbiased estimator of the original full weighted sum; division by
+            # the original total weight therefore preserves expected loss scale.
+            if self.random_horizon_unbiased_reweight:
+                train_multiplier = selected / inclusion_prob.to(
+                    device=horizon_loss.device, dtype=horizon_loss.dtype
+                )
+            else:
+                train_multiplier = selected
+            train_weighted_loss = (
+                train_weighted_loss + train_multiplier * weight * horizon_loss
+            )
+            selected_weight_total = selected_weight_total + selected * weight
 
             metrics[f"s_multistep_loss_h{step}"] = horizon_loss.detach()
             metrics[f"s_multistep_cosine_h{step}"] = horizon_cosine.detach()
@@ -213,10 +630,49 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             metrics[f"s_multistep_target_raw_std_h{step}"] = (
                 target_raw.detach().std()
             )
+            metrics[f"s_random_horizon_selected_h{step}"] = selected.detach()
 
-        total = weighted_loss / weight_total.clamp_min(self.eps)
-        metrics["s_multistep_loss"] = total.detach()
+        full_total = full_weighted_loss / full_weight_total.clamp_min(self.eps)
+        if self.random_horizon_unbiased_reweight:
+            train_total = train_weighted_loss / full_weight_total.clamp_min(self.eps)
+        else:
+            train_total = train_weighted_loss / selected_weight_total.clamp_min(
+                self.eps
+            )
+
+        # Backward-compatible metric: exactly the same all-horizon weighted mean
+        # that old fixed-horizon S5A logged.  The actually optimized stochastic
+        # estimator is logged separately as s_multistep_train_loss.
+        metrics["s_multistep_loss"] = full_total.detach()
+        metrics["s_multistep_train_loss"] = train_total.detach()
         metrics["s_multistep_starts"] = torch.tensor(
             float(num_starts), device=actions.device
         )
-        return total, metrics
+        metrics["s_random_horizon_enabled"] = torch.tensor(
+            float(self.random_horizon_enabled), device=actions.device
+        )
+        metrics["s_random_horizon_selected_count"] = selected_mask.sum().detach()
+        metrics["s_random_horizon_inclusion_prob"] = inclusion_prob.detach()
+        metrics["s_random_horizon_selector_step"] = selector_step.to(
+            dtype=torch.float32
+        ).detach()
+        metrics["s_random_horizon_unbiased_reweight"] = torch.tensor(
+            float(self.random_horizon_unbiased_reweight), device=actions.device
+        )
+
+        # Diagnostics are deliberately outside the optimization objective.
+        # They use deterministic mode rollouts and torch.no_grad(), so enabling
+        # them does not consume RNG or add any gradient path to S/Z.
+        metrics.update(
+            self._run_diagnostics(
+                dynamics=dynamics,
+                posterior=posterior,
+                start_state=start_state_flat,
+                action_prefix=action_prefix,
+                starts=starts,
+                first_prefix=first_prefix,
+                batch=batch,
+                num_starts=num_starts,
+            )
+        )
+        return train_total, metrics

@@ -41,6 +41,23 @@ defaults:
     starts_per_sequence: 4
     projection_seed: 314159
     loss_scale: 0.05
+
+    # RandomHorizon: 每次world-model更新仅随机选择3/5个horizon参与S5A梯度。
+    # 所有1/2/4/8/15指标仍全部计算和记录。选择器使用checkpointed局部伪随机
+    # schedule，不消耗torch/NumPy/Python全局RNG；unbiased_reweight保持期望loss尺度。
+    random_horizon:
+      enabled: true
+      sample_count: 3
+      seed: 271828
+      unbiased_reweight: true
+
+    # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
+    diagnostics:
+      enabled: true
+      counterfactual_actions: true      # true prefix vs cyclic-shuffled / zero prefix
+      direct_vs_composed: true          # ISO3 surrogate: full open-loop vs posterior-reanchored terminal
+      direct_vs_composed_horizon: 15
+      direct_vs_composed_midpoint: 7
   # 【已移除 long_term_branch_weight】
 
   gaussian_reward_weight: 0.0  

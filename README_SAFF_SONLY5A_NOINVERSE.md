@@ -28,3 +28,5 @@ python -m py_compile networks.py models.py s_multistep_consistency.py expr.py
 python audit_saff_sonly5a_noinverse.py
 bash ./scripts/train.sh harvest_log_in_plains
 ```
+
+Diagnostics variant: see README_S5A_DIAGNOSTICS.md
