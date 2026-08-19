@@ -77,20 +77,21 @@ mod_on = build(True)
 # Use the exact same initial RNG state so the stochastic *training* rollout is identical.
 torch.manual_seed(12345)
 rng0 = torch.get_rng_state().clone()
-loss_off, metrics_off = mod_off(dyn_off, post, actions, is_first)
+loss_off, outcome_off, metrics_off = mod_off(dyn_off, post, actions, is_first)
 loss_off.backward()
 rng_after_off = torch.get_rng_state().clone()
 grad_off = dyn_off.scale.grad.detach().clone()
 
 # Reset RNG to the exact pre-forward state and run diagnostics-enabled variant.
 torch.set_rng_state(rng0)
-loss_on, metrics_on = mod_on(dyn_on, post, actions, is_first)
+loss_on, outcome_on, metrics_on = mod_on(dyn_on, post, actions, is_first)
 loss_on.backward()
 rng_after_on = torch.get_rng_state().clone()
 grad_on = dyn_on.scale.grad.detach().clone()
 
 assert torch.equal(rng_after_off, rng_after_on), "Diagnostics changed global torch RNG state"
 assert torch.allclose(loss_off, loss_on, atol=0.0, rtol=0.0), (loss_off, loss_on)
+assert float(outcome_off) == 0.0 and float(outcome_on) == 0.0
 assert torch.allclose(grad_off, grad_on, atol=0.0, rtol=0.0), (grad_off, grad_on)
 
 required = [

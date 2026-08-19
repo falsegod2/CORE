@@ -9,9 +9,7 @@ updated by the auxiliary rollout.
 
 from __future__ import annotations
 
-import itertools
 import math
-import random
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -39,6 +37,38 @@ class FixedRandomProjector(nn.Module):
         return F.linear(x, weight)
 
 
+class SOutcomeHead(nn.Module):
+    """Small deterministic-initialization head for multi-step task outcome.
+
+    The head predicts the symlog of the replay k-step discounted *environment*
+    return from [S_t, S_hat_{t+k}].  Construction is wrapped in a forked CPU
+    RNG context so enabling S-Outcome does not perturb the initialization or
+    stochastic training path of the existing model.
+    """
+
+    def __init__(self, feat_dim: int, hidden_dim: int = 256, seed: int = 161803):
+        super().__init__()
+        feat_dim = int(feat_dim)
+        hidden_dim = int(hidden_dim)
+        if feat_dim <= 0 or hidden_dim <= 0:
+            raise ValueError((feat_dim, hidden_dim))
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            self.net = nn.Sequential(
+                nn.Linear(feat_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+    def forward(self, start_feat: torch.Tensor, future_feat: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([start_feat, future_feat], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
 class SOnlyMultiStepRSSMConsistency(nn.Module):
     """5A-style open-loop consistency applied only to ISO3's S branch."""
 
@@ -50,15 +80,16 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         projection_dim: int = 512,
         starts_per_sequence: int = 4,
         projection_seed: int = 314159,
-        random_horizon_enabled: bool = False,
-        random_horizon_count: int = 3,
-        random_horizon_seed: int = 271828,
-        random_horizon_unbiased_reweight: bool = True,
         diagnostics_enabled: bool = True,
         counterfactual_diagnostics: bool = True,
         direct_vs_composed_diagnostics: bool = True,
         direct_vs_composed_horizon: Optional[int] = None,
         direct_vs_composed_midpoint: Optional[int] = None,
+        outcome_enabled: bool = False,
+        outcome_hidden_dim: int = 256,
+        outcome_init_seed: int = 161803,
+        outcome_discount: float = 0.997,
+        outcome_positive_weight: float = 1.0,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -74,22 +105,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             raise ValueError(f"Invalid horizon weights: {weights}")
         if starts_per_sequence <= 0:
             raise ValueError(starts_per_sequence)
-        if random_horizon_count <= 0 or random_horizon_count > len(horizons):
-            raise ValueError(
-                f"random_horizon_count={random_horizon_count} must be in "
-                f"[1, {len(horizons)}]"
-            )
 
         self.horizons = horizons
         self.max_horizon = max(horizons)
         self.starts_per_sequence = int(starts_per_sequence)
         self.eps = float(eps)
-        self.random_horizon_enabled = bool(random_horizon_enabled)
-        self.random_horizon_count = int(random_horizon_count)
-        self.random_horizon_seed = int(random_horizon_seed)
-        self.random_horizon_unbiased_reweight = bool(
-            random_horizon_unbiased_reweight
-        )
         self.diagnostics_enabled = bool(diagnostics_enabled)
         self.counterfactual_diagnostics = bool(counterfactual_diagnostics)
         self.direct_vs_composed_diagnostics = bool(direct_vs_composed_diagnostics)
@@ -117,6 +137,21 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         self.direct_vs_composed_horizon = dvc_horizon
         self.direct_vs_composed_midpoint = dvc_midpoint
 
+        self.outcome_enabled = bool(outcome_enabled)
+        self.outcome_discount = float(outcome_discount)
+        self.outcome_positive_weight = float(outcome_positive_weight)
+        if not (0.0 <= self.outcome_discount <= 1.0):
+            raise ValueError(f"Invalid outcome_discount={self.outcome_discount}")
+        if self.outcome_positive_weight <= 0.0:
+            raise ValueError(
+                f"Invalid outcome_positive_weight={self.outcome_positive_weight}"
+            )
+        self.outcome_head = None
+        if self.outcome_enabled:
+            self.outcome_head = SOutcomeHead(
+                int(feat_dim), int(outcome_hidden_dim), int(outcome_init_seed)
+            )
+
         self.projector = FixedRandomProjector(
             int(feat_dim), int(projection_dim), int(projection_seed)
         )
@@ -125,66 +160,6 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             torch.tensor(weights, dtype=torch.float32),
             persistent=True,
         )
-        # Checkpointed selector state.  RandomHorizon deliberately does NOT use
-        # torch.rand / NumPy / Python's global RNG: enabling it must not perturb
-        # RSSM categorical samples or any later stochastic training operation.
-        self.register_buffer(
-            "random_horizon_step",
-            torch.zeros((), dtype=torch.long),
-            persistent=True,
-        )
-
-        # Balanced random subset schedule.  For H=5 and m=3 this contains all
-        # C(5,3)=10 subsets exactly once per cycle, so every horizon is selected
-        # exactly 6/10=0.6 of updates.  Only a *local* Python Random object is
-        # used to permute the schedule at construction; global RNG is untouched.
-        combinations = list(
-            itertools.combinations(range(len(horizons)), self.random_horizon_count)
-        )
-        local_rng = random.Random(self.random_horizon_seed)
-        local_rng.shuffle(combinations)
-        schedule = torch.zeros(
-            len(combinations), len(horizons), dtype=torch.float32
-        )
-        for row, combo in enumerate(combinations):
-            schedule[row, list(combo)] = 1.0
-        self.register_buffer(
-            "random_horizon_schedule", schedule, persistent=True
-        )
-
-    def _random_horizon_selection(
-        self, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return a checkpoint-safe balanced pseudo-random horizon subset.
-
-        The schedule contains every m-of-H subset once per cycle in a seed-based
-        shuffled order.  Consequently horizon coverage is exactly balanced over
-        each full cycle, while selection order is pseudo-random and reproducible.
-        The persistent counter makes resume-from-checkpoint continue the same
-        schedule and no global random stream is consumed.
-        """
-        count_h = len(self.horizons)
-        if not self.random_horizon_enabled:
-            return (
-                torch.ones(count_h, dtype=torch.float32, device=device),
-                torch.ones((), dtype=torch.float32, device=device),
-                self.random_horizon_step.to(device=device).detach().clone(),
-            )
-
-        selector_step = self.random_horizon_step.to(device=device).detach().clone()
-        schedule = self.random_horizon_schedule.to(device=device)
-        row = torch.remainder(
-            selector_step, torch.tensor(schedule.shape[0], device=device)
-        ).long().reshape(1)
-        selected_mask = schedule.index_select(0, row).squeeze(0)
-        inclusion_prob = torch.tensor(
-            float(self.random_horizon_count) / float(count_h),
-            dtype=torch.float32,
-            device=device,
-        )
-        with torch.no_grad():
-            self.random_horizon_step.add_(1)
-        return selected_mask, inclusion_prob, selector_step
 
     @staticmethod
     def _s_feature(dynamics: nn.Module, state: TensorDict) -> torch.Tensor:
@@ -244,6 +219,31 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask = mask.to(values.dtype)
         return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
+    @staticmethod
+    def _symexp(x: torch.Tensor) -> torch.Tensor:
+        # Clamp only for logging safety. Typical harvest-log targets are tiny.
+        x = torch.clamp(x, -20.0, 20.0)
+        return torch.sign(x) * torch.expm1(torch.abs(x))
+
+    @staticmethod
+    def _masked_corr(
+        x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8
+    ) -> torch.Tensor:
+        mask = mask.to(x.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        mx = (x * mask).sum() / denom
+        my = (y * mask).sum() / denom
+        xc = (x - mx) * mask
+        yc = (y - my) * mask
+        cov = (xc * yc).sum() / denom
+        vx = (xc.square()).sum() / denom
+        vy = (yc.square()).sum() / denom
+        return cov / torch.sqrt((vx * vy).clamp_min(eps))
 
     def _project_state(
         self, dynamics: nn.Module, state: TensorDict
@@ -520,13 +520,24 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         posterior: TensorDict,
         actions: torch.Tensor,
         is_first: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        rewards: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if actions.ndim != 3:
             raise ValueError(f"Expected actions [B,T,A], got {actions.shape}")
         batch, time, _ = actions.shape
         if time <= self.max_horizon:
             zero = actions.sum() * 0.0
-            return zero, {"s_multistep_valid_fraction": zero.detach()}
+            return zero, zero, {"s_multistep_valid_fraction": zero.detach()}
+
+        if self.outcome_enabled:
+            if rewards is None:
+                raise ValueError("S-Outcome is enabled but replay rewards were not provided.")
+            if rewards.ndim == 3 and rewards.shape[-1] == 1:
+                rewards = rewards[..., 0]
+            if rewards.ndim != 2 or rewards.shape[:2] != actions.shape[:2]:
+                raise ValueError(
+                    f"Expected rewards [B,T] matching actions, got {rewards.shape}"
+                )
 
         starts = self._start_indices(time, actions.device)
         num_starts = starts.numel()
@@ -534,6 +545,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         start_state = self._gather_s_state(posterior, starts)
         start_state_flat = self._flatten_batch_starts(start_state)
         current = start_state_flat
+        start_feat_for_outcome = (
+            self._s_feature(dynamics, start_state_flat)
+            if self.outcome_enabled
+            else None
+        )
 
         # In this replay convention action[:, t] leads INTO state/observation t.
         # Therefore the first transition from state t uses action[:, t + 1].
@@ -549,16 +565,13 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         )
 
         horizon_to_index = {h: i for i, h in enumerate(self.horizons)}
-        # RandomHorizon changes only which horizon losses contribute gradient.
-        # We still execute the same stochastic rollout to max_horizon and compute
-        # every legacy per-horizon metric, preserving apples-to-apples logging.
-        selected_mask, inclusion_prob, selector_step = self._random_horizon_selection(
-            actions.device
+        weighted_loss = actions.sum() * 0.0
+        weight_total = actions.sum() * 0.0
+        outcome_weighted_loss = actions.sum() * 0.0
+        outcome_weight_total = actions.sum() * 0.0
+        discounted_return = torch.zeros(
+            batch, num_starts, dtype=actions.dtype, device=actions.device
         )
-        train_weighted_loss = actions.sum() * 0.0
-        selected_weight_total = actions.sum() * 0.0
-        full_weighted_loss = actions.sum() * 0.0
-        full_weight_total = actions.sum() * 0.0
         metrics: Dict[str, torch.Tensor] = {}
         valid_prefix = torch.ones(
             batch, num_starts, dtype=torch.bool, device=actions.device
@@ -569,6 +582,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 current, action_prefix[:, step - 1], sample=True
             )
             valid_prefix = valid_prefix & (~first_prefix[:, :, step - 1])
+            if self.outcome_enabled:
+                reward_step = rewards[:, starts + step].to(actions.dtype)
+                discounted_return = discounted_return + (
+                    self.outcome_discount ** (step - 1)
+                ) * reward_step
 
             if step not in horizon_to_index:
                 continue
@@ -595,32 +613,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             horizon_cosine = (cosine * mask).sum() / denom
             valid_fraction = mask.mean()
 
-            horizon_index = horizon_to_index[step]
-            weight = self.horizon_weights[horizon_index].to(
+            weight = self.horizon_weights[horizon_to_index[step]].to(
                 device=horizon_loss.device, dtype=horizon_loss.dtype
             )
-            selected = selected_mask[horizon_index].to(
-                device=horizon_loss.device, dtype=horizon_loss.dtype
-            )
-
-            # Preserve the exact legacy 5-horizon aggregate as a diagnostic.
-            full_weighted_loss = full_weighted_loss + weight * horizon_loss
-            full_weight_total = full_weight_total + weight
-
-            # Training objective: uniformly sample m of H horizons without
-            # replacement.  Dividing by p=m/H gives a Horvitz-Thompson-style
-            # unbiased estimator of the original full weighted sum; division by
-            # the original total weight therefore preserves expected loss scale.
-            if self.random_horizon_unbiased_reweight:
-                train_multiplier = selected / inclusion_prob.to(
-                    device=horizon_loss.device, dtype=horizon_loss.dtype
-                )
-            else:
-                train_multiplier = selected
-            train_weighted_loss = (
-                train_weighted_loss + train_multiplier * weight * horizon_loss
-            )
-            selected_weight_total = selected_weight_total + selected * weight
+            weighted_loss = weighted_loss + weight * horizon_loss
+            weight_total = weight_total + weight
 
             metrics[f"s_multistep_loss_h{step}"] = horizon_loss.detach()
             metrics[f"s_multistep_cosine_h{step}"] = horizon_cosine.detach()
@@ -630,35 +627,89 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             metrics[f"s_multistep_target_raw_std_h{step}"] = (
                 target_raw.detach().std()
             )
-            metrics[f"s_random_horizon_selected_h{step}"] = selected.detach()
 
-        full_total = full_weighted_loss / full_weight_total.clamp_min(self.eps)
-        if self.random_horizon_unbiased_reweight:
-            train_total = train_weighted_loss / full_weight_total.clamp_min(self.eps)
-        else:
-            train_total = train_weighted_loss / selected_weight_total.clamp_min(
-                self.eps
-            )
+            # S-Outcome: ground the same action-conditioned predicted S future
+            # in the *real replay task return*. It is an auxiliary world-model
+            # loss only; it is never added to the Actor's reward.
+            if self.outcome_enabled:
+                assert self.outcome_head is not None
+                assert start_feat_for_outcome is not None
+                pred_outcome_symlog = self.outcome_head(
+                    start_feat_for_outcome, pred_feat
+                )
+                target_return = discounted_return.reshape(-1).detach()
+                target_outcome_symlog = self._symlog(target_return)
 
-        # Backward-compatible metric: exactly the same all-horizon weighted mean
-        # that old fixed-horizon S5A logged.  The actually optimized stochastic
-        # estimator is logged separately as s_multistep_train_loss.
-        metrics["s_multistep_loss"] = full_total.detach()
-        metrics["s_multistep_train_loss"] = train_total.detach()
+                valid_mask = mask
+                sample_weight = valid_mask
+                if self.outcome_positive_weight != 1.0:
+                    positive = (target_return.abs() > self.eps).to(sample_weight.dtype)
+                    sample_weight = sample_weight * (
+                        1.0 + positive * (self.outcome_positive_weight - 1.0)
+                    )
+                outcome_denom = sample_weight.sum().clamp_min(1.0)
+                outcome_sqerr = (
+                    pred_outcome_symlog - target_outcome_symlog
+                ).square()
+                horizon_outcome_loss = (
+                    outcome_sqerr * sample_weight
+                ).sum() / outcome_denom
+
+                outcome_weighted_loss = (
+                    outcome_weighted_loss + weight * horizon_outcome_loss
+                )
+                outcome_weight_total = outcome_weight_total + weight
+
+                with torch.no_grad():
+                    pred_return = self._symexp(pred_outcome_symlog)
+                    abs_err = torch.abs(pred_return - target_return)
+                    metrics[f"s_outcome_loss_h{step}"] = horizon_outcome_loss.detach()
+                    metrics[f"s_outcome_target_return_mean_h{step}"] = (
+                        self._masked_mean(target_return, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_target_return_std_h{step}"] = (
+                        (
+                            ((target_return - self._masked_mean(target_return, valid_mask)) ** 2)
+                            * valid_mask
+                        ).sum()
+                        / valid_mask.sum().clamp_min(1.0)
+                    ).sqrt().detach()
+                    metrics[f"s_outcome_target_nonzero_frac_h{step}"] = (
+                        self._masked_mean(
+                            (target_return.abs() > self.eps).float(), valid_mask
+                        ).detach()
+                    )
+                    metrics[f"s_outcome_pred_return_mean_h{step}"] = (
+                        self._masked_mean(pred_return, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_mae_h{step}"] = (
+                        self._masked_mean(abs_err, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_corr_h{step}"] = self._masked_corr(
+                        pred_return, target_return, valid_mask, self.eps
+                    ).detach()
+
+        total = weighted_loss / weight_total.clamp_min(self.eps)
+        outcome_total = (
+            outcome_weighted_loss / outcome_weight_total.clamp_min(self.eps)
+            if self.outcome_enabled
+            else actions.sum() * 0.0
+        )
+        metrics["s_multistep_loss"] = total.detach()
         metrics["s_multistep_starts"] = torch.tensor(
             float(num_starts), device=actions.device
         )
-        metrics["s_random_horizon_enabled"] = torch.tensor(
-            float(self.random_horizon_enabled), device=actions.device
+        metrics["s_outcome_enabled"] = torch.tensor(
+            float(self.outcome_enabled), device=actions.device
         )
-        metrics["s_random_horizon_selected_count"] = selected_mask.sum().detach()
-        metrics["s_random_horizon_inclusion_prob"] = inclusion_prob.detach()
-        metrics["s_random_horizon_selector_step"] = selector_step.to(
-            dtype=torch.float32
-        ).detach()
-        metrics["s_random_horizon_unbiased_reweight"] = torch.tensor(
-            float(self.random_horizon_unbiased_reweight), device=actions.device
-        )
+        if self.outcome_enabled:
+            metrics["s_outcome_loss"] = outcome_total.detach()
+            metrics["s_outcome_discount"] = torch.tensor(
+                self.outcome_discount, device=actions.device
+            )
+            metrics["s_outcome_positive_weight"] = torch.tensor(
+                self.outcome_positive_weight, device=actions.device
+            )
 
         # Diagnostics are deliberately outside the optimization objective.
         # They use deterministic mode rollouts and torch.no_grad(), so enabling
@@ -675,4 +726,4 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 num_starts=num_starts,
             )
         )
-        return train_total, metrics
+        return total, outcome_total, metrics

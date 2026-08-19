@@ -42,14 +42,17 @@ defaults:
     projection_seed: 314159
     loss_scale: 0.05
 
-    # RandomHorizon: 每次world-model更新仅随机选择3/5个horizon参与S5A梯度。
-    # 所有1/2/4/8/15指标仍全部计算和记录。选择器使用checkpointed局部伪随机
-    # schedule，不消耗torch/NumPy/Python全局RNG；unbiased_reweight保持期望loss尺度。
-    random_horizon:
+    # S-Outcome: 用同一条S5A rollout的 [S_t, S_hat_{t+k}] 预测真实环境
+    # k-step discounted return。只作为world-model辅助监督，不加入Actor reward。
+    outcome:
       enabled: true
-      sample_count: 3
-      seed: 271828
-      unbiased_reweight: true
+      loss_scale: 0.01
+      hidden_dim: 256
+      init_seed: 161803
+      # 省略/设为null时由代码继承全局 discount=0.997；这里显式写出便于审计。
+      discount: 0.997
+      # 第一版保持1.0，不对稀疏正样本额外重权；后续可单独消融。
+      positive_weight: 1.0
 
     # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
     diagnostics:

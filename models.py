@@ -197,7 +197,9 @@ class WorldModel(nn.Module):
             )
             s_feat_dim = s_stoch_dim + self.dynamics._deter_s
             diag_cfg = sms_cfg.get("diagnostics", {}) or {}
-            random_h_cfg = sms_cfg.get("random_horizon", {}) or {}
+            outcome_cfg = sms_cfg.get("outcome", {}) or {}
+            self._s_outcome_enabled = bool(outcome_cfg.get("enabled", False))
+            self._s_outcome_scale = float(outcome_cfg.get("loss_scale", 0.0))
             self._s_multistep = s_multistep_consistency.SOnlyMultiStepRSSMConsistency(
                 feat_dim=s_feat_dim,
                 horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
@@ -207,12 +209,6 @@ class WorldModel(nn.Module):
                 projection_dim=int(sms_cfg.get("projection_dim", 512)),
                 starts_per_sequence=int(sms_cfg.get("starts_per_sequence", 4)),
                 projection_seed=int(sms_cfg.get("projection_seed", 314159)),
-                random_horizon_enabled=bool(random_h_cfg.get("enabled", False)),
-                random_horizon_count=int(random_h_cfg.get("sample_count", 3)),
-                random_horizon_seed=int(random_h_cfg.get("seed", 271828)),
-                random_horizon_unbiased_reweight=bool(
-                    random_h_cfg.get("unbiased_reweight", True)
-                ),
                 diagnostics_enabled=bool(diag_cfg.get("enabled", True)),
                 counterfactual_diagnostics=bool(
                     diag_cfg.get("counterfactual_actions", True)
@@ -226,7 +222,21 @@ class WorldModel(nn.Module):
                 direct_vs_composed_midpoint=diag_cfg.get(
                     "direct_vs_composed_midpoint", None
                 ),
+                outcome_enabled=self._s_outcome_enabled,
+                outcome_hidden_dim=int(outcome_cfg.get("hidden_dim", 256)),
+                outcome_init_seed=int(outcome_cfg.get("init_seed", 161803)),
+                outcome_discount=(
+                    float(config.discount)
+                    if outcome_cfg.get("discount", None) is None
+                    else float(outcome_cfg.get("discount"))
+                ),
+                outcome_positive_weight=float(
+                    outcome_cfg.get("positive_weight", 1.0)
+                ),
             )
+        else:
+            self._s_outcome_enabled = False
+            self._s_outcome_scale = 0.0
        
         for name in config.grad_heads:
             assert name in self.heads, name
@@ -358,9 +368,18 @@ class WorldModel(nn.Module):
                 #    open-loop rollout S prior，并对齐未来 posterior S。
                 s_multistep_metrics = {}
                 s_multistep_loss = loss_inv * 0.0
+                s_outcome_loss = loss_inv * 0.0
                 if self._s_multistep_enabled:
-                    s_multistep_loss, s_multistep_metrics = self._s_multistep(
-                        self.dynamics, post, data["action"], data["is_first"]
+                    (
+                        s_multistep_loss,
+                        s_outcome_loss,
+                        s_multistep_metrics,
+                    ) = self._s_multistep(
+                        self.dynamics,
+                        post,
+                        data["action"],
+                        data["is_first"],
+                        rewards=data["reward"],
                     )
 
                 # 6. 汇总总损失：保留 repaired inverse + S-Aff，关闭Z adversary，
@@ -373,6 +392,7 @@ class WorldModel(nn.Module):
                     + torch.mean(loss_affordance_s)
                     * self._scales.get("affordance_s", 1.0)
                     + self._s_multistep_scale * s_multistep_loss
+                    + self._s_outcome_scale * s_outcome_loss
                 )
 
             # 统一执行优化
@@ -387,6 +407,10 @@ class WorldModel(nn.Module):
         metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
         metrics.update({name: to_np(value) for name, value in s_multistep_metrics.items()})
         metrics["s_multistep_scale"] = self._s_multistep_scale
+        metrics["s_outcome_scale"] = self._s_outcome_scale
+        metrics["s_outcome_weighted_loss"] = to_np(
+            self._s_outcome_scale * s_outcome_loss
+        )
         metrics["model_loss"] = to_np(total_loss)
         metrics["kl"] = to_np(torch.mean(kl_value_img))
         metrics["kl_s"] = to_np(torch.mean(kl_value_s))
