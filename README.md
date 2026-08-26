@@ -1,17 +1,9 @@
-# ISO3-RGB-Aux-NoLong (project modification)
-
-> This repository is modified from the LS-Imagine codebase. The active method is an ISO-Dream-inspired, no-long-branch world model with an **RGB-only observation encoder**. Affordance maps remain training-time auxiliary targets and are not fed into the encoder. See [`METHOD_CHANGES.md`](METHOD_CHANGES.md) for the exact implementation, corrected inverse-dynamics alignment, Z-branch adversarial action invariance, metrics, and ablations.
-
-Run the static audit before training:
-
-```bash
-python audit_rgb_only_iso.py
-```
-
----
-
+<div align="center">
+<img src='assets/logo_long.png' style="height:60px"></img>
+</div>
 <h1 align="center">
- [ICLR 2025 Oral] <img src="./assets/minecraft.png" alt="logo" style="width: 32px; height: 32px; margin-right: 7px; margin-bottom: 0px;">Open-World Reinforcement Learning over Long Short-Term Imagination </h1>
+ [ICLR 2025 Oral] <i>Open-World Reinforcement Learning over Long Short-Term Imagination</i> </h1>
+<!--  <img src="./assets/minecraft.png" alt="logo" style="width: 32px; height: 32px; margin-right: 7px; margin-bottom: 0px;"> -->
 <p align="center">
     Jiajian Li*
     ·
@@ -28,7 +20,7 @@ python audit_rgb_only_iso.py
     Xiaokang Yang
   </p>
 
-<h3 align="center"> <a href="https://openreview.net/pdf?id=vzItLaEoDa" target="_blank"> Paper </a> &nbsp;&nbsp; |&nbsp;&nbsp;   <a href="https://arxiv.org/pdf/2410.03618" target="_blank"> arXiv </a> &nbsp;&nbsp; | &nbsp;&nbsp; <a href="https://qiwang067.github.io/ls-imagine" target="_blank"> Website </a> &nbsp;&nbsp; </h3>
+<h3 align="center"> <a href="https://openreview.net/pdf?id=vzItLaEoDa" target="_blank"> Paper </a> &nbsp;&nbsp; |&nbsp;&nbsp;   <a href="https://arxiv.org/pdf/2410.03618" target="_blank"> arXiv </a> &nbsp;&nbsp; | &nbsp;&nbsp; <a href="https://qiwang067.github.io/ls-imagine" target="_blank"> Website </a> &nbsp;&nbsp; <img alt="Visitors" src="https://visitor-badge.laobi.icu/badge?page_id=qiwang067.LS-Imagine&left_color=green&right_color=red"></h3>
   <div align="center"></div>
 <p align="center">
   <a href="#quick-start"><b>⚡ Quick Start</b></a> |
@@ -44,11 +36,37 @@ python audit_rgb_only_iso.py
   Training visual reinforcement learning agents in a high-dimensional open world presents significant challenges. While various model-based methods have improved sample efficiency by learning interactive world models, these agents tend to be "short-sighted", as they are typically trained on short snippets of imagined experiences. We argue that the primary challenge in open-world decision-making is improving the exploration efficiency across a vast state space, especially for tasks that demand consideration of long-horizon payoffs. In this paper, we present LS-Imgine, which extends the imagination horizon within a limited number of state transition steps, enabling the agent to explore behaviors that potentially lead to promising long-term feedback. The foundation of our approach is to build a <i>long short-term world model</i>. To achieve this, we simulate goal-conditioned jumpy state transitions and compute corresponding affordance maps by zooming in on specific areas within single images. This facilitates the integration of direct long-term values into behavior learning. Our method demonstrates significant improvements over state-of-the-art techniques in MineDojo.
 </p>
 
-<p align="center">
+## Showcases
+<table style="margin: auto;">
+<table class="center">
+  <tr>
+    <td align="center">Harvest log in plains</td>
+    <td align="center">Harvest water with bucket</td>
+    <td align="center">Shear sheep</td>
+    <td align="center">Mine iron ore</td>
+  </tr>
+  <tr>
+    <td>
+      <img src="assets/iron_demo.gif" width="170">
+    </td>
+    <td>
+      <img src="assets/log_demo.gif" width="170">
+    </td>
+    <td>
+      <img src="assets/water_demo.gif" width="170">
+    </td>
+    <td>
+      <img src="assets/wool_demo.gif" width="170">
+    </td>
+  </tr>
+</table>
 <img src="assets/success_rate_with_barplot.png" alt="evaluation_results" width="90%"/>
-</p>
 
-<!-- # Open-World Reinforcement Learning over Long Short-Term Imagination
+<!-- 
+<p align="center">
+</p>
+# Open-World Reinforcement Learning over Long Short-Term Imagination
+
 #### Open-World Reinforcement Learning over Long Short-Term Imagination
 
 Jiajian Li*, Qi Wang*, Yunbo Wang, Xin Jin, Yang Li, Wenjun Zeng, Xiaokang Yang
@@ -161,7 +179,7 @@ Before starting the learning process for the world model and behavior, ensure yo
 | harvest_water_with_bucket  | [swin_unet_checkpoint_water.pth](https://drive.google.com/file/d/1Z-7vDNOiKxFE0iaApjYznALkLu8F4cXD/view?usp=sharing)          |
 | harvest_sand               | [swin_unet_checkpoint_sand.pth](https://drive.google.com/file/d/1ZeKVY6Y99Nch_wDXOgl_WX1IEyuIFNrs/view?usp=sharing)          |
 | mine_iron_ore              | [swin_unet_checkpoint_iron.pth](https://drive.google.com/file/d/1_sUWXeVEFEYHpQmw0115pMFYJxKmMZyL/view?usp=sharing)          |
-| shear_sheep                | [swin_unet_checkpoint_wool.pth](https://drive.google.com/file/d/1uaZM1ZLBz2dZWcn85rZmjP7LV6Sg5PZW/view?usp=sharing)          |
+| shear_sheep                | [swin_unet_checkpoint_wool.pth](https://drive.google.com/file/d/1cIbkZlxdZtG4hVVErCCbBxoH8MoRLuZF/view?usp=sharing)          |
 
 </div>
 
@@ -205,9 +223,9 @@ Additionally, we provide pretrained weights for the tasks mentioned in the paper
         --agent_checkpoint_dir {path_to_latest.pt} \
         --eval_episode_num 100
     ```
--->
+    -->
 
-## Citation
+## Citation 
 If you find this repo useful, please cite our paper:
 ```bib
 @inproceedings{li2025open,
@@ -219,7 +237,6 @@ If you find this repo useful, please cite our paper:
 ```
 
 
-## Credits
+## Credits [🔝](#quick-links)
 The codes refer to the implemention of [dreamerv3-torch](https://github.com/NM512/dreamerv3-torch) and [Swin-Unet](https://github.com/HuCaoFighting/Swin-Unet). Thanks for the authors！
-
 

@@ -216,7 +216,9 @@ def simulate(
     cache, 
     directory, 
     logger, 
+    step_calculator,
     max_steps,
+    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -252,6 +254,10 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
+
+                current_step = 0
+                if t["is_zoomed"] == True:
+                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
                 obs[index] = result
@@ -300,7 +306,20 @@ def simulate(
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
 
-            information[tmp_index]['real_done'] = True
+            length = len(cache[env.id]["reward"]) 
+            current_step = length - 1
+            if transition["is_zoomed"] == True and not d:
+                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
+
+            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+            if len(tmp_list) > 0:
+                for ss in tmp_list:
+                    cache[env.id]["jumping_steps"][ss] = current_step - ss
+                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                    cache[env.id]["is_calculated"][ss] = True
+
+            if step_calculator.count_data_pairs(env.id) == 0:
+                information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -311,6 +330,7 @@ def simulate(
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
 
+                step_calculator.remove_all(envs[i].id)
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -451,7 +471,7 @@ def save_episodes(directory, episodes):
     return True
 
 def replace_none_with_zeros(episode):
-    if "image" in episode and len(episode["image"]) > 0:
+    if "image" in episode and episode["image"]:
         reference_shape = episode["image"][0].shape
     else:
         raise ValueError("Image data is missing or malformed in episode.")
@@ -461,7 +481,7 @@ def replace_none_with_zeros(episode):
             np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
         ]
     
-    if "heatmap" in episode and len(episode["heatmap"]) > 0:
+    if "heatmap" in episode and episode["heatmap"]:
         heatmap_shape = episode["heatmap"][0].shape
     else:
         heatmap_shape = None
@@ -539,44 +559,35 @@ def load_episodes(directory, limit=None, reverse=True):
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
     total = 0
-    
-    # 1. First, get the list of files to know the total count
     if reverse:
-        filenames = list(reversed(sorted(directory.glob("*.npz"))))
-    else:
-        filenames = list(sorted(directory.glob("*.npz")))
-        
-    total_files = len(filenames)
-    print(f"Found {total_files} .npz files in {directory}. Beginning to load...")
-
-    # 2. Iterate through the pre-fetched list
-    for i, filename in enumerate(filenames):
-        try:
-            with filename.open("rb") as f:
-                episode = np.load(f)
-                episode = {k: episode[k] for k in episode.keys()}
-        except Exception as e:
-            print(f"Could not load episode: {e}")
-            continue
-            
-        # extract only filename without extension
-        if reverse:
+        for filename in reversed(sorted(directory.glob("*.npz"))):
+            try:
+                with filename.open("rb") as f:
+                    episode = np.load(f)
+                    episode = {k: episode[k] for k in episode.keys()}
+            except Exception as e:
+                print(f"Could not load episode: {e}")
+                continue
+            # extract only filename without extension
             episodes[str(os.path.splitext(os.path.basename(filename))[0])] = episode
-        else:
+            total += len(episode["reward"]) - 1
+            if limit and total >= limit:
+                break
+    else:
+        for filename in sorted(directory.glob("*.npz")):
+            try:
+                with filename.open("rb") as f:
+                    episode = np.load(f)
+                    episode = {k: episode[k] for k in episode.keys()}
+            except Exception as e:
+                print(f"Could not load episode: {e}")
+                continue
             episodes[str(filename)] = episode
-            
-        total += len(episode["reward"]) - 1
-        
-        # 3. Print progress every 100 files
-        if (i + 1) % 100 == 0 or (i + 1) == total_files:
-            print(f"Loaded {i + 1} / {total_files} files... (Total steps in buffer: {total})")
-
-        if limit and total >= limit:
-            print(f"Reached step limit ({limit}). Stopping load.")
-            break
-            
-    print(f"Loading complete! Total episodes: {len(episodes)}, Total steps: {total}")
+            total += len(episode["reward"]) - 1
+            if limit and total >= limit:
+                break
     return episodes
+
 
 class SampleDist:
     def __init__(self, dist, samples=100):
