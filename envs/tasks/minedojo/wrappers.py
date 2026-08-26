@@ -38,6 +38,16 @@ class MinedojoClipReward(ClipReward):
     def get_resolution():
         return (160, 256)
     
+class MinedojoConcentrationReward(ConcentrationReward):
+    @staticmethod
+    def get_curr_frame(obs):
+        curr_frame = obs["rgb"].copy()
+        curr_frame = curr_frame.transpose((1, 2, 0))
+        return curr_frame # shape: (160, 256, 3)
+    
+    @staticmethod
+    def get_resolution():
+        return (160, 256)
 
 
 class MinedojoRewardWrapper(RewardWrapper):
@@ -102,5 +112,5 @@ class MinedojoTerminalWrapper(TerminalWrapper):
         return obs["life_stats"]["life"].item() == 0
 
 
-class MinedojoAgentWrapper(AgentWrapper):
+class MinedojoLSImagineWrapper(LSImagineWrapper):
     pass
