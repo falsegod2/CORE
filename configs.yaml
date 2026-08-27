@@ -1,32 +1,71 @@
 defaults:
-  # System and logging
+  # ==========================================
+  # 1. 系统与日志配置 (System & Logging)
+  # ==========================================
   logdir: null
   traindir: null
   evaldir: null
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
+
   video_pred_log: True
+  
   deterministic_run: False
   device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
+  
   use_wandb: False
-  wandb_key: null
+  wandb_key: None
+  resume_path: null
   enable_cloud_backup: False
   cloud_backup_interval: 7200
 
-  # Training
-  steps: 1e6
+  # ==========================================
+  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
+  # ==========================================
+  inverse_loss_scale: 0.0      # 本消融关闭inverse监督；inverse head保留实例以维持初始化/RNG路径可比性
+  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
+  z_action_adv_scale: 0.0      # 关闭Z对抗；只测试S-Aff + S-only 5A
+  z_action_grl_scale: 1.0      # Gradient Reversal强度
+
+  # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
+  # 与原5A保持同一 horizons / weights / scale；Z不参与该辅助损失。
+  s_multi_step_consistency:
+    enabled: true
+    horizons: [1, 2, 4, 8, 15]
+    horizon_weights: [1.0, 1.0, 0.75, 0.5, 0.25]
+    projection_dim: 512
+    starts_per_sequence: 4
+    projection_seed: 314159
+    loss_scale: 0.05
+
+    # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
+    diagnostics:
+      enabled: true
+      counterfactual_actions: true      # true prefix vs cyclic-shuffled / zero prefix
+      direct_vs_composed: true          # ISO3 surrogate: full open-loop vs posterior-reanchored terminal
+      direct_vs_composed_horizon: 15
+      direct_vs_composed_midpoint: 7
+  # 【已移除 long_term_branch_weight】
+
+  gaussian_reward_weight: 0.0  
+  gaussian_sigma_weight: 0.5   
+
+  # ==========================================
+  # 3. 强化学习与训练超参 (RL & Training Params)
+  # ==========================================
+  steps: 1e6                   
   parallel: False
-  eval_every: 20000
-  eval_episode_num: 10
+  eval_every: 20000            
+  eval_episode_num: 10          # 减少3-episode评估造成的离散高方差
   log_every: 20000
   reset_every: 0
-  train_ratio: 16
-  pretrain: 100
-  prefill: 2500
+  train_ratio: 16              
+  pretrain: 100                
+  prefill: 2500                
   dataset_size: 1000000
   batch_size: 16
   batch_length: 32
@@ -34,26 +73,34 @@ defaults:
   opt_eps: 1e-8
   grad_clip: 1000
   opt: 'adam'
-  reward_EMA: True
+  reward_EMA: True             
 
-  # Environment
+  # ==========================================
+  # 4. 环境设置 (Environment)
+  # ==========================================
   task: 'minedojo'
+  size: [64, 64]
   envs: 1
   action_repeat: 1
   time_limit: 36000
+  grayscale: False
+  break_speed: 100.0
 
-  # Standard DreamerV3 latent imagination
+  # ==========================================
+  # 5. 行为策略与长短期想象 (Behavior & Imagination)
+  # ==========================================
   discount: 0.997
   discount_lambda: 0.95
-  imag_horizon: 15
-  imag_gradient: 'reinforce'
+  # 【已移除 jump_prob 和 jump_prob_decay】
+  imag_horizon: 15             
+  max_imag_sequences_num: 1024
+  imag_gradient: 'reinforce'   
   imag_gradient_mix: 0.0
   eval_state_mean: False
 
-  # Reward used by actor-critic: environment + scaled MineCLIP
-  mineclip_reward_scale: 1.0
-
-  # Standard single-stream DreamerV3 world model
+  # ==========================================
+  # 6. 世界模型架构 (World Model Architecture)
+  # ==========================================
   dyn_hidden: 1024
   dyn_deter: 4096
   dyn_stoch: 32
@@ -68,26 +115,36 @@ defaults:
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
+  img_weight: 1.0
+  jmp_weight: 1.0
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
-
+  
   encoder:
     {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
-    {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+    {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  
+  # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
 
-  grad_heads: ['decoder', 'reward', 'end', 'mineclip_reward']
-
+  # ==========================================
+  # 7. 策略与价值网络 (Actor-Critic & Heads)
+  # ==========================================
   actor:
     {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic:
+  critic: 
     {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  
   reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   end_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
-  mineclip_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  intrinsic_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  # 【已移除 jump_head, jumping_steps_head, accumulated_reward_head, concentration_score_head】
 
-  # Optional Plan2Explore settings
+  # ==========================================
+  # 8. 探索参数 (Exploration)
+  # ==========================================
   expl_behavior: 'greedy'
   expl_until: 0
   expl_extr_scale: 0.0
@@ -101,10 +158,11 @@ defaults:
   disag_action_cond: False
 
 minedojo:
-  target_item: 'log'
-  name: 'test'
-  results_dir: './results'
-  agent_checkpoint_dir: ''
+  target_item: "log"
+  name: "test"
+  results_dir: "./results"
+  agent_checkpoint_dir: ""
+  unet_batch_size: 64
   rollout_image_num: 2000
   is_random: True
 

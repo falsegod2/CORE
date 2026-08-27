@@ -22,9 +22,9 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-class DreamerV3Agent(nn.Module):
+class LS_Imagine(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super().__init__()
+        super(LS_Imagine, self).__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -88,7 +88,7 @@ class DreamerV3Agent(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
+            latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -119,7 +119,7 @@ class DreamerV3Agent(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        mineclip_reward = lambda f, s, a: self._wm.heads["mineclip_reward"](
+        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
 
@@ -127,7 +127,7 @@ class DreamerV3Agent(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, reward, mineclip_reward, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
@@ -223,6 +223,10 @@ def main(config): # config is namespace
     task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
 
     config.episode_max_steps = task_specs['terminal_specs']['max_steps']
+    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
+    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
+    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
+    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
     
     train_envs = [make("train", i) for i in range(config.envs)]
     eval_envs = [make("eval", i) for i in range(config.envs)]
@@ -278,7 +282,7 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = DreamerV3Agent(
+    agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -320,7 +324,7 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent,
+            agent, # LS_Imagine
             train_envs, 
             train_eps,
             config.traindir,
@@ -339,12 +343,17 @@ def main(config): # config is namespace
         
         torch.save(items_to_save, logdir / "latest.pt")
 
-        # Keep publication-grade historical checkpoints for independent evaluation.
-        if agent._step % 100000 == 0:
-            torch.save(
-                items_to_save,
-                logdir / f"checkpoint_{agent._step}.pt",
-            )
+        # Publication-grade historical checkpoints for independent evaluation.
+        # Save every 100k environment steps without changing optimization.
+        current_step = int(agent._step)
+        previous_step = max(0, current_step - int(config.eval_every))
+        crossed_100k_boundary = (
+            current_step // 100000 > previous_step // 100000
+        )
+        if current_step > 0 and crossed_100k_boundary:
+            # With prefill=2500 the actual checkpoints are typically 102.5k,
+            # 202.5k, ...; use the true environment step in the filename.
+            torch.save(items_to_save, logdir / f"checkpoint_{current_step}.pt")
 
     for env in train_envs + eval_envs:
         try:
