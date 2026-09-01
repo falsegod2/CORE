@@ -258,6 +258,43 @@ class WorldModel(nn.Module):
                 prototype_ema=float(
                     prototype_cfg.get("prototype_ema", 0.95)
                 ),
+                prototype_label_mode=str(
+                    prototype_cfg.get("label_mode", "task_evidence")
+                ),
+                prototype_positive_threshold=float(
+                    prototype_cfg.get("positive_threshold", 1.0e-6)
+                ),
+                prototype_semantic_weight=float(
+                    prototype_cfg.get("semantic_weight", 0.65)
+                ),
+                prototype_affordance_weight=float(
+                    prototype_cfg.get("affordance_weight", 0.30)
+                ),
+                prototype_intrinsic_weight=float(
+                    prototype_cfg.get("intrinsic_weight", 0.05)
+                ),
+                prototype_heatmap_topk_fraction=float(
+                    prototype_cfg.get("heatmap_topk_fraction", 0.05)
+                ),
+                prototype_robust_low_quantile=float(
+                    prototype_cfg.get("robust_low_quantile", 0.05)
+                ),
+                prototype_robust_high_quantile=float(
+                    prototype_cfg.get("robust_high_quantile", 0.95)
+                ),
+                prototype_stage_low_quantile=float(
+                    prototype_cfg.get("stage_low_quantile", 0.30)
+                ),
+                prototype_stage_high_quantile=float(
+                    prototype_cfg.get("stage_high_quantile", 0.70)
+                ),
+                prototype_boundary_margin=float(
+                    prototype_cfg.get("boundary_margin", 0.05)
+                ),
+                prototype_min_signal_span=float(
+                    prototype_cfg.get("min_signal_span", 1.0e-4)
+                ),
+                # Retained only if label_mode=temporal_success for ablation.
                 prototype_ready_steps=int(
                     prototype_cfg.get("ready_steps", 4)
                 ),
@@ -266,9 +303,6 @@ class WorldModel(nn.Module):
                 ),
                 prototype_progress_steps=prototype_cfg.get(
                     "progress_steps", None
-                ),
-                prototype_positive_threshold=float(
-                    prototype_cfg.get("positive_threshold", 1.0e-6)
                 ),
             )
         else:
@@ -421,6 +455,11 @@ class WorldModel(nn.Module):
                         data["action"],
                         data["is_first"],
                         rewards=data["reward"],
+                        # Generic task-evidence teachers. These are auxiliary-only
+                        # and are not consumed by the RGB observation encoder.
+                        task_scores=data.get("task_score", None),
+                        heatmaps=data.get("heatmap", None),
+                        intrinsic=data.get("intrinsic", None),
                     )
 
                 # 6. 汇总总损失：保留 repaired inverse + S-Aff，关闭Z adversary，

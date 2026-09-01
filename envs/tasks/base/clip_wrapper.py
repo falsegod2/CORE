@@ -32,6 +32,9 @@ class ClipWrapper(Wrapper):
         obs = self.env.reset(**kwargs)
         obs['intrinsic'] = 0.0
         obs['score'] = 0.0
+        # Raw [0,1] task-conditioned MineCLIP score for prototype supervision.
+        # It is carried through replay but is NOT fed to the RGB encoder.
+        obs['task_score'] = 0.0
 
         return obs
     
@@ -52,10 +55,12 @@ class ClipWrapper(Wrapper):
                 obs['intrinsic'] = 0.0
 
             obs['score'] = self.dense_reward * score
+            obs['task_score'] = float(score)
 
         else:
             obs['intrinsic'] = 0.0
             obs['score'] = 0.0
+            obs['task_score'] = 0.0
 
         if len(self.expl_prompt) > 0:
             logits, self._expl_clip_state = self.clip.get_logits(obs, self.expl_prompt, self._expl_clip_state)

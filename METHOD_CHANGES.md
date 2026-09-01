@@ -1,3 +1,5 @@
+> **Prototype v2 update:** the default prototype labels are now task-agnostic `Low/Mid/High/Success` stages derived from task-conditioned MineCLIP score + affordance heatmap + weak intrinsic progress, with real reward as the Success anchor. The earlier fixed time-to-success partition is retained only as an ablation. See `README_GENERIC_PROTOTYPE_UTILITY_CN.md`.
+
 # ISO3-RGB-Aux-NoLong：修改说明
 
 本版本以 `ISO2-M-NoLong` 为主干。目标不是删除 affordance map 本身，而是阻止它作为观测直接进入世界模型 encoder，将其改为训练期辅助教师信号。

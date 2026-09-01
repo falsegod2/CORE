@@ -16,7 +16,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from s_prototype_utility import PrototypeUtilityBank, build_progress_labels
+from s_prototype_utility import (
+    PrototypeUtilityBank,
+    build_progress_labels,
+    build_task_evidence_labels,
+)
 
 TensorDict = Mapping[str, torch.Tensor]
 
@@ -100,10 +104,22 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         prototype_enabled: bool = False,
         prototype_temperature: float = 0.10,
         prototype_ema: float = 0.95,
+        prototype_label_mode: str = "task_evidence",
+        prototype_positive_threshold: float = 1.0e-6,
+        prototype_semantic_weight: float = 0.65,
+        prototype_affordance_weight: float = 0.30,
+        prototype_intrinsic_weight: float = 0.05,
+        prototype_heatmap_topk_fraction: float = 0.05,
+        prototype_robust_low_quantile: float = 0.05,
+        prototype_robust_high_quantile: float = 0.95,
+        prototype_stage_low_quantile: float = 0.30,
+        prototype_stage_high_quantile: float = 0.70,
+        prototype_boundary_margin: float = 0.05,
+        prototype_min_signal_span: float = 1.0e-4,
+        # Legacy temporal-success mode parameters (ablation only).
         prototype_ready_steps: int = 4,
         prototype_near_steps: int = 15,
         prototype_progress_steps: Optional[int] = None,
-        prototype_positive_threshold: float = 1.0e-6,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -196,16 +212,34 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             persistent=True,
         )
 
-        # Few-shot Prototypical Utility supervision.
-        # Support examples are detached real posterior-S features projected by the
-        # same frozen projector used by S5A. Queries are S5A-predicted future S.
+        # Generic few-shot Prototypical Utility supervision.
+        # Default labels come from task-conditioned evidence (MineCLIP score +
+        # affordance heatmap + a weak intrinsic progress event), not from a
+        # sheep/tree-specific time-to-success partition. Real reward is only the
+        # hard Success anchor. The old temporal scheme remains as an ablation.
         self.prototype_enabled = bool(prototype_enabled)
+        self.prototype_label_mode = str(prototype_label_mode).lower()
+        if self.prototype_label_mode not in {"task_evidence", "temporal_success"}:
+            raise ValueError(
+                f"prototype_label_mode must be task_evidence or temporal_success, "
+                f"got {self.prototype_label_mode}"
+            )
+        self.prototype_positive_threshold = float(prototype_positive_threshold)
+        self.prototype_semantic_weight = float(prototype_semantic_weight)
+        self.prototype_affordance_weight = float(prototype_affordance_weight)
+        self.prototype_intrinsic_weight = float(prototype_intrinsic_weight)
+        self.prototype_heatmap_topk_fraction = float(prototype_heatmap_topk_fraction)
+        self.prototype_robust_low_quantile = float(prototype_robust_low_quantile)
+        self.prototype_robust_high_quantile = float(prototype_robust_high_quantile)
+        self.prototype_stage_low_quantile = float(prototype_stage_low_quantile)
+        self.prototype_stage_high_quantile = float(prototype_stage_high_quantile)
+        self.prototype_boundary_margin = float(prototype_boundary_margin)
+        self.prototype_min_signal_span = float(prototype_min_signal_span)
         self.prototype_ready_steps = int(prototype_ready_steps)
         self.prototype_near_steps = int(prototype_near_steps)
         self.prototype_progress_steps = (
             None if prototype_progress_steps is None else int(prototype_progress_steps)
         )
-        self.prototype_positive_threshold = float(prototype_positive_threshold)
         self.prototype_bank = None
         if self.prototype_enabled:
             self.prototype_bank = PrototypeUtilityBank(
@@ -432,26 +466,58 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         posterior: TensorDict,
         rewards: torch.Tensor,
         is_first: torch.Tensor,
+        task_scores: Optional[torch.Tensor] = None,
+        heatmaps: Optional[torch.Tensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        """Build task-stage labels and update EMA prototypes from posterior S.
+        """Build generic task-stage labels and update posterior-S prototypes.
 
-        This path is deliberately gradient-free.  It turns the few observed
-        real success trajectories into Progress/Near/Ready/Success support
-        examples, without treating zero-reward states as negatives.
+        Default `task_evidence` mode is task-agnostic. It combines the current
+        task's MineCLIP semantic score, task-conditioned affordance heatmap, and
+        a weak intrinsic progress event. Each component is robustly normalized
+        inside the replay batch, so no task-specific threshold or time horizon
+        is hard-coded. Real environment reward remains the Success anchor.
+
+        `temporal_success` is retained only as an ablation/backward comparison.
+        This whole support path is no_grad: pseudo labels cannot directly train
+        the posterior encoder. They supervise only S5A-predicted future S queries.
         """
         if not self.prototype_enabled or self.prototype_bank is None:
             labels = torch.full_like(rewards, -1, dtype=torch.long)
-            distance = torch.full_like(rewards, -1, dtype=torch.long)
-            return labels, distance, {}
+            aux = torch.zeros_like(rewards, dtype=torch.float32)
+            return labels, aux, {}
 
-        labels, distance = build_progress_labels(
-            rewards=rewards,
-            is_first=is_first,
-            positive_threshold=self.prototype_positive_threshold,
-            ready_steps=self.prototype_ready_steps,
-            near_steps=self.prototype_near_steps,
-            progress_steps=self.prototype_progress_steps,
-        )
+        metrics: Dict[str, torch.Tensor] = {}
+        if self.prototype_label_mode == "task_evidence":
+            labels, aux, teacher_metrics = build_task_evidence_labels(
+                rewards=rewards,
+                task_scores=task_scores,
+                heatmaps=heatmaps,
+                intrinsic=intrinsic,
+                positive_threshold=self.prototype_positive_threshold,
+                semantic_weight=self.prototype_semantic_weight,
+                affordance_weight=self.prototype_affordance_weight,
+                intrinsic_weight=self.prototype_intrinsic_weight,
+                heatmap_topk_fraction=self.prototype_heatmap_topk_fraction,
+                robust_low_quantile=self.prototype_robust_low_quantile,
+                robust_high_quantile=self.prototype_robust_high_quantile,
+                stage_low_quantile=self.prototype_stage_low_quantile,
+                stage_high_quantile=self.prototype_stage_high_quantile,
+                boundary_margin=self.prototype_boundary_margin,
+                min_signal_span=self.prototype_min_signal_span,
+            )
+            metrics.update(teacher_metrics)
+            class_names = ("low", "mid", "high", "success")
+        else:
+            labels, aux = build_progress_labels(
+                rewards=rewards,
+                is_first=is_first,
+                positive_threshold=self.prototype_positive_threshold,
+                ready_steps=self.prototype_ready_steps,
+                near_steps=self.prototype_near_steps,
+                progress_steps=self.prototype_progress_steps,
+            )
+            class_names = ("progress", "near", "ready", "success")
 
         posterior_feat = self._s_feature(dynamics, posterior)
         support_raw = self.projector(posterior_feat.float())
@@ -461,17 +527,19 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             support_labels=labels.detach(),
         )
 
-        metrics: Dict[str, torch.Tensor] = {}
         metrics.update(self.prototype_bank.metrics())
         metrics.update({name: value.detach() for name, value in added.items()})
         known = labels >= 0
         metrics["s_proto_known_fraction"] = known.float().mean().detach()
         metrics["s_proto_unknown_fraction"] = (~known).float().mean().detach()
-        for cls, name in enumerate(("progress", "near", "ready", "success")):
+        metrics["s_proto_label_mode_task_evidence"] = torch.tensor(
+            float(self.prototype_label_mode == "task_evidence"), device=rewards.device
+        )
+        for cls, name in enumerate(class_names):
             metrics[f"s_proto_batch_{name}_count"] = (
                 (labels == cls).float().sum().detach()
             )
-        return labels, distance, metrics
+        return labels, aux, metrics
 
     @staticmethod
     def _masked_corr(
@@ -764,6 +832,9 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         actions: torch.Tensor,
         is_first: torch.Tensor,
         rewards: Optional[torch.Tensor] = None,
+        task_scores: Optional[torch.Tensor] = None,
+        heatmaps: Optional[torch.Tensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if actions.ndim != 3:
             raise ValueError(f"Expected actions [B,T,A], got {actions.shape}")
@@ -793,6 +864,9 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 posterior=posterior,
                 rewards=rewards,
                 is_first=is_first,
+                task_scores=task_scores,
+                heatmaps=heatmaps,
+                intrinsic=intrinsic,
             )
 
         starts = self._start_indices(time, actions.device)

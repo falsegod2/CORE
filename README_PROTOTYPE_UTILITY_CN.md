@@ -1,3 +1,5 @@
+> **注意：此文件描述的是 v1 temporal-success 原型。当前默认版本已升级为跨任务的 Generic Task-Evidence Prototype Utility v2。请优先阅读 `README_GENERIC_PROTOTYPE_UTILITY_CN.md`。**
+
 # ISO3-SAff-SOnly5A-NoInverse-BalancedOutcome-ProtoNet-Clean
 
 这是在用户上传的：

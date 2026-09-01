@@ -68,21 +68,46 @@ defaults:
       calibration_enabled: true
       calibration_scale: 0.5
 
-    # Few-shot Prototypical Utility:
-    # 从极少数真实成功轨迹向前传播 Progress/Near/Ready/Success 阶段标签，
-    # 用真实 posterior-S 建立 EMA prototype，并监督 S5A 预测 future-S。
-    # 只作为 representation supervision，不加入 Actor imagined reward。
+    # Generic Few-shot Prototypical Utility v2:
+    # 不再按“距离成功还有4/15步”做任务特定的时间分层。默认使用所有任务都存在的
+    # task-conditioned evidence：MineCLIP task score + affordance heatmap + 少量 intrinsic
+    # progress event，经过 batch 内稳健分位数归一化后形成 Low/Mid/High/Success 四类。
+    # real environment reward 只负责 Success 硬锚点。仍然只作为 representation
+    # supervision，不加入 Actor imagined reward，因此 RGB-only inference 不变。
     prototype_utility:
       enabled: true
       loss_scale: 0.01
       temperature: 0.10
       prototype_ema: 0.95
+
+      # task_evidence = 默认通用版；temporal_success = 旧版时间分层，仅供消融。
+      label_mode: task_evidence
+
+      # 通用 teacher 权重。task_score 和 heatmap 都是 task-conditioned，
+      # 数值会先在每个 replay batch 内做稳健分位数归一化，因此不需要为每个任务手调阈值。
+      semantic_weight: 0.65
+      affordance_weight: 0.30
+      intrinsic_weight: 0.05
+      heatmap_topk_fraction: 0.05
+
+      # robust component normalization: q05 -> 0, q95 -> 1
+      robust_low_quantile: 0.05
+      robust_high_quantile: 0.95
+
+      # combined task evidence 的三段相对分层：Low / Mid / High。
+      # 边界附近留作 Unknown，降低 noisy pseudo labels。
+      stage_low_quantile: 0.30
+      stage_high_quantile: 0.70
+      boundary_margin: 0.05
+      min_signal_span: 1.0e-4
+
+      # 真实成功永远覆盖 pseudo stage，成为 class 3 的硬锚点。
+      positive_threshold: 1.0e-6
+
+      # 下面三个参数仅 label_mode=temporal_success 时使用。
       ready_steps: 4
       near_steps: 15
-      # null: 当前 replay chunk 内，只要未来能观察到 success，
-      # 更早的状态都可标为 Progress；没有未来 success 的状态保持 Unknown(-1)。
       progress_steps: null
-      positive_threshold: 1.0e-6
 
     # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
     diagnostics:

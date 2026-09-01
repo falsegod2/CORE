@@ -69,6 +69,9 @@ class LSImagineWrapper(Wrapper, ABC):
                 'is_last': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'is_terminal': spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
                 'intrinsic': spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                # Raw MineCLIP task score, teacher-only. Encoder mlp_keys='$^' keeps
+                # RGB-only inference unchanged.
+                'task_score': spaces.Box(0.0, 1.0, (1,), dtype=np.float32),
             }
         )
 
@@ -129,6 +132,9 @@ class LSImagineWrapper(Wrapper, ABC):
             'is_last': obs['is_last'],
             'is_terminal': obs['is_terminal'],
             'intrinsic': obs['intrinsic'] if 'intrinsic' in obs else 0.0,
+            'task_score': np.asarray(
+                [obs.get('task_score', 0.0)], dtype=np.float32
+            ),
         }
 
         
