@@ -16,6 +16,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from s_prototype_utility import PrototypeUtilityBank, build_progress_labels
+
 TensorDict = Mapping[str, torch.Tensor]
 
 
@@ -37,6 +39,38 @@ class FixedRandomProjector(nn.Module):
         return F.linear(x, weight)
 
 
+class SOutcomeHead(nn.Module):
+    """Small deterministic-initialization head for multi-step task outcome.
+
+    The head predicts the symlog of the replay k-step discounted *environment*
+    return from [S_t, S_hat_{t+k}].  Construction is wrapped in a forked CPU
+    RNG context so enabling S-Outcome does not perturb the initialization or
+    stochastic training path of the existing model.
+    """
+
+    def __init__(self, feat_dim: int, hidden_dim: int = 256, seed: int = 161803):
+        super().__init__()
+        feat_dim = int(feat_dim)
+        hidden_dim = int(hidden_dim)
+        if feat_dim <= 0 or hidden_dim <= 0:
+            raise ValueError((feat_dim, hidden_dim))
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            self.net = nn.Sequential(
+                nn.Linear(feat_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+
+    def forward(self, start_feat: torch.Tensor, future_feat: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([start_feat, future_feat], dim=-1)
+        return self.net(x).squeeze(-1)
+
+
 class SOnlyMultiStepRSSMConsistency(nn.Module):
     """5A-style open-loop consistency applied only to ISO3's S branch."""
 
@@ -53,6 +87,23 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         direct_vs_composed_diagnostics: bool = True,
         direct_vs_composed_horizon: Optional[int] = None,
         direct_vs_composed_midpoint: Optional[int] = None,
+        outcome_enabled: bool = False,
+        outcome_hidden_dim: int = 256,
+        outcome_init_seed: int = 161803,
+        outcome_discount: float = 0.997,
+        outcome_positive_weight: float = 1.0,
+        outcome_balance_mode: str = "balanced",
+        outcome_positive_mix: float = 0.5,
+        outcome_positive_threshold: float = 1.0e-6,
+        outcome_calibration_enabled: bool = True,
+        outcome_calibration_scale: float = 0.5,
+        prototype_enabled: bool = False,
+        prototype_temperature: float = 0.10,
+        prototype_ema: float = 0.95,
+        prototype_ready_steps: int = 4,
+        prototype_near_steps: int = 15,
+        prototype_progress_steps: Optional[int] = None,
+        prototype_positive_threshold: float = 1.0e-6,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -100,6 +151,42 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         self.direct_vs_composed_horizon = dvc_horizon
         self.direct_vs_composed_midpoint = dvc_midpoint
 
+        self.outcome_enabled = bool(outcome_enabled)
+        self.outcome_discount = float(outcome_discount)
+        self.outcome_positive_weight = float(outcome_positive_weight)
+        self.outcome_balance_mode = str(outcome_balance_mode).lower()
+        self.outcome_positive_mix = float(outcome_positive_mix)
+        self.outcome_positive_threshold = float(outcome_positive_threshold)
+        self.outcome_calibration_enabled = bool(outcome_calibration_enabled)
+        self.outcome_calibration_scale = float(outcome_calibration_scale)
+        if not (0.0 <= self.outcome_discount <= 1.0):
+            raise ValueError(f"Invalid outcome_discount={self.outcome_discount}")
+        if self.outcome_positive_weight <= 0.0:
+            raise ValueError(
+                f"Invalid outcome_positive_weight={self.outcome_positive_weight}"
+            )
+        if self.outcome_balance_mode not in {"balanced", "sample_weighted"}:
+            raise ValueError(
+                f"Invalid outcome_balance_mode={self.outcome_balance_mode}"
+            )
+        if not (0.0 <= self.outcome_positive_mix <= 1.0):
+            raise ValueError(
+                f"Invalid outcome_positive_mix={self.outcome_positive_mix}"
+            )
+        if self.outcome_positive_threshold < 0.0:
+            raise ValueError(
+                f"Invalid outcome_positive_threshold={self.outcome_positive_threshold}"
+            )
+        if self.outcome_calibration_scale < 0.0:
+            raise ValueError(
+                f"Invalid outcome_calibration_scale={self.outcome_calibration_scale}"
+            )
+        self.outcome_head = None
+        if self.outcome_enabled:
+            self.outcome_head = SOutcomeHead(
+                int(feat_dim), int(outcome_hidden_dim), int(outcome_init_seed)
+            )
+
         self.projector = FixedRandomProjector(
             int(feat_dim), int(projection_dim), int(projection_seed)
         )
@@ -108,6 +195,25 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             torch.tensor(weights, dtype=torch.float32),
             persistent=True,
         )
+
+        # Few-shot Prototypical Utility supervision.
+        # Support examples are detached real posterior-S features projected by the
+        # same frozen projector used by S5A. Queries are S5A-predicted future S.
+        self.prototype_enabled = bool(prototype_enabled)
+        self.prototype_ready_steps = int(prototype_ready_steps)
+        self.prototype_near_steps = int(prototype_near_steps)
+        self.prototype_progress_steps = (
+            None if prototype_progress_steps is None else int(prototype_progress_steps)
+        )
+        self.prototype_positive_threshold = float(prototype_positive_threshold)
+        self.prototype_bank = None
+        if self.prototype_enabled:
+            self.prototype_bank = PrototypeUtilityBank(
+                feature_dim=int(projection_dim),
+                temperature=float(prototype_temperature),
+                prototype_ema=float(prototype_ema),
+                eps=self.eps,
+            )
 
     @staticmethod
     def _s_feature(dynamics: nn.Module, state: TensorDict) -> torch.Tensor:
@@ -167,6 +273,220 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         mask = mask.to(values.dtype)
         return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
+    @staticmethod
+    def _symexp(x: torch.Tensor) -> torch.Tensor:
+        # Clamp only for logging safety. Typical harvest-log targets are tiny.
+        x = torch.clamp(x, -20.0, 20.0)
+        return torch.sign(x) * torch.expm1(torch.abs(x))
+
+    def _outcome_regression_loss(
+        self,
+        pred_symlog: torch.Tensor,
+        target_return: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Class-balanced regression for extremely sparse real returns.
+
+        ``balanced`` computes separate positive and zero-return means and mixes
+        them with ``outcome_positive_mix``. This prevents thousands of zero
+        targets from numerically overwhelming the rare positive targets.
+        ``sample_weighted`` retains the original weighted-MSE behavior for
+        exact ablations/backward compatibility.
+        """
+        target_symlog = self._symlog(target_return)
+        sqerr = (pred_symlog - target_symlog).square()
+        valid = valid_mask.to(torch.bool)
+        positive = valid & (target_return.abs() > self.outcome_positive_threshold)
+        negative = valid & (~positive)
+
+        pos_f = positive.to(sqerr.dtype)
+        neg_f = negative.to(sqerr.dtype)
+        valid_f = valid.to(sqerr.dtype)
+        pos_count = pos_f.sum()
+        neg_count = neg_f.sum()
+        valid_count = valid_f.sum()
+        pos_mean = (sqerr * pos_f).sum() / pos_count.clamp_min(1.0)
+        neg_mean = (sqerr * neg_f).sum() / neg_count.clamp_min(1.0)
+
+        if self.outcome_balance_mode == "sample_weighted":
+            sample_weight = valid_f * (
+                1.0
+                + pos_f * (self.outcome_positive_weight - 1.0)
+            )
+            loss = (sqerr * sample_weight).sum() / sample_weight.sum().clamp_min(1.0)
+        else:
+            both = (pos_count > 0) & (neg_count > 0)
+            has_pos = pos_count > 0
+            balanced = (
+                self.outcome_positive_mix * pos_mean
+                + (1.0 - self.outcome_positive_mix) * neg_mean
+            )
+            # torch.where avoids Python branching on CUDA tensors / compile syncs.
+            loss = torch.where(
+                both,
+                balanced,
+                torch.where(has_pos, pos_mean, neg_mean),
+            )
+            # Degenerate all-invalid case should remain exactly zero.
+            loss = torch.where(valid_count > 0, loss, sqerr.sum() * 0.0)
+
+        stats = {
+            "positive_count": pos_count.detach(),
+            "negative_count": neg_count.detach(),
+            "positive_loss": pos_mean.detach(),
+            "negative_loss": neg_mean.detach(),
+            "valid_count": valid_count.detach(),
+        }
+        return loss, stats
+
+    def _dense_outcome_calibration(
+        self,
+        dynamics: nn.Module,
+        posterior: TensorDict,
+        rewards: torch.Tensor,
+        is_first: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Calibrate the Outcome head on dense replay posterior windows.
+
+        This auxiliary term uses [S_t, S_{t+k}] from replay posterior states
+        for every legal start position in the sampled sequence. Both S features
+        are detached, so calibration updates only the Outcome head. The main
+        rollout Outcome loss still uses [S_t, S_hat_{t+k}] and therefore remains
+        the only return-prediction path that shapes the S dynamics.
+        """
+        if (
+            not self.outcome_enabled
+            or not self.outcome_calibration_enabled
+            or self.outcome_head is None
+        ):
+            zero = rewards.sum() * 0.0
+            return zero, {}
+
+        batch, time = rewards.shape
+        weighted = rewards.sum() * 0.0
+        weight_total = rewards.sum() * 0.0
+        metrics: Dict[str, torch.Tensor] = {}
+        horizon_to_index = {h: i for i, h in enumerate(self.horizons)}
+
+        for step in self.horizons:
+            usable = time - step
+            if usable <= 0:
+                continue
+            starts = torch.arange(usable, device=rewards.device, dtype=torch.long)
+            valid = torch.ones(batch, usable, dtype=torch.bool, device=rewards.device)
+            ret = torch.zeros(batch, usable, dtype=rewards.dtype, device=rewards.device)
+            for offset in range(1, step + 1):
+                idx = starts + offset
+                valid = valid & (~is_first[:, idx].bool())
+                ret = ret + (self.outcome_discount ** (offset - 1)) * rewards[:, idx]
+
+            start_state = self._flatten_batch_starts(
+                self._gather_s_state(posterior, starts)
+            )
+            future_state = self._flatten_batch_starts(
+                self._gather_s_state(posterior, starts + step)
+            )
+            # Detach posterior features: calibration must not turn privileged
+            # return targets into an encoder/RSSM shortcut.
+            start_feat = self._s_feature(dynamics, start_state).detach()
+            future_feat = self._s_feature(dynamics, future_state).detach()
+            pred_symlog = self.outcome_head(start_feat, future_feat)
+            target_return = ret.reshape(-1).detach()
+            valid_mask = valid.reshape(-1)
+            loss_h, stats = self._outcome_regression_loss(
+                pred_symlog, target_return, valid_mask
+            )
+            weight = self.horizon_weights[horizon_to_index[step]].to(
+                device=loss_h.device, dtype=loss_h.dtype
+            )
+            weighted = weighted + weight * loss_h
+            weight_total = weight_total + weight
+
+            metrics[f"s_outcome_calibration_loss_h{step}"] = loss_h.detach()
+            metrics[f"s_outcome_calibration_positive_count_h{step}"] = stats[
+                "positive_count"
+            ]
+            metrics[f"s_outcome_calibration_negative_count_h{step}"] = stats[
+                "negative_count"
+            ]
+            metrics[f"s_outcome_calibration_positive_loss_h{step}"] = stats[
+                "positive_loss"
+            ]
+            metrics[f"s_outcome_calibration_negative_loss_h{step}"] = stats[
+                "negative_loss"
+            ]
+
+        total = weighted / weight_total.clamp_min(self.eps)
+        metrics["s_outcome_calibration_loss"] = total.detach()
+        return total, metrics
+
+    @torch.no_grad()
+    def _prepare_prototype_support(
+        self,
+        dynamics: nn.Module,
+        posterior: TensorDict,
+        rewards: torch.Tensor,
+        is_first: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Build task-stage labels and update EMA prototypes from posterior S.
+
+        This path is deliberately gradient-free.  It turns the few observed
+        real success trajectories into Progress/Near/Ready/Success support
+        examples, without treating zero-reward states as negatives.
+        """
+        if not self.prototype_enabled or self.prototype_bank is None:
+            labels = torch.full_like(rewards, -1, dtype=torch.long)
+            distance = torch.full_like(rewards, -1, dtype=torch.long)
+            return labels, distance, {}
+
+        labels, distance = build_progress_labels(
+            rewards=rewards,
+            is_first=is_first,
+            positive_threshold=self.prototype_positive_threshold,
+            ready_steps=self.prototype_ready_steps,
+            near_steps=self.prototype_near_steps,
+            progress_steps=self.prototype_progress_steps,
+        )
+
+        posterior_feat = self._s_feature(dynamics, posterior)
+        support_raw = self.projector(posterior_feat.float())
+        support_proj = F.normalize(support_raw, dim=-1, eps=self.eps)
+        added = self.prototype_bank.update(
+            support_features=support_proj.detach(),
+            support_labels=labels.detach(),
+        )
+
+        metrics: Dict[str, torch.Tensor] = {}
+        metrics.update(self.prototype_bank.metrics())
+        metrics.update({name: value.detach() for name, value in added.items()})
+        known = labels >= 0
+        metrics["s_proto_known_fraction"] = known.float().mean().detach()
+        metrics["s_proto_unknown_fraction"] = (~known).float().mean().detach()
+        for cls, name in enumerate(("progress", "near", "ready", "success")):
+            metrics[f"s_proto_batch_{name}_count"] = (
+                (labels == cls).float().sum().detach()
+            )
+        return labels, distance, metrics
+
+    @staticmethod
+    def _masked_corr(
+        x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8
+    ) -> torch.Tensor:
+        mask = mask.to(x.dtype)
+        denom = mask.sum().clamp_min(1.0)
+        mx = (x * mask).sum() / denom
+        my = (y * mask).sum() / denom
+        xc = (x - mx) * mask
+        yc = (y - my) * mask
+        cov = (xc * yc).sum() / denom
+        vx = (xc.square()).sum() / denom
+        vy = (yc.square()).sum() / denom
+        return cov / torch.sqrt((vx * vy).clamp_min(eps))
 
     def _project_state(
         self, dynamics: nn.Module, state: TensorDict
@@ -443,13 +763,37 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         posterior: TensorDict,
         actions: torch.Tensor,
         is_first: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        rewards: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         if actions.ndim != 3:
             raise ValueError(f"Expected actions [B,T,A], got {actions.shape}")
         batch, time, _ = actions.shape
         if time <= self.max_horizon:
             zero = actions.sum() * 0.0
-            return zero, {"s_multistep_valid_fraction": zero.detach()}
+            return zero, zero, zero, {"s_multistep_valid_fraction": zero.detach()}
+
+        if self.outcome_enabled or self.prototype_enabled:
+            if rewards is None:
+                raise ValueError(
+                    "S-Outcome/Prototype Utility is enabled but replay rewards were not provided."
+                )
+            if rewards.ndim == 3 and rewards.shape[-1] == 1:
+                rewards = rewards[..., 0]
+            if rewards.ndim != 2 or rewards.shape[:2] != actions.shape[:2]:
+                raise ValueError(
+                    f"Expected rewards [B,T] matching actions, got {rewards.shape}"
+                )
+
+        prototype_labels = None
+        prototype_metrics: Dict[str, torch.Tensor] = {}
+        if self.prototype_enabled:
+            assert rewards is not None
+            prototype_labels, _, prototype_metrics = self._prepare_prototype_support(
+                dynamics=dynamics,
+                posterior=posterior,
+                rewards=rewards,
+                is_first=is_first,
+            )
 
         starts = self._start_indices(time, actions.device)
         num_starts = starts.numel()
@@ -457,6 +801,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         start_state = self._gather_s_state(posterior, starts)
         start_state_flat = self._flatten_batch_starts(start_state)
         current = start_state_flat
+        start_feat_for_outcome = (
+            self._s_feature(dynamics, start_state_flat)
+            if self.outcome_enabled
+            else None
+        )
 
         # In this replay convention action[:, t] leads INTO state/observation t.
         # Therefore the first transition from state t uses action[:, t + 1].
@@ -474,6 +823,13 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         horizon_to_index = {h: i for i, h in enumerate(self.horizons)}
         weighted_loss = actions.sum() * 0.0
         weight_total = actions.sum() * 0.0
+        outcome_weighted_loss = actions.sum() * 0.0
+        outcome_weight_total = actions.sum() * 0.0
+        prototype_weighted_loss = actions.sum() * 0.0
+        prototype_weight_total = actions.sum() * 0.0
+        discounted_return = torch.zeros(
+            batch, num_starts, dtype=actions.dtype, device=actions.device
+        )
         metrics: Dict[str, torch.Tensor] = {}
         valid_prefix = torch.ones(
             batch, num_starts, dtype=torch.bool, device=actions.device
@@ -484,6 +840,11 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 current, action_prefix[:, step - 1], sample=True
             )
             valid_prefix = valid_prefix & (~first_prefix[:, :, step - 1])
+            if self.outcome_enabled:
+                reward_step = rewards[:, starts + step].to(actions.dtype)
+                discounted_return = discounted_return + (
+                    self.outcome_discount ** (step - 1)
+                ) * reward_step
 
             if step not in horizon_to_index:
                 continue
@@ -525,11 +886,152 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 target_raw.detach().std()
             )
 
+            # Few-shot Prototype Utility: classify the same differentiable
+            # predicted future S by task stage.  Real posterior S only updates
+            # detached EMA support prototypes; no prototype utility is added to
+            # actor imagined reward.
+            if self.prototype_enabled:
+                assert self.prototype_bank is not None
+                assert prototype_labels is not None
+                target_proto = prototype_labels[:, target_indices].reshape(-1).clone()
+                valid_mask_proto = mask.to(torch.bool)
+                target_proto[~valid_mask_proto] = -1
+                horizon_proto_loss, proto_stats = self.prototype_bank.loss(
+                    pred_proj,
+                    target_proto,
+                )
+                prototype_weighted_loss = (
+                    prototype_weighted_loss + weight * horizon_proto_loss
+                )
+                prototype_weight_total = prototype_weight_total + weight
+                metrics[f"s_proto_loss_h{step}"] = horizon_proto_loss.detach()
+                metrics[f"s_proto_acc_h{step}"] = proto_stats["acc"].detach()
+                metrics[f"s_proto_num_h{step}"] = proto_stats["num"].detach()
+
+            # S-Outcome: ground the same action-conditioned predicted S future
+            # in the *real replay task return*. It is an auxiliary world-model
+            # loss only; it is never added to the Actor's reward.
+            if self.outcome_enabled:
+                assert self.outcome_head is not None
+                assert start_feat_for_outcome is not None
+                pred_outcome_symlog = self.outcome_head(
+                    start_feat_for_outcome, pred_feat
+                )
+                target_return = discounted_return.reshape(-1).detach()
+                valid_mask = mask.to(torch.bool)
+                horizon_outcome_loss, outcome_stats = self._outcome_regression_loss(
+                    pred_outcome_symlog, target_return, valid_mask
+                )
+
+                outcome_weighted_loss = (
+                    outcome_weighted_loss + weight * horizon_outcome_loss
+                )
+                outcome_weight_total = outcome_weight_total + weight
+
+                with torch.no_grad():
+                    pred_return = self._symexp(pred_outcome_symlog)
+                    abs_err = torch.abs(pred_return - target_return)
+                    metrics[f"s_outcome_loss_h{step}"] = horizon_outcome_loss.detach()
+                    metrics[f"s_outcome_rollout_positive_count_h{step}"] = outcome_stats[
+                        "positive_count"
+                    ]
+                    metrics[f"s_outcome_rollout_negative_count_h{step}"] = outcome_stats[
+                        "negative_count"
+                    ]
+                    metrics[f"s_outcome_rollout_positive_loss_h{step}"] = outcome_stats[
+                        "positive_loss"
+                    ]
+                    metrics[f"s_outcome_rollout_negative_loss_h{step}"] = outcome_stats[
+                        "negative_loss"
+                    ]
+                    metrics[f"s_outcome_target_return_mean_h{step}"] = (
+                        self._masked_mean(target_return, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_target_return_std_h{step}"] = (
+                        (
+                            ((target_return - self._masked_mean(target_return, valid_mask)) ** 2)
+                            * valid_mask
+                        ).sum()
+                        / valid_mask.sum().clamp_min(1.0)
+                    ).sqrt().detach()
+                    metrics[f"s_outcome_target_nonzero_frac_h{step}"] = (
+                        self._masked_mean(
+                            (target_return.abs() > self.eps).float(), valid_mask
+                        ).detach()
+                    )
+                    metrics[f"s_outcome_pred_return_mean_h{step}"] = (
+                        self._masked_mean(pred_return, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_mae_h{step}"] = (
+                        self._masked_mean(abs_err, valid_mask).detach()
+                    )
+                    metrics[f"s_outcome_corr_h{step}"] = self._masked_corr(
+                        pred_return, target_return, valid_mask, self.eps
+                    ).detach()
+
         total = weighted_loss / weight_total.clamp_min(self.eps)
+        outcome_rollout_total = (
+            outcome_weighted_loss / outcome_weight_total.clamp_min(self.eps)
+            if self.outcome_enabled
+            else actions.sum() * 0.0
+        )
+        outcome_calibration_loss = actions.sum() * 0.0
+        if self.outcome_enabled and self.outcome_calibration_enabled:
+            assert rewards is not None
+            outcome_calibration_loss, calibration_metrics = (
+                self._dense_outcome_calibration(
+                    dynamics=dynamics,
+                    posterior=posterior,
+                    rewards=rewards,
+                    is_first=is_first,
+                )
+            )
+            metrics.update(calibration_metrics)
+        outcome_total = (
+            outcome_rollout_total
+            + self.outcome_calibration_scale * outcome_calibration_loss
+            if self.outcome_enabled
+            else actions.sum() * 0.0
+        )
+        prototype_total = (
+            prototype_weighted_loss / prototype_weight_total.clamp_min(self.eps)
+            if self.prototype_enabled
+            else actions.sum() * 0.0
+        )
+        metrics.update(prototype_metrics)
+        metrics["s_proto_enabled"] = torch.tensor(
+            float(self.prototype_enabled), device=actions.device
+        )
+        if self.prototype_enabled:
+            metrics["s_proto_loss"] = prototype_total.detach()
         metrics["s_multistep_loss"] = total.detach()
         metrics["s_multistep_starts"] = torch.tensor(
             float(num_starts), device=actions.device
         )
+        metrics["s_outcome_enabled"] = torch.tensor(
+            float(self.outcome_enabled), device=actions.device
+        )
+        if self.outcome_enabled:
+            metrics["s_outcome_loss"] = outcome_total.detach()
+            metrics["s_outcome_rollout_loss"] = outcome_rollout_total.detach()
+            metrics["s_outcome_calibration_weighted_loss"] = (
+                self.outcome_calibration_scale * outcome_calibration_loss
+            ).detach()
+            metrics["s_outcome_discount"] = torch.tensor(
+                self.outcome_discount, device=actions.device
+            )
+            metrics["s_outcome_positive_weight"] = torch.tensor(
+                self.outcome_positive_weight, device=actions.device
+            )
+            metrics["s_outcome_positive_mix"] = torch.tensor(
+                self.outcome_positive_mix, device=actions.device
+            )
+            metrics["s_outcome_calibration_scale"] = torch.tensor(
+                self.outcome_calibration_scale, device=actions.device
+            )
+            metrics["s_outcome_balance_mode_balanced"] = torch.tensor(
+                float(self.outcome_balance_mode == "balanced"), device=actions.device
+            )
 
         # Diagnostics are deliberately outside the optimization objective.
         # They use deterministic mode rollouts and torch.no_grad(), so enabling
@@ -546,4 +1048,4 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 num_starts=num_starts,
             )
         )
-        return total, metrics
+        return total, outcome_total, prototype_total, metrics

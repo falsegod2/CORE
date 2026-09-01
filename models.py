@@ -197,6 +197,12 @@ class WorldModel(nn.Module):
             )
             s_feat_dim = s_stoch_dim + self.dynamics._deter_s
             diag_cfg = sms_cfg.get("diagnostics", {}) or {}
+            outcome_cfg = sms_cfg.get("outcome", {}) or {}
+            prototype_cfg = sms_cfg.get("prototype_utility", {}) or {}
+            self._s_outcome_enabled = bool(outcome_cfg.get("enabled", False))
+            self._s_outcome_scale = float(outcome_cfg.get("loss_scale", 0.0))
+            self._s_prototype_enabled = bool(prototype_cfg.get("enabled", False))
+            self._s_prototype_scale = float(prototype_cfg.get("loss_scale", 0.0))
             self._s_multistep = s_multistep_consistency.SOnlyMultiStepRSSMConsistency(
                 feat_dim=s_feat_dim,
                 horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
@@ -219,7 +225,57 @@ class WorldModel(nn.Module):
                 direct_vs_composed_midpoint=diag_cfg.get(
                     "direct_vs_composed_midpoint", None
                 ),
+                outcome_enabled=self._s_outcome_enabled,
+                outcome_hidden_dim=int(outcome_cfg.get("hidden_dim", 256)),
+                outcome_init_seed=int(outcome_cfg.get("init_seed", 161803)),
+                outcome_discount=(
+                    float(config.discount)
+                    if outcome_cfg.get("discount", None) is None
+                    else float(outcome_cfg.get("discount"))
+                ),
+                outcome_positive_weight=float(
+                    outcome_cfg.get("positive_weight", 1.0)
+                ),
+                outcome_balance_mode=str(
+                    outcome_cfg.get("balance_mode", "balanced")
+                ),
+                outcome_positive_mix=float(
+                    outcome_cfg.get("positive_mix", 0.5)
+                ),
+                outcome_positive_threshold=float(
+                    outcome_cfg.get("positive_threshold", 1.0e-6)
+                ),
+                outcome_calibration_enabled=bool(
+                    outcome_cfg.get("calibration_enabled", True)
+                ),
+                outcome_calibration_scale=float(
+                    outcome_cfg.get("calibration_scale", 0.5)
+                ),
+                prototype_enabled=self._s_prototype_enabled,
+                prototype_temperature=float(
+                    prototype_cfg.get("temperature", 0.10)
+                ),
+                prototype_ema=float(
+                    prototype_cfg.get("prototype_ema", 0.95)
+                ),
+                prototype_ready_steps=int(
+                    prototype_cfg.get("ready_steps", 4)
+                ),
+                prototype_near_steps=int(
+                    prototype_cfg.get("near_steps", 15)
+                ),
+                prototype_progress_steps=prototype_cfg.get(
+                    "progress_steps", None
+                ),
+                prototype_positive_threshold=float(
+                    prototype_cfg.get("positive_threshold", 1.0e-6)
+                ),
             )
+        else:
+            self._s_outcome_enabled = False
+            self._s_outcome_scale = 0.0
+            self._s_prototype_enabled = False
+            self._s_prototype_scale = 0.0
        
         for name in config.grad_heads:
             assert name in self.heads, name
@@ -351,9 +407,20 @@ class WorldModel(nn.Module):
                 #    open-loop rollout S prior，并对齐未来 posterior S。
                 s_multistep_metrics = {}
                 s_multistep_loss = loss_inv * 0.0
+                s_outcome_loss = loss_inv * 0.0
+                s_prototype_loss = loss_inv * 0.0
                 if self._s_multistep_enabled:
-                    s_multistep_loss, s_multistep_metrics = self._s_multistep(
-                        self.dynamics, post, data["action"], data["is_first"]
+                    (
+                        s_multistep_loss,
+                        s_outcome_loss,
+                        s_prototype_loss,
+                        s_multistep_metrics,
+                    ) = self._s_multistep(
+                        self.dynamics,
+                        post,
+                        data["action"],
+                        data["is_first"],
+                        rewards=data["reward"],
                     )
 
                 # 6. 汇总总损失：保留 repaired inverse + S-Aff，关闭Z adversary，
@@ -366,6 +433,8 @@ class WorldModel(nn.Module):
                     + torch.mean(loss_affordance_s)
                     * self._scales.get("affordance_s", 1.0)
                     + self._s_multistep_scale * s_multistep_loss
+                    + self._s_outcome_scale * s_outcome_loss
+                    + self._s_prototype_scale * s_prototype_loss
                 )
 
             # 统一执行优化
@@ -380,6 +449,14 @@ class WorldModel(nn.Module):
         metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
         metrics.update({name: to_np(value) for name, value in s_multistep_metrics.items()})
         metrics["s_multistep_scale"] = self._s_multistep_scale
+        metrics["s_outcome_scale"] = self._s_outcome_scale
+        metrics["s_outcome_weighted_loss"] = to_np(
+            self._s_outcome_scale * s_outcome_loss
+        )
+        metrics["s_prototype_scale"] = self._s_prototype_scale
+        metrics["s_prototype_weighted_loss"] = to_np(
+            self._s_prototype_scale * s_prototype_loss
+        )
         metrics["model_loss"] = to_np(total_loss)
         metrics["kl"] = to_np(torch.mean(kl_value_img))
         metrics["kl_s"] = to_np(torch.mean(kl_value_s))

@@ -42,6 +42,48 @@ defaults:
     projection_seed: 314159
     loss_scale: 0.05
 
+    # S-Outcome: 用同一条S5A rollout的 [S_t, S_hat_{t+k}] 预测真实环境
+    # k-step discounted return。只作为world-model辅助监督，不加入Actor reward。
+    outcome:
+      enabled: true
+      loss_scale: 0.01
+      hidden_dim: 256
+      init_seed: 161803
+      # 省略/设为null时由代码继承全局 discount=0.997；这里显式写出便于审计。
+      discount: 0.997
+
+      # Balanced Multi-Step Return Prediction
+      # 原始Outcome中非零真实回报极稀疏（约1e-3量级），普通MSE容易退化为“全预测0”。
+      # balanced模式分别求正/负样本均值，再按positive_mix混合；只有一类样本时退化为该类均值。
+      balance_mode: balanced
+      positive_mix: 0.5
+      positive_threshold: 1.0e-6
+      # 仅用于legacy sample_weighted模式；balanced模式下不使用。
+      positive_weight: 1.0
+
+      # Head calibration：额外使用同一replay batch中所有合法posterior窗口，
+      # 从 [S_t, S_{t+k}] 预测真实k-step return。posterior特征detach，
+      # 因而该项只校准Outcome head，不向S/Z encoder或RSSM注入捷径。
+      # 主rollout outcome loss仍使用 [S_t, S_hat_{t+k}]，并继续向S dynamics反传。
+      calibration_enabled: true
+      calibration_scale: 0.5
+
+    # Few-shot Prototypical Utility:
+    # 从极少数真实成功轨迹向前传播 Progress/Near/Ready/Success 阶段标签，
+    # 用真实 posterior-S 建立 EMA prototype，并监督 S5A 预测 future-S。
+    # 只作为 representation supervision，不加入 Actor imagined reward。
+    prototype_utility:
+      enabled: true
+      loss_scale: 0.01
+      temperature: 0.10
+      prototype_ema: 0.95
+      ready_steps: 4
+      near_steps: 15
+      # null: 当前 replay chunk 内，只要未来能观察到 success，
+      # 更早的状态都可标为 Progress；没有未来 success 的状态保持 Unknown(-1)。
+      progress_steps: null
+      positive_threshold: 1.0e-6
+
     # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
     diagnostics:
       enabled: true

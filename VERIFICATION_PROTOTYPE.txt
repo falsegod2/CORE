@@ -1,0 +1,26 @@
+Verification for ISO3-SAff-SOnly5A-NoInverse-BalancedOutcome-ProtoNet-Clean
+
+Python compileall: PASS
+
+test_prototype_utility.py: PASS
+test_s_outcome.py: PASS
+test_s5a_diagnostics_invariance.py: PASS
+audit_prototype_utility.py: PASS
+audit_s_outcome.py: PASS
+audit_s5a_diagnostics.py: PASS
+audit_saff_sonly5a_noinverse.py: PASS
+audit_rgb_only_iso.py: PASS
+audit_saff_inverse_sonly5a.py: PASS
+
+Important test_prototype_utility.py output:
+PASS: ordinal prototype labels are generated from rare real success
+PASS: zero-reward/no-success trajectory stays Unknown, not negative
+PASS: Prototype Utility leaves the S5A RNG/sampling path unchanged
+PASS: Prototype loss backpropagates through predicted future S
+PASS: Prototype metrics are present
+prototype loss: 0.9993613958358765
+initialized: 4
+supports: [17, 8, 4, 2]
+
+Note: Python startup in this environment emitted an unrelated artifact_tool spreadsheet warmup warning.
+It did not affect the test exit codes or project code tests.

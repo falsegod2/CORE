@@ -1,0 +1,41 @@
+Modified directly from the uploaded ISO3-SAff-SOnly5A-NoInverse-BalancedOutcome-Clean project.
+
+Changed:
+1. NEW s_prototype_utility.py
+   - distance-to-next-success labeling
+   - Progress/Near/Ready/Success labels
+   - Unknown(-1) for states without observed future success
+   - EMA PrototypeUtilityBank with cosine ProtoNet loss
+
+2. MOD s_multistep_consistency.py
+   - prototype config arguments
+   - update prototypes from detached real posterior S
+   - reuse existing FixedRandomProjector
+   - use differentiable S5A future-S as ProtoNet query
+   - aggregate proto loss across horizons [1,2,4,8,15]
+   - add prototype metrics
+   - return prototype_total alongside S5A/Outcome losses
+
+3. MOD models.py
+   - parse prototype_utility config
+   - add prototype loss with global scale
+   - log weighted prototype loss
+   - actor/critic and imagined reward unchanged
+
+4. MOD configs.yaml
+   - enable prototype_utility
+   - loss_scale=0.01
+   - temperature=0.10
+   - prototype_ema=0.95
+   - ready_steps=4
+   - near_steps=15
+   - progress_steps=null
+
+5. NEW test_prototype_utility.py and audit_prototype_utility.py
+6. MOD existing tests for the extended forward return signature.
+7. MOD old legacy inverse audit to match this project's existing NoInverse=0 protocol.
+
+Core training objective:
+L_total = L_base + L_S-Aff + 0.05 L_S5A + 0.01 L_Outcome + 0.01 L_Proto
+
+Prototype Utility is NOT added to actor imagined reward.
