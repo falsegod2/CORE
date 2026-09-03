@@ -1,0 +1,29 @@
+Ablation-baseline changes relative to the uploaded projects
+
+NEW / SPLIT BACKENDS
+- models.py                  lazy backend dispatcher
+- models_dreamer.py          clean single-stream Dreamer backend (interface name intrinsic)
+- networks_dreamer.py        exact clean single-stream RSSM/network implementation
+- models_modular.py          Dual S/Z + current auxiliary modules
+- networks_modular.py        current Dual S/Z network implementation
+- ablation.py                runtime module dependency/scalar resolver
+
+MODIFIED
+- configs.yaml               flat module switches + named ablation presets
+- expr.py                    apply/print ablation config; pass heatmap-pipeline flag
+- envs/tasks/minedojo/__init__.py
+                            skip affordance U-Net unless an active module needs it
+- models_modular.py          S-Aff can be truly disabled; explicit full heatmap scale
+- scripts/train.sh           profile-aware wrapper, default ab_dreamer
+
+NEW UTILITIES
+- scripts/train_ablation.sh
+- scripts/run_core_ablation_tree.sh
+- scripts/audit_ablation_profiles.py
+- README_ABLATION_CN.md
+- ABLATION_MATRIX.csv
+
+UNCHANGED CORE METHOD FILES
+- s_multistep_consistency.py
+- s_prototype_utility.py
+- current S5A / Balanced Outcome / Generic Prototype mechanics

@@ -24,17 +24,44 @@ defaults:
   cloud_backup_interval: 7200
 
   # ==========================================
-  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
+  # 2. 模块化消融开关 (edit these or use ab_* presets below)
   # ==========================================
+  # Architecture switch. All S-branch modules require module_dual_sz=true.
+  module_dual_sz: false
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: false
+  module_inverse: false
+  module_z_adv: false
+
+  # Main ablation coefficients. These are mapped onto the implementation at
+  # runtime by ablation.py, so they can be changed directly from CLI.
+  saff_scale: 1.0
+  full_heatmap_scale: 1.0
+  s5a_scale: 0.05
+  outcome_scale: 0.01
+  proto_scale: 0.01
+  inverse_scale: 1.0
+  z_adv_scale: 1.0
+
+  # Generic Proto can also be switched to the old temporal-success labels.
+  proto_label_mode: task_evidence
+
+  # Actor/Critic reward shaping. Keep 1.0 to match the existing experiments;
+  # set 0.0 for environment-reward-only ablations.
+  intrinsic_reward_scale: 1.0
+
+  # Effective values below are overwritten by ablation.py from the switches.
   inverse_loss_scale: 0.0      # 本消融关闭inverse监督；inverse head保留实例以维持初始化/RNG路径可比性
-  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
+  affordance_s_scale: 0.0      # Affordance仅作为S分支辅助监督，不再输入encoder
   z_action_adv_scale: 0.0      # 关闭Z对抗；只测试S-Aff + S-only 5A
   z_action_grl_scale: 1.0      # Gradient Reversal强度
 
   # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
   # 与原5A保持同一 horizons / weights / scale；Z不参与该辅助损失。
   s_multi_step_consistency:
-    enabled: true
+    enabled: false
     horizons: [1, 2, 4, 8, 15]
     horizon_weights: [1.0, 1.0, 0.75, 0.5, 0.25]
     projection_dim: 512
@@ -45,7 +72,7 @@ defaults:
     # S-Outcome: 用同一条S5A rollout的 [S_t, S_hat_{t+k}] 预测真实环境
     # k-step discounted return。只作为world-model辅助监督，不加入Actor reward。
     outcome:
-      enabled: true
+      enabled: false
       loss_scale: 0.01
       hidden_dim: 256
       init_seed: 161803
@@ -75,7 +102,7 @@ defaults:
     # real environment reward 只负责 Success 硬锚点。仍然只作为 representation
     # supervision，不加入 Actor imagined reward，因此 RGB-only inference 不变。
     prototype_utility:
-      enabled: true
+      enabled: false
       loss_scale: 0.01
       temperature: 0.10
       prototype_ema: 0.95
@@ -191,7 +218,7 @@ defaults:
   encoder:
     {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
-    {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+    {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   
   # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
   grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
@@ -239,3 +266,129 @@ debug:
   prefill: 1
   batch_size: 10
   batch_length: 20
+
+# ============================================================
+# Named ablation presets
+# Usage:
+#   python expr.py --configs minedojo ab_dreamer --task minedojo_harvest_log_in_plains --logdir ./logdir
+# or:
+#   bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer 0
+#
+# IMPORTANT:
+# S-Aff / S5A / Outcome / Proto operate on the S branch and therefore include
+# Dual S/Z. "ab_saff" means Dreamer + Dual S/Z + S-Aff, not S-Aff on a
+# single-stream RSSM.
+# ============================================================
+
+ab_dreamer:
+  module_dual_sz: false
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: false
+  module_inverse: false
+  module_z_adv: false
+
+ab_dreamer_no_intrinsic:
+  module_dual_sz: false
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: false
+  module_inverse: false
+  module_z_adv: false
+  intrinsic_reward_scale: 0.0
+
+ab_dual:
+  module_dual_sz: true
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: false
+  module_inverse: false
+  module_z_adv: false
+
+# Single-module ablations on top of the required Dual S/Z backbone.
+ab_saff:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: false
+  module_outcome: false
+  module_proto: false
+
+ab_s5a:
+  module_dual_sz: true
+  module_saff: false
+  module_s5a: true
+  module_outcome: false
+  module_proto: false
+
+ab_outcome:
+  module_dual_sz: true
+  module_saff: false
+  module_s5a: false
+  module_outcome: true
+  module_proto: false
+
+ab_proto:
+  module_dual_sz: true
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: true
+
+# Cumulative ablations matching the current method-development chain.
+ab_saff_s5a:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: false
+  module_proto: false
+
+ab_saff_s5a_outcome:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: true
+  module_proto: false
+
+ab_saff_s5a_proto:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: false
+  module_proto: true
+
+ab_full:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: true
+  module_proto: true
+
+# Useful sensitivity presets.
+ab_full_proto_half:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: true
+  module_proto: true
+  proto_scale: 0.005
+
+ab_full_no_intrinsic:
+  module_dual_sz: true
+  module_saff: true
+  module_s5a: true
+  module_outcome: true
+  module_proto: true
+  intrinsic_reward_scale: 0.0
+
+# Optional legacy modules retained for dedicated ablations.
+ab_inverse:
+  module_dual_sz: true
+  module_inverse: true
+
+ab_z_adv:
+  module_dual_sz: true
+  module_z_adv: true
+

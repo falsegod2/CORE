@@ -1,0 +1,25 @@
+DreamerV3 Modular Ablation Validation
+====================================
+
+[1] Python compileall
+PASS
+
+[2] Ablation profile audit
+PASS: all core ablation profiles resolve to the intended modules.
+
+[3] Clean Dreamer network backend identity
+PASS: networks_dreamer.py is byte-equivalent in content to uploaded clean networks.py
+
+[4] Backend imports
+9:import networks_dreamer as networks
+23:import networks_modular as networks
+PASS: explicit backend separation present
+
+[5] Full profile effective settings
+backend= dual_sz
+saff= 1.0
+s5a= 0.05
+outcome= True 0.01
+proto= True 0.01
+decoder= ^(image|heatmap)$
+heatmap_aux= True

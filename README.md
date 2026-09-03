@@ -1,3 +1,11 @@
+# Modular DreamerV3 Ablation Baseline
+
+**Start here:** `README_ABLATION_CN.md`
+
+This package contains both the clean single-stream DreamerV3 backend and the current Dual-S/Z modular backend. Use the `ab_*` config presets to run controlled ablations.
+
+---
+
 # ISO3-RGB-Aux-NoLong (project modification)
 
 > This repository is modified from the LS-Imagine codebase. The active method is an ISO-Dream-inspired, no-long-branch world model with an **RGB-only observation encoder**. Affordance maps remain training-time auxiliary targets and are not fed into the encoder. See [`METHOD_CHANGES.md`](METHOD_CHANGES.md) for the exact implementation, corrected inverse-dynamics alignment, Z-branch adversarial action invariance, metrics, and ablations.

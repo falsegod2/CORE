@@ -11,6 +11,7 @@ from torch import distributions as torchd
 from datetime import datetime
 
 import exploration as expl
+import ablation
 import models
 import tools
 import envs.wrappers as wrappers
@@ -22,9 +23,9 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-class LS_Imagine(nn.Module):
+class DreamerAblationAgent(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super(LS_Imagine, self).__init__()
+        super().__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -88,7 +89,13 @@ class LS_Imagine(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+            if "stoch" in latent:
+                latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
+            elif "stoch_s" in latent and "stoch_z" in latent:
+                s_stats = {k[2:]: v for k, v in latent.items() if k.startswith("s_")}
+                z_stats = {k[2:]: v for k, v in latent.items() if k.startswith("z_")}
+                latent["stoch_s"] = self._wm.dynamics.get_dist(s_stats).mode()
+                latent["stoch_z"] = self._wm.dynamics.get_dist(z_stats).mode()
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -153,7 +160,8 @@ def make_env(config, mode, id):
 
         kwargs=dict(
                 log_dir=log_dir,
-                target_item=config.target_item
+                target_item=config.target_item,
+                use_heatmap_aux=bool(getattr(config, "use_heatmap_aux", False)),
             )
         env = minedojo.make_env(task, **kwargs)
         env = wrappers.OneHotAction(env)
@@ -169,6 +177,12 @@ def make_env(config, mode, id):
 
 
 def main(config): # config is namespace
+
+    # Resolve flat ablation switches into the exact backend/loss configuration.
+    # This happens before environment/model construction so disabled modules
+    # cannot leave hidden losses active.
+    config = ablation.apply_ablation_config(config)
+    ablation.print_summary(config)
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
@@ -282,7 +296,7 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = LS_Imagine(
+    agent = DreamerAblationAgent(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -324,7 +338,7 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent, # LS_Imagine
+            agent, # DreamerAblationAgent
             train_envs, 
             train_eps,
             config.traindir,

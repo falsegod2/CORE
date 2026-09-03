@@ -1,0 +1,12 @@
+profile,single_dreamer_rssm,dual_sz,s_aff,s5a_consistency,balanced_outcome,generic_proto,intrinsic_reward_scale,notes
+ab_dreamer,1,0,0,0,0,0,1.0,Clean Dreamer baseline
+ab_dreamer_no_intrinsic,1,0,0,0,0,0,0.0,Actor-critic uses environment reward only
+ab_dual,0,1,0,0,0,0,1.0,Dual S/Z structural effect only
+ab_saff,0,1,1,0,0,0,1.0,Single S-Aff module on Dual backbone
+ab_s5a,0,1,0,1,0,0,1.0,Single S5A loss on Dual backbone
+ab_outcome,0,1,0,0,1,0,1.0,S5A rollout machinery active but S5A loss=0
+ab_proto,0,1,0,0,0,1,1.0,S5A rollout machinery active but S5A loss=0
+ab_saff_s5a,0,1,1,1,0,0,1.0,Cumulative representation baseline
+ab_saff_s5a_outcome,0,1,1,1,1,0,1.0,Cumulative + Outcome
+ab_saff_s5a_proto,0,1,1,1,0,1,1.0,Cumulative + Generic Proto; recommended no-Outcome test
+ab_full,0,1,1,1,1,1,1.0,Current full GenericTask method

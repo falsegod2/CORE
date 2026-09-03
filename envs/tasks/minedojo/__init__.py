@@ -59,6 +59,11 @@ def _add_wrappers(
     **kwargs
 ):
     
+    # Ablation flag: skip the expensive affordance U-Net unless S-Aff or
+    # Generic Proto actually needs heatmaps. LSImagineWrapper still emits a
+    # zero heatmap so observation structure stays identical across profiles.
+    use_heatmap_aux = bool(kwargs.pop("use_heatmap_aux", True))
+
     if terminal_specs is None:
         terminal_specs = dict(max_steps=500, on_death=True)
     if success_specs and terminal_specs:
@@ -78,7 +83,7 @@ def _add_wrappers(
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
     
-    if concentration_specs is not None:
+    if concentration_specs is not None and use_heatmap_aux:
         unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
         gaussian_sigma_weight = concentration_specs["gaussian_sigma_weight"] if "gaussian_sigma_weight" in concentration_specs else 0.5
         concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight)
