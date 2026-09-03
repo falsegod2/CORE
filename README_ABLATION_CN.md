@@ -28,24 +28,25 @@ intrinsic_reward_scale: 1.0
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer_no_intrinsic 0
 ```
 
-### S 分支模块的依赖
+### S 分支模块的依赖与 Proto 例外
 
-S-Aff、S5A、Outcome、Proto 都定义在 controllable `S` branch 上，因此必须先有 Dual S/Z。
+S-Aff、S5A、Outcome 仍然定义在 controllable `S` branch 上，因此必须先有 Dual S/Z。
 
-所以：
+Generic Proto 现在增加了一个**严格的单流 Dreamer 消融**：
 
-- `ab_saff` = Dreamer + Dual S/Z + S-Aff
-- `ab_s5a` = Dreamer + Dual S/Z + S5A
-- `ab_outcome` = Dreamer + Dual S/Z + Balanced Outcome
-- `ab_proto` = Dreamer + Dual S/Z + Generic Prototype
+- `ab_dreamer_proto` = Dreamer 单一 RSSM + Generic Proto(full latent)
+- `ab_proto` / `ab_dual_proto` = Dreamer + Dual S/Z + Generic Proto(S branch)
 
-**不是**把 S-Aff/S5A 强行装到单流 Dreamer latent 上。
+因此可以做完整 2×2：Dreamer / Dreamer+Proto / Dreamer+Dual / Dreamer+Dual+Proto。
+
+`ab_dreamer_proto` 不会强行创建 S branch；它使用标准 Dreamer `dynamics.img_step` 对 full latent 做 action-prefix rollout，并且不加入 S5A consistency loss。
 
 ## 2. 推荐的核心消融矩阵
 
 | Profile | Single RSSM | Dual S/Z | S-Aff | S5A loss | Outcome | Generic Proto |
 |---|---:|---:|---:|---:|---:|---:|
 | `ab_dreamer` | ✓ |  |  |  |  |  |
+| `ab_dreamer_proto` | ✓ |  |  |  |  | ✓ (full latent) |
 | `ab_dual` |  | ✓ |  |  |  |  |
 | `ab_saff` |  | ✓ | ✓ |  |  |  |
 | `ab_s5a` |  | ✓ |  | ✓ |  |  |
@@ -70,7 +71,9 @@ s_multi_step_consistency.loss_scale: 0.0
 
 ```bash
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer 0
+bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer_proto 0
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dual 0
+bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dual_proto 0
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_saff 0
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_s5a 0
 bash ./scripts/train_ablation.sh harvest_log_in_plains ab_outcome 0
@@ -118,6 +121,7 @@ inverse_scale: 1.0
 z_adv_scale: 1.0
 intrinsic_reward_scale: 1.0
 proto_label_mode: task_evidence
+proto_latent_source: auto   # full for single Dreamer, s for Dual S/Z
 ```
 
 也可覆盖 flat 参数，例如：

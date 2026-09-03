@@ -47,6 +47,8 @@ defaults:
 
   # Generic Proto can also be switched to the old temporal-success labels.
   proto_label_mode: task_evidence
+  # auto: Dual S/Z -> S branch; single-stream Dreamer -> full RSSM latent.
+  proto_latent_source: auto
 
   # Actor/Critic reward shaping. Keep 1.0 to match the existing experiments;
   # set 0.0 for environment-reward-only ablations.
@@ -331,11 +333,39 @@ ab_outcome:
   module_proto: false
 
 ab_proto:
+  # Backward-compatible name: Dreamer + Dual S/Z + Generic Proto on S.
   module_dual_sz: true
   module_saff: false
   module_s5a: false
   module_outcome: false
   module_proto: true
+  proto_latent_source: s
+
+# Key controlled ablation requested by the user:
+# ordinary single-stream Dreamer + the SAME Generic Task-Evidence ProtoNet,
+# applied to the standard Dreamer full RSSM latent instead of S.
+ab_dreamer_proto:
+  module_dual_sz: false
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: true
+  module_inverse: false
+  module_z_adv: false
+  proto_latent_source: full
+  proto_scale: 0.01
+
+# Explicit alias for the Dual/S counterpart in the 2x2 ablation.
+ab_dual_proto:
+  module_dual_sz: true
+  module_saff: false
+  module_s5a: false
+  module_outcome: false
+  module_proto: true
+  module_inverse: false
+  module_z_adv: false
+  proto_latent_source: s
+  proto_scale: 0.01
 
 # Cumulative ablations matching the current method-development chain.
 ab_saff_s5a:

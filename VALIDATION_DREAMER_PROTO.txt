@@ -1,0 +1,78 @@
+Dreamer + Generic Proto validation
+==================================
+
+Requested structure
+-------------------
+PASS  backend = standard single-stream Dreamer RSSM
+PASS  module_dual_sz = false
+PASS  Generic Proto = true
+PASS  proto_latent_source = full
+PASS  S-Aff = false
+PASS  decoder = ^image$ (no hidden heatmap reconstruction)
+PASS  encoder = ^image$ (RGB-only inference)
+PASS  S5A = false; s_multi_step_consistency.enabled = false; S5A scale = 0
+PASS  Balanced Outcome = false
+PASS  inverse = false
+PASS  Z adversary = false
+PASS  heatmap U-Net pipe remains on only because affordance is a Proto teacher
+PASS  actor reward remains predicted env reward + configured intrinsic only; Proto is not added
+
+Static/config audit
+-------------------
+Command:
+  python scripts/audit_ablation_profiles.py
+Result:
+  PASS: Dreamer+GenericProto and all core ablation profiles are structurally clean.
+
+Prototype unit smoke test
+-------------------------
+Command:
+  python test_full_latent_prototype.py
+Result:
+  PASS: full-latent Generic Proto loss is finite and trains native Dreamer dynamics.
+  Verified:
+    - task-evidence labels initialize prototypes
+    - CE gradients reach the native Dreamer transition
+    - h15 Proto accuracy diagnostic exists
+    - deterministic counterfactual diagnostics exist
+    - no S5A consistency metric/loss is produced
+
+World-model integration smoke test
+----------------------------------
+Command:
+  python test_dreamer_proto_integration.py
+Result:
+  PASS: single-stream Dreamer world model trains with Generic Proto only.
+  Example smoke values (tiny CPU test, not a research result):
+    proto_weighted_loss ~= 0.0089
+    proto_acc_h15 ~= 0.25
+
+Pure Dreamer preservation audit
+-------------------------------
+A tiny `ab_dreamer` model was instantiated from the previous modular baseline
+and from this package with the same torch seed. Results:
+  parameter count: identical (235906 in the tiny audit model)
+  state_dict keys: identical (66)
+  initial state SHA256: identical
+    3a2ed4afa117da8bcc6eff52f907384161472df1465d3751e17cbaddf74893ec
+
+This confirms that merely adding the optional full-latent Proto implementation
+does not alter the pure Dreamer parameterization or initialization path when
+`module_proto=false`.
+
+Syntax audit
+------------
+Command:
+  python -m compileall -q .
+Result:
+  PASS
+  Existing warning in ls_imagine_wrapper.py about an assertion tuple remains
+  unchanged and is unrelated to this modification.
+
+Environment limitation
+----------------------
+A full MineDojo episode was not launched in this container. The production
+project requirements (wandb/tensorboard/MineDojo assets, Java/Minecraft stack,
+MineCLIP/U-Net checkpoints) are not fully installed here. The CPU integration
+test stubs only logging imports; it exercises the actual Dreamer world-model
+training path and the new full-latent Proto loss.

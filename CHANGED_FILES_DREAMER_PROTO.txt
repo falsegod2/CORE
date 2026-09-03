@@ -1,0 +1,28 @@
+Dreamer + Generic Proto (single-stream full-latent) changes
+===========================================================
+
+NEW
+- full_latent_prototype.py
+- test_full_latent_prototype.py
+- README_DREAMER_PROTO_CN.md
+- CHANGED_FILES_DREAMER_PROTO.txt
+- VALIDATION_DREAMER_PROTO.txt
+
+MODIFIED
+- ablation.py
+  * allows Generic Proto without Dual when proto_latent_source=full
+  * keeps S-Aff/S5A/Outcome/Inverse/ZAdv dependent on Dual
+  * separates full-latent Proto from S-branch Proto
+- models_dreamer.py
+  * instantiates FullLatentPrototypeUtility for single-stream Dreamer
+  * adds only proto_scale * proto_loss to world-model objective
+  * normalizes teacher-only heatmap to [0,1]
+  * leaves encoder/decoder RGB-only
+- configs.yaml
+  * adds proto_latent_source
+  * adds ab_dreamer_proto
+  * adds ab_dual_proto alias
+- scripts/audit_ablation_profiles.py
+  * verifies single-stream Proto has no hidden S5A/Outcome/S-Aff
+- ABLATION_MATRIX.csv
+  * adds full-latent vs S-latent Proto rows

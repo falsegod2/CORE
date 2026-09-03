@@ -8,6 +8,7 @@ import torch.nn as nn
 
 import networks_dreamer as networks
 import tools
+import full_latent_prototype
 
 logger = logging.getLogger(__name__)
 to_np = lambda x: x.detach().cpu().numpy()
@@ -111,6 +112,56 @@ class WorldModel(nn.Module):
             if name not in self.heads:
                 raise KeyError(f"Unknown gradient head: {name}")
 
+        # --------------------------------------------------------------
+        # Controlled ablation: Generic Task-Evidence ProtoNet directly on
+        # the ordinary single-stream Dreamer full latent.  This is not Dual
+        # S/Z and does not enable S5A/Outcome/S-Aff.
+        # --------------------------------------------------------------
+        self._full_proto_enabled = bool(
+            getattr(config, "full_latent_proto_enabled", False)
+        )
+        self._full_proto_scale = float(
+            getattr(config, "full_latent_proto_scale", 0.0)
+        )
+        self._full_proto = None
+        if self._full_proto_enabled:
+            sms_cfg = getattr(config, "s_multi_step_consistency", {}) or {}
+            proto_cfg = dict(sms_cfg.get("prototype_utility", {}) or {})
+            # ablation.py disables the S-branch prototype flag for this backend,
+            # but all teacher/prototype hyperparameters remain in this dict.
+            self._full_proto = full_latent_prototype.FullLatentPrototypeUtility(
+                feat_dim=feat_size,
+                horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
+                horizon_weights=sms_cfg.get(
+                    "horizon_weights", [1.0, 1.0, 0.75, 0.5, 0.25]
+                ),
+                projection_dim=int(sms_cfg.get("projection_dim", 512)),
+                starts_per_sequence=int(sms_cfg.get("starts_per_sequence", 4)),
+                projection_seed=int(sms_cfg.get("projection_seed", 314159)),
+                temperature=float(proto_cfg.get("temperature", 0.10)),
+                prototype_ema=float(proto_cfg.get("prototype_ema", 0.95)),
+                label_mode=str(
+                    getattr(config, "proto_label_mode", proto_cfg.get("label_mode", "task_evidence"))
+                ),
+                positive_threshold=float(proto_cfg.get("positive_threshold", 1.0e-6)),
+                semantic_weight=float(proto_cfg.get("semantic_weight", 0.65)),
+                affordance_weight=float(proto_cfg.get("affordance_weight", 0.30)),
+                intrinsic_weight=float(proto_cfg.get("intrinsic_weight", 0.05)),
+                heatmap_topk_fraction=float(proto_cfg.get("heatmap_topk_fraction", 0.05)),
+                robust_low_quantile=float(proto_cfg.get("robust_low_quantile", 0.05)),
+                robust_high_quantile=float(proto_cfg.get("robust_high_quantile", 0.95)),
+                stage_low_quantile=float(proto_cfg.get("stage_low_quantile", 0.30)),
+                stage_high_quantile=float(proto_cfg.get("stage_high_quantile", 0.70)),
+                boundary_margin=float(proto_cfg.get("boundary_margin", 0.05)),
+                min_signal_span=float(proto_cfg.get("min_signal_span", 1.0e-4)),
+                ready_steps=int(proto_cfg.get("ready_steps", 4)),
+                near_steps=int(proto_cfg.get("near_steps", 15)),
+                progress_steps=proto_cfg.get("progress_steps", None),
+                diagnostics_enabled=bool(
+                    (sms_cfg.get("diagnostics", {}) or {}).get("enabled", True)
+                ),
+            )
+
         self._model_opt = tools.Optimizer(
             "model",
             self.parameters(),
@@ -183,7 +234,30 @@ class WorldModel(nn.Module):
                     for name, loss in losses.items()
                 }
                 model_loss = sum(scaled_losses.values()) + kl_loss
-                mean_model_loss = torch.mean(model_loss)
+
+                # Generic Proto on the *full* single-stream Dreamer latent.
+                # It reuses the native RSSM img_step transition with replay
+                # actions. There is deliberately NO S5A cosine consistency loss.
+                full_proto_metrics = {}
+                full_proto_loss = model_loss.mean() * 0.0
+                if self._full_proto_enabled:
+                    if self._full_proto is None:
+                        raise RuntimeError("full_latent_proto_enabled but module is missing")
+                    full_proto_loss, full_proto_metrics = self._full_proto(
+                        dynamics=self.dynamics,
+                        posterior=post,
+                        actions=data["action"],
+                        is_first=data["is_first"],
+                        rewards=data["reward"],
+                        task_scores=data.get("task_score", None),
+                        heatmaps=data.get("heatmap", None),
+                        intrinsic=data.get("intrinsic", None),
+                    )
+
+                mean_model_loss = (
+                    torch.mean(model_loss)
+                    + self._full_proto_scale * full_proto_loss
+                )
 
             metrics = self._model_opt(mean_model_loss, self.parameters())
 
@@ -192,6 +266,12 @@ class WorldModel(nn.Module):
                 f"{name}_loss": to_np(torch.mean(loss))
                 for name, loss in losses.items()
             }
+        )
+        metrics.update({name: to_np(value) for name, value in full_proto_metrics.items()})
+        metrics["proto_latent_source_full"] = float(self._full_proto_enabled)
+        metrics["proto_scale"] = self._full_proto_scale
+        metrics["proto_weighted_loss"] = to_np(
+            self._full_proto_scale * full_proto_loss
         )
         metrics["kl_free"] = kl_free
         metrics["dyn_scale"] = dyn_scale
@@ -219,6 +299,16 @@ class WorldModel(nn.Module):
     def preprocess(self, obs):
         obs = obs.copy()
         obs["image"] = torch.as_tensor(obs["image"], dtype=torch.float32) / 255.0
+
+        # Heatmap is teacher-only in Dreamer+Proto: it is NOT in encoder/decoder
+        # keys, but it must use the same [0,1] scale as the Dual/S GenericTask
+        # implementation for an exact teacher ablation. Replay commonly stores
+        # it as [B,T,H,W] because cv2 drops the singleton channel.
+        if "heatmap" in obs:
+            heatmap = torch.as_tensor(obs["heatmap"], dtype=torch.float32)
+            if heatmap.ndim == 4:
+                heatmap = heatmap.unsqueeze(-1)
+            obs["heatmap"] = heatmap / 255.0
 
         if "discount" in obs:
             obs["discount"] = torch.as_tensor(
