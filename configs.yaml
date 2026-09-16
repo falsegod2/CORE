@@ -19,51 +19,30 @@ defaults:
   
   use_wandb: False
   wandb_key: None
+  # Stable-V1 optional readable console/health diagnostics. Disabled in the
+  # baseline profile so old experiments remain behaviorally/logging compatible.
+  compact_health_log: False
+  print_all_scalars: True
+  health_metrics_enabled: False
+  health_value_std_low: 0.01
+  health_actor_grad_low: 0.003
+  health_imag_reward_std_low: 0.001
   resume_path: null
   enable_cloud_backup: False
   cloud_backup_interval: 7200
 
   # ==========================================
-  # 2. 模块化消融开关 (edit these or use ab_* presets below)
+  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
   # ==========================================
-  # Architecture switch. All S-branch modules require module_dual_sz=true.
-  module_dual_sz: false
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: false
-  module_inverse: false
-  module_z_adv: false
-
-  # Main ablation coefficients. These are mapped onto the implementation at
-  # runtime by ablation.py, so they can be changed directly from CLI.
-  saff_scale: 1.0
-  full_heatmap_scale: 1.0
-  s5a_scale: 0.05
-  outcome_scale: 0.01
-  proto_scale: 0.01
-  inverse_scale: 1.0
-  z_adv_scale: 1.0
-
-  # Generic Proto can also be switched to the old temporal-success labels.
-  proto_label_mode: task_evidence
-  # auto: Dual S/Z -> S branch; single-stream Dreamer -> full RSSM latent.
-  proto_latent_source: auto
-
-  # Actor/Critic reward shaping. Keep 1.0 to match the existing experiments;
-  # set 0.0 for environment-reward-only ablations.
-  intrinsic_reward_scale: 1.0
-
-  # Effective values below are overwritten by ablation.py from the switches.
   inverse_loss_scale: 0.0      # 本消融关闭inverse监督；inverse head保留实例以维持初始化/RNG路径可比性
-  affordance_s_scale: 0.0      # Affordance仅作为S分支辅助监督，不再输入encoder
+  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
   z_action_adv_scale: 0.0      # 关闭Z对抗；只测试S-Aff + S-only 5A
   z_action_grl_scale: 1.0      # Gradient Reversal强度
 
   # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
   # 与原5A保持同一 horizons / weights / scale；Z不参与该辅助损失。
   s_multi_step_consistency:
-    enabled: false
+    enabled: true
     horizons: [1, 2, 4, 8, 15]
     horizon_weights: [1.0, 1.0, 0.75, 0.5, 0.25]
     projection_dim: 512
@@ -74,7 +53,7 @@ defaults:
     # S-Outcome: 用同一条S5A rollout的 [S_t, S_hat_{t+k}] 预测真实环境
     # k-step discounted return。只作为world-model辅助监督，不加入Actor reward。
     outcome:
-      enabled: false
+      enabled: true
       loss_scale: 0.01
       hidden_dim: 256
       init_seed: 161803
@@ -97,6 +76,16 @@ defaults:
       calibration_enabled: true
       calibration_scale: 0.5
 
+      # Stable-V1 return-evidence gate. Baseline remains disabled; the
+      # stable_v1 profile turns it on. Calibration still trains the head while
+      # only the rollout loss that shapes S is gated.
+      evidence_gate_enabled: false
+      evidence_gate_ema: 0.99
+      evidence_gate_low: 5.0e-5
+      evidence_gate_high: 5.0e-4
+      evidence_gate_horizon: 15
+      evidence_gate_min: 0.0
+
     # Generic Few-shot Prototypical Utility v2:
     # 不再按“距离成功还有4/15步”做任务特定的时间分层。默认使用所有任务都存在的
     # task-conditioned evidence：MineCLIP task score + affordance heatmap + 少量 intrinsic
@@ -104,10 +93,15 @@ defaults:
     # real environment reward 只负责 Success 硬锚点。仍然只作为 representation
     # supervision，不加入 Actor imagined reward，因此 RGB-only inference 不变。
     prototype_utility:
-      enabled: false
+      enabled: true
       loss_scale: 0.01
       temperature: 0.10
       prototype_ema: 0.95
+      # Stable-V1 keys. Baseline keeps batch quantiles and immediate success
+      # prototype activation; stable_v1 overrides them.
+      quantile_mode: batch
+      quantile_ema: 0.99
+      success_min_support: 1
 
       # task_evidence = 默认通用版；temporal_success = 旧版时间分层，仅供消融。
       label_mode: task_evidence
@@ -220,7 +214,7 @@ defaults:
   encoder:
     {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
   decoder:
-    {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+    {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
   
   # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
   grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
@@ -262,163 +256,41 @@ minedojo:
   rollout_image_num: 2000
   is_random: True
 
+stable_v1:
+  # Stable-V1 keeps the strongest method architecture and its original
+  # Full-Heatmap + S-only Affordance + S5A losses unchanged. Only reliability
+  # handling for Proto/Outcome and diagnostics are modified.
+  compact_health_log: True
+  print_all_scalars: False
+  health_metrics_enabled: True
+
+  s_multi_step_consistency:
+    outcome:
+      enabled: true
+      loss_scale: 0.01
+      # Gate only the rollout Outcome path that backpropagates into S dynamics.
+      # Dense posterior calibration stays active at all times.
+      evidence_gate_enabled: true
+      evidence_gate_ema: 0.99
+      evidence_gate_low: 5.0e-5
+      evidence_gate_high: 5.0e-4
+      evidence_gate_horizon: 15
+      evidence_gate_min: 0.0
+
+    prototype_utility:
+      enabled: true
+      loss_scale: 0.01
+      prototype_ema: 0.98
+      quantile_mode: ema
+      quantile_ema: 0.99
+      boundary_margin: 0.10
+      # Prevent a handful of rare success samples from immediately defining a
+      # high-authority Success prototype.
+      success_min_support: 256
+
 debug:
   debug: True
   pretrain: 1
   prefill: 1
   batch_size: 10
   batch_length: 20
-
-# ============================================================
-# Named ablation presets
-# Usage:
-#   python expr.py --configs minedojo ab_dreamer --task minedojo_harvest_log_in_plains --logdir ./logdir
-# or:
-#   bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer 0
-#
-# IMPORTANT:
-# S-Aff / S5A / Outcome / Proto operate on the S branch and therefore include
-# Dual S/Z. "ab_saff" means Dreamer + Dual S/Z + S-Aff, not S-Aff on a
-# single-stream RSSM.
-# ============================================================
-
-ab_dreamer:
-  module_dual_sz: false
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: false
-  module_inverse: false
-  module_z_adv: false
-
-ab_dreamer_no_intrinsic:
-  module_dual_sz: false
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: false
-  module_inverse: false
-  module_z_adv: false
-  intrinsic_reward_scale: 0.0
-
-ab_dual:
-  module_dual_sz: true
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: false
-  module_inverse: false
-  module_z_adv: false
-
-# Single-module ablations on top of the required Dual S/Z backbone.
-ab_saff:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: false
-  module_outcome: false
-  module_proto: false
-
-ab_s5a:
-  module_dual_sz: true
-  module_saff: false
-  module_s5a: true
-  module_outcome: false
-  module_proto: false
-
-ab_outcome:
-  module_dual_sz: true
-  module_saff: false
-  module_s5a: false
-  module_outcome: true
-  module_proto: false
-
-ab_proto:
-  # Backward-compatible name: Dreamer + Dual S/Z + Generic Proto on S.
-  module_dual_sz: true
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: true
-  proto_latent_source: s
-
-# Key controlled ablation requested by the user:
-# ordinary single-stream Dreamer + the SAME Generic Task-Evidence ProtoNet,
-# applied to the standard Dreamer full RSSM latent instead of S.
-ab_dreamer_proto:
-  module_dual_sz: false
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: true
-  module_inverse: false
-  module_z_adv: false
-  proto_latent_source: full
-  proto_scale: 0.01
-
-# Explicit alias for the Dual/S counterpart in the 2x2 ablation.
-ab_dual_proto:
-  module_dual_sz: true
-  module_saff: false
-  module_s5a: false
-  module_outcome: false
-  module_proto: true
-  module_inverse: false
-  module_z_adv: false
-  proto_latent_source: s
-  proto_scale: 0.01
-
-# Cumulative ablations matching the current method-development chain.
-ab_saff_s5a:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: false
-  module_proto: false
-
-ab_saff_s5a_outcome:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: true
-  module_proto: false
-
-ab_saff_s5a_proto:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: false
-  module_proto: true
-
-ab_full:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: true
-  module_proto: true
-
-# Useful sensitivity presets.
-ab_full_proto_half:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: true
-  module_proto: true
-  proto_scale: 0.005
-
-ab_full_no_intrinsic:
-  module_dual_sz: true
-  module_saff: true
-  module_s5a: true
-  module_outcome: true
-  module_proto: true
-  intrinsic_reward_scale: 0.0
-
-# Optional legacy modules retained for dedicated ablations.
-ab_inverse:
-  module_dual_sz: true
-  module_inverse: true
-
-ab_z_adv:
-  module_dual_sz: true
-  module_z_adv: true
-

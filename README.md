@@ -1,11 +1,3 @@
-# Modular DreamerV3 Ablation Baseline
-
-**Start here:** `README_ABLATION_CN.md`
-
-This package contains both the clean single-stream DreamerV3 backend and the current Dual-S/Z modular backend. Use the `ab_*` config presets to run controlled ablations.
-
----
-
 # ISO3-RGB-Aux-NoLong (project modification)
 
 > This repository is modified from the LS-Imagine codebase. The active method is an ISO-Dream-inspired, no-long-branch world model with an **RGB-only observation encoder**. Affordance maps remain training-time auxiliary targets and are not fed into the encoder. See [`METHOD_CHANGES.md`](METHOD_CHANGES.md) for the exact implementation, corrected inverse-dynamics alignment, Z-branch adversarial action invariance, metrics, and ablations.
@@ -231,13 +223,3 @@ If you find this repo useful, please cite our paper:
 The codes refer to the implemention of [dreamerv3-torch](https://github.com/NM512/dreamerv3-torch) and [Swin-Unet](https://github.com/HuCaoFighting/Swin-Unet). Thanks for the authors！
 
 
-
-## Added controlled ablation: Dreamer + Generic Proto
-
-This package additionally supports Generic Task-Evidence Prototype Utility on
-an ordinary single-stream Dreamer RSSM full latent, without Dual S/Z and without
-S5A consistency loss. See `README_DREAMER_PROTO_CN.md` and use:
-
-```bash
-bash ./scripts/train_ablation.sh harvest_log_in_plains ab_dreamer_proto 0
-```

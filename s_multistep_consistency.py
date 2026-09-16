@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from s_prototype_utility import (
     PrototypeUtilityBank,
+    EMATaskEvidenceTeacher,
     build_progress_labels,
     build_task_evidence_labels,
 )
@@ -101,6 +102,12 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         outcome_positive_threshold: float = 1.0e-6,
         outcome_calibration_enabled: bool = True,
         outcome_calibration_scale: float = 0.5,
+        outcome_gate_enabled: bool = False,
+        outcome_gate_ema: float = 0.99,
+        outcome_gate_low: float = 5.0e-5,
+        outcome_gate_high: float = 5.0e-4,
+        outcome_gate_horizon: int = 15,
+        outcome_gate_min: float = 0.0,
         prototype_enabled: bool = False,
         prototype_temperature: float = 0.10,
         prototype_ema: float = 0.95,
@@ -116,6 +123,9 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         prototype_stage_high_quantile: float = 0.70,
         prototype_boundary_margin: float = 0.05,
         prototype_min_signal_span: float = 1.0e-4,
+        prototype_quantile_mode: str = "batch",
+        prototype_quantile_ema: float = 0.99,
+        prototype_success_min_support: int = 1,
         # Legacy temporal-success mode parameters (ablation only).
         prototype_ready_steps: int = 4,
         prototype_near_steps: int = 15,
@@ -197,6 +207,30 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             raise ValueError(
                 f"Invalid outcome_calibration_scale={self.outcome_calibration_scale}"
             )
+        self.outcome_gate_enabled = bool(outcome_gate_enabled)
+        self.outcome_gate_ema = float(outcome_gate_ema)
+        self.outcome_gate_low = float(outcome_gate_low)
+        self.outcome_gate_high = float(outcome_gate_high)
+        self.outcome_gate_horizon = int(outcome_gate_horizon)
+        self.outcome_gate_min = float(outcome_gate_min)
+        if not (0.0 <= self.outcome_gate_ema < 1.0):
+            raise ValueError(f"Invalid outcome_gate_ema={self.outcome_gate_ema}")
+        if self.outcome_gate_low < 0.0 or self.outcome_gate_high <= self.outcome_gate_low:
+            raise ValueError(
+                f"Invalid outcome gate range: {self.outcome_gate_low}, {self.outcome_gate_high}"
+            )
+        if not (0.0 <= self.outcome_gate_min <= 1.0):
+            raise ValueError(f"Invalid outcome_gate_min={self.outcome_gate_min}")
+        if self.outcome_gate_enabled and self.outcome_gate_horizon not in self.horizons:
+            raise ValueError(
+                f"outcome_gate_horizon={self.outcome_gate_horizon} not in {self.horizons}"
+            )
+        self.register_buffer(
+            "outcome_positive_ema", torch.zeros((), dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            "outcome_gate_initialized", torch.zeros((), dtype=torch.bool), persistent=True
+        )
         self.outcome_head = None
         if self.outcome_enabled:
             self.outcome_head = SOutcomeHead(
@@ -235,19 +269,46 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         self.prototype_stage_high_quantile = float(prototype_stage_high_quantile)
         self.prototype_boundary_margin = float(prototype_boundary_margin)
         self.prototype_min_signal_span = float(prototype_min_signal_span)
+        self.prototype_quantile_mode = str(prototype_quantile_mode).lower()
+        if self.prototype_quantile_mode not in {"batch", "ema"}:
+            raise ValueError(
+                f"prototype_quantile_mode must be batch or ema, got {self.prototype_quantile_mode}"
+            )
+        self.prototype_quantile_ema = float(prototype_quantile_ema)
+        self.prototype_success_min_support = int(prototype_success_min_support)
         self.prototype_ready_steps = int(prototype_ready_steps)
         self.prototype_near_steps = int(prototype_near_steps)
         self.prototype_progress_steps = (
             None if prototype_progress_steps is None else int(prototype_progress_steps)
         )
         self.prototype_bank = None
+        self.prototype_teacher = None
         if self.prototype_enabled:
             self.prototype_bank = PrototypeUtilityBank(
                 feature_dim=int(projection_dim),
                 temperature=float(prototype_temperature),
                 prototype_ema=float(prototype_ema),
+                success_min_support=self.prototype_success_min_support,
                 eps=self.eps,
             )
+            if (
+                self.prototype_label_mode == "task_evidence"
+                and self.prototype_quantile_mode == "ema"
+            ):
+                self.prototype_teacher = EMATaskEvidenceTeacher(
+                    positive_threshold=self.prototype_positive_threshold,
+                    semantic_weight=self.prototype_semantic_weight,
+                    affordance_weight=self.prototype_affordance_weight,
+                    intrinsic_weight=self.prototype_intrinsic_weight,
+                    heatmap_topk_fraction=self.prototype_heatmap_topk_fraction,
+                    robust_low_quantile=self.prototype_robust_low_quantile,
+                    robust_high_quantile=self.prototype_robust_high_quantile,
+                    stage_low_quantile=self.prototype_stage_low_quantile,
+                    stage_high_quantile=self.prototype_stage_high_quantile,
+                    boundary_margin=self.prototype_boundary_margin,
+                    min_signal_span=self.prototype_min_signal_span,
+                    quantile_ema=self.prototype_quantile_ema,
+                )
 
     @staticmethod
     def _s_feature(dynamics: nn.Module, state: TensorDict) -> torch.Tensor:
@@ -454,6 +515,9 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             metrics[f"s_outcome_calibration_negative_loss_h{step}"] = stats[
                 "negative_loss"
             ]
+            metrics[f"s_outcome_calibration_positive_fraction_h{step}"] = (
+                stats["positive_count"] / stats["valid_count"].clamp_min(1.0)
+            ).detach()
 
         total = weighted / weight_total.clamp_min(self.eps)
         metrics["s_outcome_calibration_loss"] = total.detach()
@@ -489,23 +553,34 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
 
         metrics: Dict[str, torch.Tensor] = {}
         if self.prototype_label_mode == "task_evidence":
-            labels, aux, teacher_metrics = build_task_evidence_labels(
-                rewards=rewards,
-                task_scores=task_scores,
-                heatmaps=heatmaps,
-                intrinsic=intrinsic,
-                positive_threshold=self.prototype_positive_threshold,
-                semantic_weight=self.prototype_semantic_weight,
-                affordance_weight=self.prototype_affordance_weight,
-                intrinsic_weight=self.prototype_intrinsic_weight,
-                heatmap_topk_fraction=self.prototype_heatmap_topk_fraction,
-                robust_low_quantile=self.prototype_robust_low_quantile,
-                robust_high_quantile=self.prototype_robust_high_quantile,
-                stage_low_quantile=self.prototype_stage_low_quantile,
-                stage_high_quantile=self.prototype_stage_high_quantile,
-                boundary_margin=self.prototype_boundary_margin,
-                min_signal_span=self.prototype_min_signal_span,
-            )
+            if self.prototype_teacher is not None:
+                labels, aux, teacher_metrics = self.prototype_teacher(
+                    rewards=rewards,
+                    task_scores=task_scores,
+                    heatmaps=heatmaps,
+                    intrinsic=intrinsic,
+                )
+            else:
+                labels, aux, teacher_metrics = build_task_evidence_labels(
+                    rewards=rewards,
+                    task_scores=task_scores,
+                    heatmaps=heatmaps,
+                    intrinsic=intrinsic,
+                    positive_threshold=self.prototype_positive_threshold,
+                    semantic_weight=self.prototype_semantic_weight,
+                    affordance_weight=self.prototype_affordance_weight,
+                    intrinsic_weight=self.prototype_intrinsic_weight,
+                    heatmap_topk_fraction=self.prototype_heatmap_topk_fraction,
+                    robust_low_quantile=self.prototype_robust_low_quantile,
+                    robust_high_quantile=self.prototype_robust_high_quantile,
+                    stage_low_quantile=self.prototype_stage_low_quantile,
+                    stage_high_quantile=self.prototype_stage_high_quantile,
+                    boundary_margin=self.prototype_boundary_margin,
+                    min_signal_span=self.prototype_min_signal_span,
+                )
+                teacher_metrics["s_proto_teacher_ema_enabled"] = torch.zeros(
+                    (), device=rewards.device
+                )
             metrics.update(teacher_metrics)
             class_names = ("low", "mid", "high", "success")
         else:
@@ -1061,8 +1136,39 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 )
             )
             metrics.update(calibration_metrics)
+        outcome_gate = torch.ones((), device=actions.device, dtype=actions.dtype)
+        outcome_gate_signal = torch.zeros((), device=actions.device, dtype=actions.dtype)
+        if self.outcome_enabled and self.outcome_gate_enabled:
+            gate_key = (
+                f"s_outcome_calibration_positive_fraction_h{self.outcome_gate_horizon}"
+            )
+            if gate_key in metrics:
+                outcome_gate_signal = metrics[gate_key].to(actions.dtype)
+            else:
+                rollout_key = f"s_outcome_target_nonzero_frac_h{self.outcome_gate_horizon}"
+                outcome_gate_signal = metrics.get(
+                    rollout_key,
+                    torch.zeros((), device=actions.device, dtype=actions.dtype),
+                ).to(actions.dtype)
+
+            with torch.no_grad():
+                signal_f = outcome_gate_signal.float().to(self.outcome_positive_ema.device)
+                if not bool(self.outcome_gate_initialized.item()):
+                    self.outcome_gate_initialized.fill_(True)
+                # Start from zero and warm up gradually even if the very first
+                # sampled batch happens to contain a rare positive return.
+                self.outcome_positive_ema.mul_(self.outcome_gate_ema).add_(
+                    signal_f * (1.0 - self.outcome_gate_ema)
+                )
+                gate_raw = (
+                    (self.outcome_positive_ema - self.outcome_gate_low)
+                    / (self.outcome_gate_high - self.outcome_gate_low)
+                ).clamp(0.0, 1.0)
+                gate_eff = self.outcome_gate_min + (1.0 - self.outcome_gate_min) * gate_raw
+                outcome_gate = gate_eff.to(device=actions.device, dtype=actions.dtype)
+
         outcome_total = (
-            outcome_rollout_total
+            outcome_gate * outcome_rollout_total
             + self.outcome_calibration_scale * outcome_calibration_loss
             if self.outcome_enabled
             else actions.sum() * 0.0
@@ -1103,6 +1209,22 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             metrics["s_outcome_calibration_scale"] = torch.tensor(
                 self.outcome_calibration_scale, device=actions.device
             )
+            metrics["s_outcome_gate_enabled"] = torch.tensor(
+                float(self.outcome_gate_enabled), device=actions.device
+            )
+            metrics["s_outcome_gate"] = outcome_gate.detach()
+            metrics["s_outcome_gate_signal"] = outcome_gate_signal.detach()
+            metrics["s_outcome_positive_ema"] = self.outcome_positive_ema.detach().to(actions.device)
+            metrics["s_outcome_gate_low"] = torch.tensor(
+                self.outcome_gate_low, device=actions.device
+            )
+            metrics["s_outcome_gate_high"] = torch.tensor(
+                self.outcome_gate_high, device=actions.device
+            )
+            metrics["s_outcome_rollout_loss_pre_gate"] = outcome_rollout_total.detach()
+            metrics["s_outcome_rollout_loss_post_gate"] = (
+                outcome_gate * outcome_rollout_total
+            ).detach()
             metrics["s_outcome_balance_mode_balanced"] = torch.tensor(
                 float(self.outcome_balance_mode == "balanced"), device=actions.device
             )

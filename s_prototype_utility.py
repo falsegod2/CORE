@@ -363,6 +363,240 @@ def build_task_evidence_labels(
     return labels, evidence, metrics
 
 
+class EMATaskEvidenceTeacher(nn.Module):
+    """Stable-V1 task-evidence teacher with EMA quantile boundaries.
+
+    The baseline recomputes q05/q95 component normalization and q30/q70 stage
+    thresholds independently for every replay batch. In sparse-reward RL this
+    makes the pseudo-label semantics move with the replay distribution. This
+    module keeps the same generic evidence definition but low-pass filters the
+    quantile boundaries across updates.
+
+    No gradients flow through this teacher. Buffers are checkpointed so resumed
+    runs continue with the same teacher state.
+    """
+
+    def __init__(
+        self,
+        positive_threshold: float = 1e-6,
+        semantic_weight: float = 0.65,
+        affordance_weight: float = 0.30,
+        intrinsic_weight: float = 0.05,
+        heatmap_topk_fraction: float = 0.05,
+        robust_low_quantile: float = 0.05,
+        robust_high_quantile: float = 0.95,
+        stage_low_quantile: float = 0.30,
+        stage_high_quantile: float = 0.70,
+        boundary_margin: float = 0.10,
+        min_signal_span: float = 1e-4,
+        quantile_ema: float = 0.99,
+    ):
+        super().__init__()
+        if not (0.0 <= quantile_ema < 1.0):
+            raise ValueError(quantile_ema)
+        self.positive_threshold = float(positive_threshold)
+        self.semantic_weight = float(semantic_weight)
+        self.affordance_weight = float(affordance_weight)
+        self.intrinsic_weight = float(intrinsic_weight)
+        self.heatmap_topk_fraction = float(heatmap_topk_fraction)
+        self.robust_low_quantile = float(robust_low_quantile)
+        self.robust_high_quantile = float(robust_high_quantile)
+        self.stage_low_quantile = float(stage_low_quantile)
+        self.stage_high_quantile = float(stage_high_quantile)
+        self.boundary_margin = float(boundary_margin)
+        self.min_signal_span = float(min_signal_span)
+        self.quantile_ema = float(quantile_ema)
+
+        # rows: semantic, affordance, intrinsic; cols: q_lo, q_hi
+        self.register_buffer(
+            "component_bounds", torch.zeros(3, 2, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            "component_initialized", torch.zeros(3, dtype=torch.bool), persistent=True
+        )
+        # q30/q70 over the combined task evidence.
+        self.register_buffer(
+            "stage_bounds", torch.zeros(2, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            "stage_initialized", torch.zeros((), dtype=torch.bool), persistent=True
+        )
+        self.register_buffer(
+            "teacher_updates", torch.zeros((), dtype=torch.long), persistent=True
+        )
+
+    @torch.no_grad()
+    def _normalize_component(self, x, index: int):
+        if x is None:
+            z = torch.zeros((), device=self.component_bounds.device)
+            return None, False, z, z, z, z, z, z
+        finite = torch.isfinite(x)
+        valid = x[finite]
+        device = x.device
+        if valid.numel() < 2:
+            z = torch.zeros((), device=device)
+            return torch.zeros_like(x), False, z, z, z, z, z, z
+
+        batch_lo = torch.quantile(valid, self.robust_low_quantile)
+        batch_hi = torch.quantile(valid, self.robust_high_quantile)
+        batch_span = batch_hi - batch_lo
+        active = bool((batch_span > self.min_signal_span).item())
+        if not active:
+            z = torch.zeros((), device=device)
+            return torch.zeros_like(x), False, batch_lo, batch_hi, batch_span, z, z, z
+
+        bounds = self.component_bounds[index]
+        if not bool(self.component_initialized[index].item()):
+            bounds.copy_(torch.stack([batch_lo, batch_hi]).to(bounds))
+            self.component_initialized[index] = True
+        else:
+            old = bounds.float()
+            new = torch.stack([batch_lo, batch_hi]).float().to(old.device)
+            merged = self.quantile_ema * old + (1.0 - self.quantile_ema) * new
+            bounds.copy_(merged.to(bounds))
+
+        ema_lo = bounds[0].to(device=device, dtype=x.dtype)
+        ema_hi = bounds[1].to(device=device, dtype=x.dtype)
+        ema_span = (ema_hi - ema_lo).clamp_min(self.min_signal_span)
+        norm = ((x - ema_lo) / ema_span).clamp(0.0, 1.0)
+        norm = torch.where(finite, norm, torch.zeros_like(norm))
+        return norm, True, batch_lo, batch_hi, batch_span, ema_lo, ema_hi, ema_span
+
+    @torch.no_grad()
+    def forward(
+        self,
+        rewards: torch.Tensor,
+        task_scores: Optional[torch.Tensor] = None,
+        heatmaps: Optional[torch.Tensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        rewards_bt = _to_bt(rewards, "rewards")
+        assert rewards_bt is not None
+        task_bt = _to_bt(task_scores, "task_scores")
+        intrinsic_bt = _to_bt(intrinsic, "intrinsic")
+        aff_raw = heatmap_topk_evidence(
+            heatmaps, topk_fraction=self.heatmap_topk_fraction
+        )
+
+        sem = self._normalize_component(task_bt, 0)
+        aff = self._normalize_component(aff_raw, 1)
+        inte = self._normalize_component(intrinsic_bt, 2)
+        sem_norm, sem_active, sem_lo, sem_hi, sem_span, sem_elo, sem_ehi, sem_espan = sem
+        aff_norm, aff_active, aff_lo, aff_hi, aff_span, aff_elo, aff_ehi, aff_espan = aff
+        int_norm, int_active, int_lo, int_hi, int_span, int_elo, int_ehi, int_espan = inte
+
+        components = []
+        weights = []
+        if sem_active and self.semantic_weight > 0.0:
+            components.append(sem_norm)
+            weights.append(self.semantic_weight)
+        if aff_active and self.affordance_weight > 0.0:
+            components.append(aff_norm)
+            weights.append(self.affordance_weight)
+        if int_active and self.intrinsic_weight > 0.0:
+            components.append(int_norm)
+            weights.append(self.intrinsic_weight)
+
+        labels = torch.full_like(rewards_bt, -1, dtype=torch.long)
+        evidence = torch.zeros_like(rewards_bt)
+        success = rewards_bt > self.positive_threshold
+        stage_batch_lo = torch.zeros((), device=rewards_bt.device)
+        stage_batch_hi = torch.zeros((), device=rewards_bt.device)
+        stage_batch_span = torch.zeros((), device=rewards_bt.device)
+        stage_lo = torch.zeros((), device=rewards_bt.device)
+        stage_hi = torch.zeros((), device=rewards_bt.device)
+        stage_span = torch.zeros((), device=rewards_bt.device)
+
+        if components:
+            total_weight = max(sum(weights), 1e-8)
+            evidence = sum(w * c for w, c in zip(weights, components)) / total_weight
+            finite = torch.isfinite(evidence)
+            valid = evidence[finite]
+            if valid.numel() >= 3:
+                stage_batch_lo = torch.quantile(valid, self.stage_low_quantile)
+                stage_batch_hi = torch.quantile(valid, self.stage_high_quantile)
+                stage_batch_span = stage_batch_hi - stage_batch_lo
+                if bool((stage_batch_span > self.min_signal_span).item()):
+                    if not bool(self.stage_initialized.item()):
+                        self.stage_bounds.copy_(
+                            torch.stack([stage_batch_lo, stage_batch_hi]).to(self.stage_bounds)
+                        )
+                        self.stage_initialized.fill_(True)
+                    else:
+                        old = self.stage_bounds.float()
+                        new = torch.stack([stage_batch_lo, stage_batch_hi]).float().to(old.device)
+                        merged = self.quantile_ema * old + (1.0 - self.quantile_ema) * new
+                        self.stage_bounds.copy_(merged.to(self.stage_bounds))
+
+                    stage_lo = self.stage_bounds[0].to(rewards_bt.device, rewards_bt.dtype)
+                    stage_hi = self.stage_bounds[1].to(rewards_bt.device, rewards_bt.dtype)
+                    stage_span = (stage_hi - stage_lo).clamp_min(self.min_signal_span)
+                    margin = self.boundary_margin * stage_span
+
+                    low_mask = finite & (evidence <= (stage_lo - margin))
+                    mid_mask = finite & (evidence >= (stage_lo + margin)) & (
+                        evidence <= (stage_hi - margin)
+                    )
+                    high_mask = finite & (evidence >= (stage_hi + margin))
+                    labels[low_mask] = 0
+                    labels[mid_mask] = 1
+                    labels[high_mask] = 2
+
+        labels[success] = 3
+        self.teacher_updates.add_(1)
+
+        configured_weight = max(
+            self.semantic_weight + self.affordance_weight + self.intrinsic_weight, 1e-8
+        )
+        active_weight = (
+            self.semantic_weight * float(sem_active)
+            + self.affordance_weight * float(aff_active)
+            + self.intrinsic_weight * float(int_active)
+        )
+        metrics: Dict[str, torch.Tensor] = {
+            "s_proto_teacher_semantic_active": torch.tensor(float(sem_active), device=rewards_bt.device),
+            "s_proto_teacher_affordance_active": torch.tensor(float(aff_active), device=rewards_bt.device),
+            "s_proto_teacher_intrinsic_active": torch.tensor(float(int_active), device=rewards_bt.device),
+            # Preserve baseline names as raw current-batch diagnostics.
+            "s_proto_teacher_semantic_qlo": sem_lo.to(rewards_bt.device),
+            "s_proto_teacher_semantic_qhi": sem_hi.to(rewards_bt.device),
+            "s_proto_teacher_semantic_span": sem_span.to(rewards_bt.device),
+            "s_proto_teacher_affordance_qlo": aff_lo.to(rewards_bt.device),
+            "s_proto_teacher_affordance_qhi": aff_hi.to(rewards_bt.device),
+            "s_proto_teacher_affordance_span": aff_span.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_qlo": int_lo.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_qhi": int_hi.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_span": int_span.to(rewards_bt.device),
+            # Stable-V1 running boundaries actually used for normalization.
+            "s_proto_teacher_semantic_ema_qlo": sem_elo.to(rewards_bt.device),
+            "s_proto_teacher_semantic_ema_qhi": sem_ehi.to(rewards_bt.device),
+            "s_proto_teacher_semantic_ema_span": sem_espan.to(rewards_bt.device),
+            "s_proto_teacher_affordance_ema_qlo": aff_elo.to(rewards_bt.device),
+            "s_proto_teacher_affordance_ema_qhi": aff_ehi.to(rewards_bt.device),
+            "s_proto_teacher_affordance_ema_span": aff_espan.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_ema_qlo": int_elo.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_ema_qhi": int_ehi.to(rewards_bt.device),
+            "s_proto_teacher_intrinsic_ema_span": int_espan.to(rewards_bt.device),
+            "s_proto_teacher_active_weight_fraction": torch.tensor(active_weight / configured_weight, device=rewards_bt.device),
+            "s_proto_evidence_mean": evidence.mean().detach(),
+            "s_proto_evidence_std": evidence.std(unbiased=False).detach(),
+            "s_proto_stage_low_threshold": stage_lo.detach(),
+            "s_proto_stage_high_threshold": stage_hi.detach(),
+            "s_proto_stage_threshold_span": stage_span.detach(),
+            "s_proto_stage_batch_low_threshold": stage_batch_lo.detach(),
+            "s_proto_stage_batch_high_threshold": stage_batch_hi.detach(),
+            "s_proto_stage_batch_threshold_span": stage_batch_span.detach(),
+            "s_proto_label_low_fraction": (labels == 0).float().mean().detach(),
+            "s_proto_label_mid_fraction": (labels == 1).float().mean().detach(),
+            "s_proto_label_high_fraction": (labels == 2).float().mean().detach(),
+            "s_proto_label_success_fraction": (labels == 3).float().mean().detach(),
+            "s_proto_label_unknown_fraction": (labels < 0).float().mean().detach(),
+            "s_proto_teacher_ema_enabled": torch.ones((), device=rewards_bt.device),
+            "s_proto_teacher_updates": self.teacher_updates.float().to(rewards_bt.device),
+        }
+        return labels, evidence, metrics
+
+
 # ============================================================================
 # Prototype bank
 # ============================================================================
@@ -390,6 +624,7 @@ class PrototypeUtilityBank(nn.Module):
         feature_dim: int,
         temperature: float = 0.10,
         prototype_ema: float = 0.95,
+        success_min_support: int = 1,
         eps: float = 1e-8,
     ):
         super().__init__()
@@ -404,6 +639,9 @@ class PrototypeUtilityBank(nn.Module):
         self.feature_dim = feature_dim
         self.temperature = float(temperature)
         self.prototype_ema = float(prototype_ema)
+        self.success_min_support = int(success_min_support)
+        if self.success_min_support < 1:
+            raise ValueError(success_min_support)
         self.eps = float(eps)
         self.num_classes = 4
 
@@ -477,6 +715,11 @@ class PrototypeUtilityBank(nn.Module):
 
         return added
 
+    def active_mask(self) -> torch.Tensor:
+        active = self.initialized.clone()
+        active[3] = active[3] & (self.support_count[3] >= self.success_min_support)
+        return active
+
     def logits(self, query_features: torch.Tensor) -> torch.Tensor:
         if query_features.shape[-1] != self.feature_dim:
             raise ValueError(
@@ -488,7 +731,7 @@ class PrototypeUtilityBank(nn.Module):
         proto = F.normalize(self.prototypes.float(), dim=-1, eps=self.eps)
         logits = torch.matmul(query, proto.transpose(0, 1)) / self.temperature
 
-        invalid = ~self.initialized
+        invalid = ~self.active_mask()
         return logits.masked_fill(invalid, -1.0e9)
 
     def loss(
@@ -504,7 +747,8 @@ class PrototypeUtilityBank(nn.Module):
         zero = flat_query.sum() * 0.0
         device = flat_query.device
 
-        if int(self.initialized.sum().item()) < 2:
+        active = self.active_mask()
+        if int(active.sum().item()) < 2:
             return zero, {
                 "acc": torch.zeros((), device=device),
                 "num": torch.zeros((), device=device),
@@ -512,7 +756,7 @@ class PrototypeUtilityBank(nn.Module):
 
         valid = flat_labels >= 0
         safe = flat_labels.clamp(min=0, max=self.num_classes - 1)
-        valid = valid & self.initialized[safe]
+        valid = valid & active[safe]
 
         if not bool(valid.any().item()):
             return zero, {
@@ -541,10 +785,20 @@ class PrototypeUtilityBank(nn.Module):
         return (probs * values).sum(dim=-1)
 
     def metrics(self) -> Dict[str, torch.Tensor]:
+        active = self.active_mask()
+        success_support = self.support_count[3].float()
         return {
             "s_proto_initialized": self.initialized.float().sum().detach(),
+            "s_proto_active_classes": active.float().sum().detach(),
             "s_proto_support_low": self.support_count[0].float().detach(),
             "s_proto_support_mid": self.support_count[1].float().detach(),
             "s_proto_support_high": self.support_count[2].float().detach(),
-            "s_proto_support_success": self.support_count[3].float().detach(),
+            "s_proto_support_success": success_support.detach(),
+            "s_proto_success_ready": active[3].float().detach(),
+            "s_proto_success_support_ratio": torch.clamp(
+                success_support / float(self.success_min_support), 0.0, 1.0
+            ).detach(),
+            "s_proto_success_min_support": torch.tensor(
+                float(self.success_min_support), device=self.support_count.device
+            ),
         }

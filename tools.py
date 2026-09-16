@@ -94,6 +94,8 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
+        self._compact_health_log = bool(getattr(config, "compact_health_log", False))
+        self._print_all_scalars = bool(getattr(config, "print_all_scalars", True))
         self.step = step
 
         if self._wandb:
@@ -121,7 +123,16 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
-        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+        scalar_dict = dict(scalars)
+        if self._print_all_scalars:
+            print(
+                f"[{step}]",
+                " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars),
+            )
+        elif self._compact_health_log:
+            self._print_compact_summary(step, scalar_dict)
+        elif scalars:
+            print(f"[{step}]", " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
 
@@ -164,6 +175,77 @@ class Logger:
             self._scalars = {}
             self._images = {}
             self._videos = {}
+
+    @staticmethod
+    def _format_scalar(value):
+        value = float(value)
+        av = abs(value)
+        if av == 0.0:
+            return "0"
+        if av >= 1000.0:
+            return f"{value:.1f}"
+        if av >= 10.0:
+            return f"{value:.2f}"
+        if av >= 1.0:
+            return f"{value:.3f}"
+        if av >= 1.0e-3:
+            return f"{value:.4f}"
+        return f"{value:.2e}"
+
+    def _print_compact_summary(self, step, d):
+        if not d:
+            return
+        f = self._format_scalar
+        if "eval_success" in d:
+            print(
+                f"[EVAL {step}] success={f(d.get('eval_success', 0.0))} "
+                f"return={f(d.get('eval_return', 0.0))} "
+                f"length={f(d.get('eval_length', 0.0))} "
+                f"first_success={f(d.get('eval_first_success_step', 0.0))}"
+            )
+            return
+        if "train_success" in d and "model_loss" not in d:
+            print(
+                f"[EP {step}] success={f(d.get('train_success', 0.0))} "
+                f"return={f(d.get('train_return', 0.0))} "
+                f"length={f(d.get('train_length', 0.0))} "
+                f"episodes={f(d.get('train_episodes', 0.0))}"
+            )
+            return
+
+        if "model_loss" in d:
+            print(
+                f"[TRAIN {step}] model={f(d.get('model_loss', 0.0))} "
+                f"image={f(d.get('image_loss', 0.0))} "
+                f"heat={f(d.get('heatmap_loss', 0.0))} "
+                f"S-Aff={f(d.get('loss_affordance_s', 0.0))} "
+                f"fps={f(d.get('fps', 0.0))}"
+            )
+            print(
+                "[HEALTH] "
+                f"S5A(cos/margin/gap)="
+                f"{f(d.get('health/s5a_cos15', 0.0))}/"
+                f"{f(d.get('health/cf_margin15', 0.0))}/"
+                f"{f(d.get('health/response_gap15', 0.0))} | "
+                f"Proto(acc/known/succReady)="
+                f"{f(d.get('health/proto_acc15', 0.0))}/"
+                f"{f(d.get('health/proto_known', 0.0))}/"
+                f"{f(d.get('health/proto_success_ready', 0.0))} | "
+                f"Outcome(gate/posEMA/corr)="
+                f"{f(d.get('health/outcome_gate', 0.0))}/"
+                f"{f(d.get('health/outcome_positive_ema', 0.0))}/"
+                f"{f(d.get('health/outcome_corr15', 0.0))} | "
+                f"Policy(Rstd/Vstd/Agrad)="
+                f"{f(d.get('health/imag_reward_std', 0.0))}/"
+                f"{f(d.get('health/value_std', 0.0))}/"
+                f"{f(d.get('health/actor_grad_norm', 0.0))} | "
+                f"ALERT={int(d.get('health/policy_collapse_alert', 0.0) >= 0.5)}"
+            )
+            return
+
+        # Fallback for rare logger writes that do not match train/eval schemas.
+        short = list(d.items())[:8]
+        print(f"[{step}]", " / ".join(f"{k} {f(v)}" for k, v in short))
 
     def _compute_fps(self, step):
         if self._last_step is None:

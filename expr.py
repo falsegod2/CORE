@@ -11,7 +11,6 @@ from torch import distributions as torchd
 from datetime import datetime
 
 import exploration as expl
-import ablation
 import models
 import tools
 import envs.wrappers as wrappers
@@ -23,9 +22,9 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-class DreamerAblationAgent(nn.Module):
+class LS_Imagine(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super().__init__()
+        super(LS_Imagine, self).__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -89,13 +88,7 @@ class DreamerAblationAgent(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            if "stoch" in latent:
-                latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
-            elif "stoch_s" in latent and "stoch_z" in latent:
-                s_stats = {k[2:]: v for k, v in latent.items() if k.startswith("s_")}
-                z_stats = {k[2:]: v for k, v in latent.items() if k.startswith("z_")}
-                latent["stoch_s"] = self._wm.dynamics.get_dist(s_stats).mode()
-                latent["stoch_z"] = self._wm.dynamics.get_dist(z_stats).mode()
+            latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -138,11 +131,63 @@ class DreamerAblationAgent(nn.Module):
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
+        if getattr(self._config, "health_metrics_enabled", False):
+            metrics = self._add_health_metrics(metrics)
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
+
+    def _add_health_metrics(self, metrics):
+        """Add human-readable aliases and a conservative collapse alert.
+
+        These diagnostics never enter any loss and do not alter RNG state.
+        """
+        aliases = {
+            "s_multistep_cosine_h15": "health/s5a_cos15",
+            "s_cf_margin_shuffle_h15": "health/cf_margin15",
+            "s_cf_response_gap_shuffle_h15": "health/response_gap15",
+            "s_dvc_reanchor_gain_h15": "health/reanchor_gain15",
+            "s_proto_acc_h15": "health/proto_acc15",
+            "s_proto_known_fraction": "health/proto_known",
+            "s_proto_unknown_fraction": "health/proto_unknown",
+            "s_proto_success_ready": "health/proto_success_ready",
+            "s_proto_success_support_ratio": "health/proto_success_support_ratio",
+            "s_proto_teacher_semantic_span": "health/proto_semantic_span",
+            "s_proto_teacher_affordance_span": "health/proto_affordance_span",
+            "s_proto_teacher_active_weight_fraction": "health/proto_teacher_active_weight",
+            "s_outcome_gate": "health/outcome_gate",
+            "s_outcome_positive_ema": "health/outcome_positive_ema",
+            "s_outcome_corr_h15": "health/outcome_corr15",
+            "s_outcome_target_nonzero_frac_h15": "health/outcome_nonzero15",
+            "imag_reward_std": "health/imag_reward_std",
+            "value_std": "health/value_std",
+            "actor_grad_norm": "health/actor_grad_norm",
+        }
+        for src, dst in aliases.items():
+            if src in metrics:
+                metrics[dst] = metrics[src]
+
+        def scalar(name, default=float("nan")):
+            if name not in metrics:
+                return default
+            try:
+                return float(np.asarray(metrics[name]).mean())
+            except Exception:
+                return default
+
+        value_std = scalar("value_std")
+        actor_grad = scalar("actor_grad_norm")
+        reward_std = scalar("imag_reward_std")
+        if np.isfinite(value_std) and np.isfinite(actor_grad) and np.isfinite(reward_std):
+            collapse = (
+                value_std < float(self._config.health_value_std_low)
+                and actor_grad < float(self._config.health_actor_grad_low)
+                and reward_std < float(self._config.health_imag_reward_std_low)
+            )
+            metrics["health/policy_collapse_alert"] = float(collapse)
+        return metrics
 
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
@@ -160,8 +205,7 @@ def make_env(config, mode, id):
 
         kwargs=dict(
                 log_dir=log_dir,
-                target_item=config.target_item,
-                use_heatmap_aux=bool(getattr(config, "use_heatmap_aux", False)),
+                target_item=config.target_item
             )
         env = minedojo.make_env(task, **kwargs)
         env = wrappers.OneHotAction(env)
@@ -177,12 +221,6 @@ def make_env(config, mode, id):
 
 
 def main(config): # config is namespace
-
-    # Resolve flat ablation switches into the exact backend/loss configuration.
-    # This happens before environment/model construction so disabled modules
-    # cannot leave hidden losses active.
-    config = ablation.apply_ablation_config(config)
-    ablation.print_summary(config)
 
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
@@ -296,7 +334,7 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = DreamerAblationAgent(
+    agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -338,7 +376,7 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent, # DreamerAblationAgent
+            agent, # LS_Imagine
             train_envs, 
             train_eps,
             config.traindir,
