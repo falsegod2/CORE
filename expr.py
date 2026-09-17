@@ -157,6 +157,19 @@ class LS_Imagine(nn.Module):
             "s_proto_teacher_semantic_span": "health/proto_semantic_span",
             "s_proto_teacher_affordance_span": "health/proto_affordance_span",
             "s_proto_teacher_active_weight_fraction": "health/proto_teacher_active_weight",
+            "s_proto_reliability_score_batch": "health/proto_reliability_batch",
+            "s_proto_reliability_score_ema": "health/proto_reliability_ema",
+            "s_proto_reliability_gate": "health/proto_gate",
+            "s_proto_success_reliability_ready": "health/proto_success_rel_ready",
+            "s_proto_pseudo_bank_update_enabled": "health/proto_bank_update",
+            "s_prototype_effective_scale": "health/proto_effective_scale",
+            "s_proto_grad_guard_gate": "health/proto_grad_gate",
+            "s_proto_grad_guard_cosine": "health/proto_grad_cos",
+            "s_proto_grad_guard_norm_ratio": "health/proto_grad_norm_ratio",
+            "s_proto_grad_guard_checked": "health/proto_grad_checked",
+            "replay_success_source_fraction": "health/replay_success_source",
+            "replay_positive_step_fraction": "health/replay_positive_step",
+            "replay_positive_sequence_fraction": "health/replay_positive_sequence",
             "s_outcome_gate": "health/outcome_gate",
             "s_outcome_positive_ema": "health/outcome_positive_ema",
             "s_outcome_corr_h15": "health/outcome_corr15",
@@ -192,8 +205,27 @@ class LS_Imagine(nn.Module):
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
-def make_dataset(episodes, config):
-    generator = tools.sample_episodes(episodes, config.batch_length)
+def make_dataset(episodes, config, training=False):
+    # Stable-V1.2 keeps the original replay implementation and adds only a
+    # small mixture bias toward already-successful episodes for the training
+    # dataset. Evaluation/video datasets remain uniform.
+    replay_enabled = bool(getattr(config, "success_replay_enabled", False))
+    replay_ratio = (
+        float(getattr(config, "success_replay_ratio", 0.0))
+        if training and replay_enabled
+        else 0.0
+    )
+    generator = tools.sample_episodes(
+        episodes,
+        config.batch_length,
+        # Preserve the original replay sampler RNG path (sample_episodes
+        # historically used seed=0 independent of environment seed).
+        seed=0,
+        success_replay_ratio=replay_ratio,
+        success_positive_threshold=float(
+            getattr(config, "success_replay_positive_threshold", 1.0e-6)
+        ),
+    )
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
 
@@ -332,8 +364,8 @@ def main(config): # config is namespace
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
+    train_dataset = make_dataset(train_eps, config, training=True)
+    eval_dataset = make_dataset(eval_eps, config, training=False)
     agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,

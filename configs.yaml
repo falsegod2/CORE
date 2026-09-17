@@ -27,6 +27,14 @@ defaults:
   health_value_std_low: 0.01
   health_actor_grad_low: 0.003
   health_imag_reward_std_low: 0.001
+
+  # Stable-V1.2 success-aware replay. Disabled by default so all earlier
+  # profiles remain behaviorally identical. This is a sampling mixture over the
+  # existing replay cache, not a new buffer and not extra environment data.
+  success_replay_enabled: False
+  success_replay_ratio: 0.0
+  success_replay_positive_threshold: 1.0e-6
+
   resume_path: null
   enable_cloud_backup: False
   cloud_backup_interval: 7200
@@ -102,6 +110,18 @@ defaults:
       quantile_mode: batch
       quantile_ema: 0.99
       success_min_support: 1
+
+      # Stable-V1.2 Proto-only gradient guard. Disabled by default. It samples
+      # gradient conflict on S prior dynamics every N updates and only attenuates
+      # Proto when it conflicts with the established core objective.
+      gradient_guard_enabled: false
+      gradient_guard_interval: 16
+      gradient_guard_conflict_low: -0.20
+      gradient_guard_conflict_high: 0.0
+      gradient_guard_min_conflict_gate: 0.25
+      gradient_guard_max_norm_ratio: 0.35
+      gradient_guard_min_total_gate: 0.10
+      gradient_guard_ema: 0.80
 
       # task_evidence = 默认通用版；temporal_success = 旧版时间分层，仅供消融。
       label_mode: task_evidence
@@ -287,6 +307,52 @@ stable_v1:
       # Prevent a handful of rare success samples from immediately defining a
       # high-authority Success prototype.
       success_min_support: 256
+
+stable_v1_1:
+  # Stable-V1.1 = Stable-V1 + Proto teacher reliability gate.
+  # Keep all Stable-V1 architecture/losses unchanged; only make Proto
+  # supervision reliability-aware when semantic/affordance evidence is weak.
+  s_multi_step_consistency:
+    prototype_utility:
+      reliability_gate_enabled: true
+      # Zero-start EMA on raw teacher discrimination:
+      # R = 0.65 * semantic_span + 0.30 * affordance_span.
+      reliability_ema: 0.99
+      reliability_low: 0.30
+      reliability_high: 0.60
+      reliability_min: 0.0
+      reliability_semantic_weight: 0.65
+      reliability_affordance_weight: 0.30
+      # Real Success support still accumulates, but the Success class is not
+      # allowed into Proto logits until both support and teacher reliability
+      # are adequate.
+      success_reliability_min_gate: 0.10
+      # When gate is exactly zero, do not let weak pseudo Low/Mid/High labels
+      # update the prototype bank. Real Success anchors are still accumulated.
+      mask_pseudo_bank_when_gate_zero: true
+
+stable_v1_2:
+  # Stable-V1.2 is intentionally restrained:
+  #   1) keep Stable-V1.1 Proto reliability gate;
+  #   2) add a Proto-only gradient conflict/norm guard;
+  #   3) sample only 10% from already-successful episodes to prevent rare
+  #      success trajectories from vanishing from replay.
+  # No changes to architecture, Full Heatmap, S-Aff, S5A, Outcome gate, actor,
+  # critic, optimizer, or learning rates.
+  success_replay_enabled: True
+  success_replay_ratio: 0.10
+  success_replay_positive_threshold: 1.0e-6
+
+  s_multi_step_consistency:
+    prototype_utility:
+      gradient_guard_enabled: true
+      gradient_guard_interval: 16
+      gradient_guard_conflict_low: -0.20
+      gradient_guard_conflict_high: 0.0
+      gradient_guard_min_conflict_gate: 0.25
+      gradient_guard_max_norm_ratio: 0.35
+      gradient_guard_min_total_gate: 0.10
+      gradient_guard_ema: 0.80
 
 debug:
   debug: True

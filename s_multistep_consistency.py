@@ -126,6 +126,17 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         prototype_quantile_mode: str = "batch",
         prototype_quantile_ema: float = 0.99,
         prototype_success_min_support: int = 1,
+        # Stable-V1.1 Proto teacher reliability gate. Defaults keep all older
+        # profiles behaviorally unchanged.
+        prototype_reliability_gate_enabled: bool = False,
+        prototype_reliability_ema: float = 0.99,
+        prototype_reliability_low: float = 0.30,
+        prototype_reliability_high: float = 0.60,
+        prototype_reliability_min: float = 0.0,
+        prototype_reliability_semantic_weight: float = 0.65,
+        prototype_reliability_affordance_weight: float = 0.30,
+        prototype_success_reliability_min_gate: float = 0.10,
+        prototype_mask_pseudo_bank_when_gate_zero: bool = False,
         # Legacy temporal-success mode parameters (ablation only).
         prototype_ready_steps: int = 4,
         prototype_near_steps: int = 15,
@@ -276,6 +287,59 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             )
         self.prototype_quantile_ema = float(prototype_quantile_ema)
         self.prototype_success_min_support = int(prototype_success_min_support)
+
+        self.prototype_reliability_gate_enabled = bool(
+            prototype_reliability_gate_enabled
+        )
+        self.prototype_reliability_ema = float(prototype_reliability_ema)
+        self.prototype_reliability_low = float(prototype_reliability_low)
+        self.prototype_reliability_high = float(prototype_reliability_high)
+        self.prototype_reliability_min = float(prototype_reliability_min)
+        self.prototype_reliability_semantic_weight = float(
+            prototype_reliability_semantic_weight
+        )
+        self.prototype_reliability_affordance_weight = float(
+            prototype_reliability_affordance_weight
+        )
+        self.prototype_success_reliability_min_gate = float(
+            prototype_success_reliability_min_gate
+        )
+        self.prototype_mask_pseudo_bank_when_gate_zero = bool(
+            prototype_mask_pseudo_bank_when_gate_zero
+        )
+        if not (0.0 <= self.prototype_reliability_ema < 1.0):
+            raise ValueError(
+                f"Invalid prototype_reliability_ema={self.prototype_reliability_ema}"
+            )
+        if (
+            self.prototype_reliability_low < 0.0
+            or self.prototype_reliability_high <= self.prototype_reliability_low
+        ):
+            raise ValueError(
+                "Invalid prototype reliability gate range: "
+                f"{self.prototype_reliability_low}, {self.prototype_reliability_high}"
+            )
+        if not (0.0 <= self.prototype_reliability_min <= 1.0):
+            raise ValueError(
+                f"Invalid prototype_reliability_min={self.prototype_reliability_min}"
+            )
+        if self.prototype_reliability_semantic_weight < 0.0:
+            raise ValueError(self.prototype_reliability_semantic_weight)
+        if self.prototype_reliability_affordance_weight < 0.0:
+            raise ValueError(self.prototype_reliability_affordance_weight)
+        if not (0.0 <= self.prototype_success_reliability_min_gate <= 1.0):
+            raise ValueError(self.prototype_success_reliability_min_gate)
+
+        # Zero-start EMA deliberately prevents a lucky first replay batch from
+        # immediately turning Proto supervision fully on.
+        self.register_buffer(
+            "prototype_reliability_score_ema",
+            torch.zeros((), dtype=torch.float32),
+            # Persist only for V1.1. Older profiles keep their original state
+            # dict schema and can still resume Stable-V1/baseline checkpoints.
+            persistent=self.prototype_reliability_gate_enabled,
+        )
+
         self.prototype_ready_steps = int(prototype_ready_steps)
         self.prototype_near_steps = int(prototype_near_steps)
         self.prototype_progress_steps = (
@@ -524,6 +588,74 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
         return total, metrics
 
     @torch.no_grad()
+    def _prototype_reliability_metrics(
+        self, teacher_metrics: Dict[str, torch.Tensor], device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Compute Stable-V1.1 reliability gate from teacher discrimination.
+
+        Reliability uses the *raw current-batch* q05-q95 spans because these
+        express whether semantic/affordance evidence actually separates states.
+        The score itself is low-pass filtered with a zero-start EMA. The gate is
+        detached and only scales Proto supervision; it never receives gradients.
+        """
+        one = torch.ones((), device=device)
+        zero = torch.zeros((), device=device)
+        if not self.prototype_reliability_gate_enabled:
+            if self.prototype_bank is not None:
+                self.prototype_bank.set_success_reliability_ready(True)
+            return {
+                "s_proto_reliability_enabled": zero,
+                "s_proto_reliability_score_batch": one,
+                "s_proto_reliability_score_ema": one,
+                "s_proto_reliability_gate": one,
+                "s_proto_success_reliability_ready": one,
+            }
+
+        sem_span = teacher_metrics.get(
+            "s_proto_teacher_semantic_span", zero
+        ).detach().float().to(device)
+        aff_span = teacher_metrics.get(
+            "s_proto_teacher_affordance_span", zero
+        ).detach().float().to(device)
+        # task_score / heatmap evidence are expected in approximately [0, 1].
+        # Clamp protects the gate from a rare outlier batch.
+        sem_term = sem_span.clamp(0.0, 1.0)
+        aff_term = aff_span.clamp(0.0, 1.0)
+        score_batch = (
+            self.prototype_reliability_semantic_weight * sem_term
+            + self.prototype_reliability_affordance_weight * aff_term
+        )
+
+        score_buffer = self.prototype_reliability_score_ema
+        score_buffer.mul_(self.prototype_reliability_ema).add_(
+            score_batch.to(score_buffer.device)
+            * (1.0 - self.prototype_reliability_ema)
+        )
+        score_ema = score_buffer.to(device=device)
+        gate_raw = (
+            (score_ema - self.prototype_reliability_low)
+            / (self.prototype_reliability_high - self.prototype_reliability_low)
+        ).clamp(0.0, 1.0)
+        gate = self.prototype_reliability_min + (
+            1.0 - self.prototype_reliability_min
+        ) * gate_raw
+        success_rel_ready = gate >= self.prototype_success_reliability_min_gate
+        if self.prototype_bank is not None:
+            self.prototype_bank.set_success_reliability_ready(success_rel_ready)
+
+        return {
+            "s_proto_reliability_enabled": one,
+            "s_proto_reliability_semantic_term": sem_term.detach(),
+            "s_proto_reliability_affordance_term": aff_term.detach(),
+            "s_proto_reliability_score_batch": score_batch.detach(),
+            "s_proto_reliability_score_ema": score_ema.detach(),
+            "s_proto_reliability_gate": gate.detach(),
+            "s_proto_success_reliability_ready": (
+                success_rel_ready.float().detach()
+            ),
+        }
+
+    @torch.no_grad()
     def _prepare_prototype_support(
         self,
         dynamics: nn.Module,
@@ -582,6 +714,9 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                     (), device=rewards.device
                 )
             metrics.update(teacher_metrics)
+            metrics.update(
+                self._prototype_reliability_metrics(teacher_metrics, rewards.device)
+            )
             class_names = ("low", "mid", "high", "success")
         else:
             labels, aux = build_progress_labels(
@@ -593,13 +728,45 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
                 progress_steps=self.prototype_progress_steps,
             )
             class_names = ("progress", "near", "ready", "success")
+            if self.prototype_bank is not None:
+                self.prototype_bank.set_success_reliability_ready(True)
+            metrics.update(
+                {
+                    "s_proto_reliability_enabled": torch.zeros((), device=rewards.device),
+                    "s_proto_reliability_score_batch": torch.ones((), device=rewards.device),
+                    "s_proto_reliability_score_ema": torch.ones((), device=rewards.device),
+                    "s_proto_reliability_gate": torch.ones((), device=rewards.device),
+                    "s_proto_success_reliability_ready": torch.ones((), device=rewards.device),
+                }
+            )
 
         posterior_feat = self._s_feature(dynamics, posterior)
         support_raw = self.projector(posterior_feat.float())
         support_proj = F.normalize(support_raw, dim=-1, eps=self.eps)
+        bank_labels = labels.detach().clone()
+        if (
+            self.prototype_reliability_gate_enabled
+            and self.prototype_mask_pseudo_bank_when_gate_zero
+        ):
+            gate = metrics["s_proto_reliability_gate"].detach()
+            pseudo = (bank_labels >= 0) & (bank_labels < 3)
+            keep_pseudo = gate > 0.0
+            bank_labels = torch.where(
+                pseudo & (~keep_pseudo),
+                torch.full_like(bank_labels, -1),
+                bank_labels,
+            )
+            metrics["s_proto_pseudo_bank_update_enabled"] = (
+                keep_pseudo.float().detach()
+            )
+        else:
+            metrics["s_proto_pseudo_bank_update_enabled"] = torch.ones(
+                (), device=rewards.device
+            )
+
         added = self.prototype_bank.update(
             support_features=support_proj.detach(),
-            support_labels=labels.detach(),
+            support_labels=bank_labels,
         )
 
         metrics.update(self.prototype_bank.metrics())
@@ -1173,16 +1340,25 @@ class SOnlyMultiStepRSSMConsistency(nn.Module):
             if self.outcome_enabled
             else actions.sum() * 0.0
         )
-        prototype_total = (
+        prototype_total_pre_gate = (
             prototype_weighted_loss / prototype_weight_total.clamp_min(self.eps)
             if self.prototype_enabled
             else actions.sum() * 0.0
         )
+        prototype_gate = prototype_metrics.get(
+            "s_proto_reliability_gate",
+            torch.ones((), device=actions.device, dtype=actions.dtype),
+        ).to(device=actions.device, dtype=prototype_total_pre_gate.dtype)
+        prototype_total = prototype_gate * prototype_total_pre_gate
         metrics.update(prototype_metrics)
         metrics["s_proto_enabled"] = torch.tensor(
             float(self.prototype_enabled), device=actions.device
         )
         if self.prototype_enabled:
+            metrics["s_proto_loss_pre_gate"] = prototype_total_pre_gate.detach()
+            metrics["s_proto_loss_post_gate"] = prototype_total.detach()
+            # Backward-compatible name now denotes the actual loss returned to
+            # WorldModel after reliability gating.
             metrics["s_proto_loss"] = prototype_total.detach()
         metrics["s_multistep_loss"] = total.detach()
         metrics["s_multistep_starts"] = torch.tensor(

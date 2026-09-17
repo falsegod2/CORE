@@ -17,6 +17,8 @@ from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict
 from bisect import insort
 
+from stable_v1_2_utils import episode_has_positive_reward
+
 
 to_np = lambda x: x.detach().cpu().numpy()
 
@@ -227,10 +229,22 @@ class Logger:
                 f"{f(d.get('health/s5a_cos15', 0.0))}/"
                 f"{f(d.get('health/cf_margin15', 0.0))}/"
                 f"{f(d.get('health/response_gap15', 0.0))} | "
-                f"Proto(acc/known/succReady)="
+                f"Proto(acc/known/gate/succReady)="
                 f"{f(d.get('health/proto_acc15', 0.0))}/"
                 f"{f(d.get('health/proto_known', 0.0))}/"
+                f"{f(d.get('health/proto_gate', 1.0))}/"
                 f"{f(d.get('health/proto_success_ready', 0.0))} | "
+                f"Rel(batch/ema/effScale)="
+                f"{f(d.get('health/proto_reliability_batch', 0.0))}/"
+                f"{f(d.get('health/proto_reliability_ema', 0.0))}/"
+                f"{f(d.get('health/proto_effective_scale', 0.0))} | "
+                f"Guard(cos/norm/gate)="
+                f"{f(d.get('health/proto_grad_cos', 1.0))}/"
+                f"{f(d.get('health/proto_grad_norm_ratio', 0.0))}/"
+                f"{f(d.get('health/proto_grad_gate', 1.0))} | "
+                f"Replay(pri/posSeq)="
+                f"{f(d.get('health/replay_success_source', 0.0))}/"
+                f"{f(d.get('health/replay_positive_sequence', 0.0))} | "
                 f"Outcome(gate/posEMA/corr)="
                 f"{f(d.get('health/outcome_gate', 0.0))}/"
                 f"{f(d.get('health/outcome_positive_ema', 0.0))}/"
@@ -570,18 +584,81 @@ def from_generator(generator, batch_size):
         yield data
 
 
-def sample_episodes(episodes, length, seed=0):
+def sample_episodes(
+    episodes,
+    length,
+    seed=0,
+    success_replay_ratio=0.0,
+    success_positive_threshold=1.0e-6,
+):
+    """Sample fixed-length replay sequences.
 
+    Stable-V1.2 adds a deliberately small success-aware mixture. With probability
+    ``success_replay_ratio`` an episode is drawn from the subset that has ever
+    contained a real positive environment reward; otherwise the original
+    length-proportional sampler is used. When no successful episode exists, this
+    is exactly the original sampler.
+
+    The sampled window itself does not have to contain the terminal reward. This
+    is intentional: windows from a successful trajectory also preserve useful
+    near-success context.
+    """
     np_random = np.random.RandomState(seed)
+    success_replay_ratio = float(np.clip(success_replay_ratio, 0.0, 1.0))
+    success_positive_threshold = float(success_positive_threshold)
+    # Cache per-episode success metadata so the 10% priority mixture never
+    # rescans the entire replay reward history on every training sample.
+    success_cache = {}
+
     while True:
         size = 0
         ret = None
-        p = np.array(
-            [len(next(iter(episode.values()))) for episode in episodes.values()]
+        used_success_priority = False
+
+        # ``episodes`` is updated online, therefore rebuild the light-weight
+        # sampling tables for every yielded training sequence just like the
+        # original implementation rebuilt its length probabilities.
+        episode_items = list(episodes.items())
+        episode_values = [episode for _, episode in episode_items]
+        lengths = np.asarray(
+            [len(next(iter(episode.values()))) for episode in episode_values],
+            dtype=np.float64,
         )
-        p = p / np.sum(p)
+        p_all = lengths / np.sum(lengths)
+
+        success_indices = []
+        if success_replay_ratio > 0.0:
+            for i, (episode_id, episode) in enumerate(episode_items):
+                if episode_id not in success_cache:
+                    success_cache[episode_id] = episode_has_positive_reward(
+                        episode, success_positive_threshold
+                    )
+                if success_cache[episode_id]:
+                    success_indices.append(i)
+        if success_indices:
+            success_lengths = lengths[success_indices]
+            p_success = success_lengths / np.sum(success_lengths)
+        else:
+            p_success = None
+
         while size < length:
-            episode = np_random.choice(list(episodes.values()), p=p)
+            draw_success = (
+                p_success is not None
+                and success_replay_ratio > 0.0
+                and np_random.rand() < success_replay_ratio
+            )
+            if draw_success:
+                local_index = int(
+                    np_random.choice(np.arange(len(success_indices)), p=p_success)
+                )
+                episode_index = int(success_indices[local_index])
+                used_success_priority = True
+            else:
+                episode_index = int(
+                    np_random.choice(np.arange(len(episode_values)), p=p_all)
+                )
+            episode = episode_values[episode_index]
+
             total = len(next(iter(episode.values())))
             # make sure at least one transition included
             if total < 2:
@@ -614,6 +691,12 @@ def sample_episodes(episodes, length, seed=0):
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
             del episode_copy
+
+        # Diagnostic-only sequence flag. WorldModel ignores it for prediction
+        # heads, but logs the actual fraction of prioritized sequences.
+        ret["replay_success_source"] = np.full(
+            (length,), float(used_success_priority), dtype=np.float32
+        )
         yield ret
 
 

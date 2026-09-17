@@ -23,6 +23,7 @@ from affordance_map.networks.swin_transformer_unet_skip_expand_decoder_sys impor
 import networks
 import tools
 import s_multistep_consistency
+from stable_v1_2_utils import gradient_guard_instant_gate
 
 logger = logging.getLogger(__name__)
 to_np = lambda x: x.detach().cpu().numpy()
@@ -32,6 +33,7 @@ def gradient_reverse(x, scale=1.0):
     """Forward identity with a compile-friendly negative backward scale."""
     scale = float(scale)
     return (1.0 + scale) * x.detach() - scale * x
+
 
 class RewardEMA:
     """
@@ -203,6 +205,47 @@ class WorldModel(nn.Module):
             self._s_outcome_scale = float(outcome_cfg.get("loss_scale", 0.0))
             self._s_prototype_enabled = bool(prototype_cfg.get("enabled", False))
             self._s_prototype_scale = float(prototype_cfg.get("loss_scale", 0.0))
+
+            # Stable-V1.2: conservative Proto-only gradient guard. We do not
+            # touch S-Aff, S5A, or Outcome because the current ablations show
+            # those paths are generally healthy. The guard is evaluated only
+            # every N model updates on the S prior-dynamics parameters.
+            self._proto_grad_guard_enabled = bool(
+                prototype_cfg.get("gradient_guard_enabled", False)
+            )
+            self._proto_grad_guard_interval = max(
+                1, int(prototype_cfg.get("gradient_guard_interval", 16))
+            )
+            self._proto_grad_guard_conflict_low = float(
+                prototype_cfg.get("gradient_guard_conflict_low", -0.20)
+            )
+            self._proto_grad_guard_conflict_high = float(
+                prototype_cfg.get("gradient_guard_conflict_high", 0.0)
+            )
+            self._proto_grad_guard_min_conflict_gate = float(
+                prototype_cfg.get("gradient_guard_min_conflict_gate", 0.25)
+            )
+            self._proto_grad_guard_max_norm_ratio = float(
+                prototype_cfg.get("gradient_guard_max_norm_ratio", 0.35)
+            )
+            self._proto_grad_guard_min_total_gate = float(
+                prototype_cfg.get("gradient_guard_min_total_gate", 0.10)
+            )
+            self._proto_grad_guard_ema = float(
+                prototype_cfg.get("gradient_guard_ema", 0.80)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_gate_ema", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_cosine", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_norm_ratio", torch.tensor(0.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_updates", torch.tensor(0, dtype=torch.long)
+            )
             self._s_multistep = s_multistep_consistency.SOnlyMultiStepRSSMConsistency(
                 feat_dim=s_feat_dim,
                 horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
@@ -321,6 +364,33 @@ class WorldModel(nn.Module):
                 prototype_success_min_support=int(
                     prototype_cfg.get("success_min_support", 1)
                 ),
+                prototype_reliability_gate_enabled=bool(
+                    prototype_cfg.get("reliability_gate_enabled", False)
+                ),
+                prototype_reliability_ema=float(
+                    prototype_cfg.get("reliability_ema", 0.99)
+                ),
+                prototype_reliability_low=float(
+                    prototype_cfg.get("reliability_low", 0.30)
+                ),
+                prototype_reliability_high=float(
+                    prototype_cfg.get("reliability_high", 0.60)
+                ),
+                prototype_reliability_min=float(
+                    prototype_cfg.get("reliability_min", 0.0)
+                ),
+                prototype_reliability_semantic_weight=float(
+                    prototype_cfg.get("reliability_semantic_weight", 0.65)
+                ),
+                prototype_reliability_affordance_weight=float(
+                    prototype_cfg.get("reliability_affordance_weight", 0.30)
+                ),
+                prototype_success_reliability_min_gate=float(
+                    prototype_cfg.get("success_reliability_min_gate", 0.10)
+                ),
+                prototype_mask_pseudo_bank_when_gate_zero=bool(
+                    prototype_cfg.get("mask_pseudo_bank_when_gate_zero", False)
+                ),
                 # Retained only if label_mode=temporal_success for ablation.
                 prototype_ready_steps=int(
                     prototype_cfg.get("ready_steps", 4)
@@ -337,6 +407,26 @@ class WorldModel(nn.Module):
             self._s_outcome_scale = 0.0
             self._s_prototype_enabled = False
             self._s_prototype_scale = 0.0
+            self._proto_grad_guard_enabled = False
+            self._proto_grad_guard_interval = 16
+            self._proto_grad_guard_conflict_low = -0.20
+            self._proto_grad_guard_conflict_high = 0.0
+            self._proto_grad_guard_min_conflict_gate = 0.25
+            self._proto_grad_guard_max_norm_ratio = 0.35
+            self._proto_grad_guard_min_total_gate = 0.10
+            self._proto_grad_guard_ema = 0.80
+            self.register_buffer(
+                "_proto_grad_guard_gate_ema", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_cosine", torch.tensor(1.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_norm_ratio", torch.tensor(0.0, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "_proto_grad_guard_updates", torch.tensor(0, dtype=torch.long)
+            )
        
         for name in config.grad_heads:
             assert name in self.heads, name
@@ -356,6 +446,68 @@ class WorldModel(nn.Module):
             affordance_s=getattr(config, "affordance_s_scale", 1.0),
             z_action_adv=getattr(config, "z_action_adv_scale", 0.0),
         )
+
+    def _proto_gradient_guard(self, base_core_loss, proto_term):
+        """Return a detached scalar gate and diagnostics for Proto.
+
+        The proxy parameter set is deliberately restricted to the controllable
+        S prior dynamics, because that is the shared mechanism Proto can perturb
+        and that S5A/action-fidelity diagnostics already validate. Evaluating
+        every update would add several backward passes, so Stable-V1.2 checks
+        every ``gradient_guard_interval`` updates and keeps an EMA gate between
+        checks.
+        """
+        if not self._proto_grad_guard_enabled or not self._s_prototype_enabled:
+            return 1.0, {
+                "s_proto_grad_guard_gate": 1.0,
+                "s_proto_grad_guard_cosine": 1.0,
+                "s_proto_grad_guard_norm_ratio": 0.0,
+                "s_proto_grad_guard_checked": 0.0,
+            }
+
+        update = int(self._proto_grad_guard_updates.item())
+        checked = (update % self._proto_grad_guard_interval) == 0
+        self._proto_grad_guard_updates.add_(1)
+
+        if checked:
+            proxy_modules = (
+                self.dynamics._img_in_s,
+                self.dynamics._cell_s,
+                self.dynamics._img_out_s,
+                self.dynamics._stat_s_img,
+            )
+            proxy_params = tuple(
+                p for module in proxy_modules for p in module.parameters()
+            )
+            gate_now, cosine, norm_ratio = gradient_guard_instant_gate(
+                base_core_loss,
+                proto_term,
+                proxy_params,
+                conflict_low=self._proto_grad_guard_conflict_low,
+                conflict_high=self._proto_grad_guard_conflict_high,
+                min_conflict_gate=self._proto_grad_guard_min_conflict_gate,
+                max_norm_ratio=self._proto_grad_guard_max_norm_ratio,
+                min_total_gate=self._proto_grad_guard_min_total_gate,
+            )
+            with torch.no_grad():
+                ema = self._proto_grad_guard_ema
+                self._proto_grad_guard_gate_ema.mul_(ema).add_(
+                    (1.0 - ema) * gate_now
+                )
+                self._proto_grad_guard_cosine.fill_(cosine)
+                self._proto_grad_guard_norm_ratio.fill_(norm_ratio)
+
+        gate = float(self._proto_grad_guard_gate_ema.detach().cpu())
+        return gate, {
+            "s_proto_grad_guard_gate": gate,
+            "s_proto_grad_guard_cosine": float(
+                self._proto_grad_guard_cosine.detach().cpu()
+            ),
+            "s_proto_grad_guard_norm_ratio": float(
+                self._proto_grad_guard_norm_ratio.detach().cpu()
+            ),
+            "s_proto_grad_guard_checked": float(checked),
+        }
 
     def _train(self, data_origin):
         # 仅预处理基础序列数据
@@ -489,19 +641,28 @@ class WorldModel(nn.Module):
                         intrinsic=data.get("intrinsic", None),
                     )
 
-                # 6. 汇总总损失：保留 repaired inverse + S-Aff，关闭Z adversary，
-                #    再增加 S-only 5A。
+                # 6. 汇总总损失。Stable-V1.2只在Proto外再加一个很克制的
+                #    gradient guard；S-Aff / S5A / Outcome路径保持Stable-V1.1不变。
                 model_loss = sum(scaled.values()) + kl_loss_img
-                total_loss = (
+                base_core_loss = (
                     torch.mean(model_loss)
                     + loss_inv * self._scales.get("inverse", 1.0)
                     + loss_z_action_adv * self._scales.get("z_action_adv", 0.0)
                     + torch.mean(loss_affordance_s)
                     * self._scales.get("affordance_s", 1.0)
                     + self._s_multistep_scale * s_multistep_loss
-                    + self._s_outcome_scale * s_outcome_loss
-                    + self._s_prototype_scale * s_prototype_loss
                 )
+                outcome_term = self._s_outcome_scale * s_outcome_loss
+                prototype_term = self._s_prototype_scale * s_prototype_loss
+
+            proto_grad_gate, proto_grad_metrics = self._proto_gradient_guard(
+                base_core_loss, prototype_term
+            )
+            total_loss = (
+                base_core_loss
+                + outcome_term
+                + proto_grad_gate * prototype_term
+            )
 
             # 统一执行优化
             metrics = self._model_opt(total_loss, self.parameters())
@@ -520,9 +681,40 @@ class WorldModel(nn.Module):
             self._s_outcome_scale * s_outcome_loss
         )
         metrics["s_prototype_scale"] = self._s_prototype_scale
+        metrics.update(proto_grad_metrics)
+        proto_gate_metric = s_multistep_metrics.get("s_proto_reliability_gate", None)
+        if proto_gate_metric is not None:
+            reliability_gate_value = to_np(proto_gate_metric)
+            metrics["s_prototype_effective_scale"] = (
+                float(reliability_gate_value)
+                * self._s_prototype_scale
+                * float(proto_grad_gate)
+            )
+        else:
+            metrics["s_prototype_effective_scale"] = (
+                self._s_prototype_scale * float(proto_grad_gate)
+            )
         metrics["s_prototype_weighted_loss"] = to_np(
-            self._s_prototype_scale * s_prototype_loss
+            float(proto_grad_gate) * self._s_prototype_scale * s_prototype_loss
         )
+
+        # Stable-V1.2 replay diagnostics. ``replay_success_source`` means the
+        # sequence was sampled through the small success-priority mixture; the
+        # two reward metrics show whether the sampled window itself contains
+        # real positive reward.
+        if "replay_success_source" in data:
+            metrics["replay_success_source_fraction"] = to_np(
+                torch.mean(data["replay_success_source"].float())
+            )
+        reward_flat = data["reward"].float()
+        metrics["replay_positive_step_fraction"] = to_np(
+            torch.mean((reward_flat > 1.0e-6).float())
+        )
+        if reward_flat.ndim >= 2:
+            per_seq = reward_flat.reshape(reward_flat.shape[0], -1)
+            metrics["replay_positive_sequence_fraction"] = to_np(
+                torch.mean((torch.max(per_seq, dim=1).values > 1.0e-6).float())
+            )
         metrics["model_loss"] = to_np(total_loss)
         metrics["kl"] = to_np(torch.mean(kl_value_img))
         metrics["kl_s"] = to_np(torch.mean(kl_value_s))

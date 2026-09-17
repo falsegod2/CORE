@@ -665,6 +665,16 @@ class PrototypeUtilityBank(nn.Module):
             torch.tensor([0.00, 0.33, 0.66, 1.00], dtype=torch.float32),
             persistent=True,
         )
+        # Stable-V1.1 external reliability condition. Defaults to True so all
+        # baseline/Stable-V1 behavior is unchanged unless the caller explicitly
+        # drives it from the Proto teacher reliability gate.
+        self.register_buffer(
+            "success_reliability_ready",
+            torch.ones((), dtype=torch.bool),
+            # Recomputed from the teacher gate every update; keeping it out of
+            # checkpoints preserves backward compatibility with Stable V1.
+            persistent=False,
+        )
 
     @torch.no_grad()
     def update(
@@ -715,9 +725,30 @@ class PrototypeUtilityBank(nn.Module):
 
         return added
 
+    @torch.no_grad()
+    def set_success_reliability_ready(self, ready) -> None:
+        """Set the external teacher-reliability condition for Success class.
+
+        Real success support/prototype accumulation is never discarded. This
+        flag only controls whether Success participates in Proto logits/loss.
+        """
+        if torch.is_tensor(ready):
+            value = ready.detach().to(
+                device=self.success_reliability_ready.device, dtype=torch.bool
+            )
+            if value.numel() != 1:
+                raise ValueError("success reliability flag must be scalar")
+            self.success_reliability_ready.copy_(value.reshape(()))
+        else:
+            self.success_reliability_ready.fill_(bool(ready))
+
     def active_mask(self) -> torch.Tensor:
         active = self.initialized.clone()
-        active[3] = active[3] & (self.support_count[3] >= self.success_min_support)
+        active[3] = (
+            active[3]
+            & (self.support_count[3] >= self.success_min_support)
+            & self.success_reliability_ready
+        )
         return active
 
     def logits(self, query_features: torch.Tensor) -> torch.Tensor:
@@ -795,6 +826,9 @@ class PrototypeUtilityBank(nn.Module):
             "s_proto_support_high": self.support_count[2].float().detach(),
             "s_proto_support_success": success_support.detach(),
             "s_proto_success_ready": active[3].float().detach(),
+            "s_proto_success_reliability_ready": (
+                self.success_reliability_ready.float().detach()
+            ),
             "s_proto_success_support_ratio": torch.clamp(
                 success_support / float(self.success_min_support), 0.0, 1.0
             ).detach(),
