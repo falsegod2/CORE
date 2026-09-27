@@ -1,776 +1,295 @@
 # coding=utf-8
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import os
 import copy
-import math
-import random
 import logging
-from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw, ImageFont
-
-from affordance_map.networks.swin_transformer_unet_skip_expand_decoder_sys import SwinTransformerSys, MultimodalSwinTransformerSys
 
 import networks
 import tools
-import s_multistep_consistency
-from stable_v1_2_utils import gradient_guard_instant_gate
+import dreamer_diagnostics
 
 logger = logging.getLogger(__name__)
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-def gradient_reverse(x, scale=1.0):
-    """Forward identity with a compile-friendly negative backward scale."""
-    scale = float(scale)
-    return (1.0 + scale) * x.detach() - scale * x
-
-
 class RewardEMA:
-    """
-    运行时的奖励均值和标准差估计 (Exponential Moving Average)
-    用于标准化奖励信号，使训练更稳定
-    """
+    """DreamerV3 percentile-based return normalization."""
+
     def __init__(self, device, alpha=1e-2):
         self.device = device
         self.alpha = alpha
-        self.range = torch.tensor([0.05, 0.95]).to(device)
+        self.range = torch.tensor([0.05, 0.95], device=device)
 
     def __call__(self, x, ema_vals):
         flat_x = torch.flatten(x.detach())
-        x_quantile = torch.quantile(input=flat_x, q=self.range)
-        ema_vals[:] = self.alpha * x_quantile + (1 - self.alpha) * ema_vals
+        x_quantile = torch.quantile(flat_x, self.range)
+        ema_vals[:] = self.alpha * x_quantile + (1.0 - self.alpha) * ema_vals
         scale = torch.clip(ema_vals[1] - ema_vals[0], min=1.0)
         offset = ema_vals[0]
         return offset.detach(), scale.detach()
 
-class MCUnet(nn.Module):
-    """多模态 U-Net，用于处理图像和文本特征"""
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
-        super(MCUnet, self).__init__()
-        self.num_classes = num_classes
-        self.zero_head = zero_head
-        self.config = config
-
-        self.swin_unet = MultimodalSwinTransformerSys(img_size=config.DATA.IMG_SIZE,
-                                patch_size=config.MODEL.SWIN.PATCH_SIZE,
-                                in_chans=config.MODEL.SWIN.IN_CHANS,
-                                num_classes=self.num_classes,
-                                embed_dim=config.MODEL.SWIN.EMBED_DIM,
-                                depths=config.MODEL.SWIN.DEPTHS,
-                                num_heads=config.MODEL.SWIN.NUM_HEADS,
-                                window_size=config.MODEL.SWIN.WINDOW_SIZE,
-                                mlp_ratio=config.MODEL.SWIN.MLP_RATIO,
-                                qkv_bias=config.MODEL.SWIN.QKV_BIAS,
-                                qk_scale=config.MODEL.SWIN.QK_SCALE,
-                                drop_rate=config.MODEL.DROP_RATE,
-                                drop_path_rate=config.MODEL.DROP_PATH_RATE,
-                                ape=config.MODEL.SWIN.APE,
-                                patch_norm=config.MODEL.SWIN.PATCH_NORM,
-                                use_checkpoint=config.TRAIN.USE_CHECKPOINT,
-                                text_feature_dim=config.MODEL.TEXT_FEATURE_DIM,
-                                heads=config.MODEL.HEADS)
-
-    def forward(self, x, p):
-        if x.size()[1] == 1:
-            x = x.repeat(1,3,1,1)
-        logits = self.swin_unet(x, p)
-        return logits
-
-    def load_from(self, config):
-        pretrained_path = config.MODEL.PRETRAIN_CKPT
-        if pretrained_path is not None:
-            print("pretrained_path:{}".format(pretrained_path))
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            pretrained_dict = torch.load(pretrained_path, map_location=device)
-            if "model"  not in pretrained_dict:
-                print("---start load pretrained modle by splitting---")
-                pretrained_dict = {k[17:]:v for k,v in pretrained_dict.items()}
-                for k in list(pretrained_dict.keys()):
-                    if "output" in k:
-                        print("delete key:{}".format(k))
-                        del pretrained_dict[k]
-                msg = self.swin_unet.load_state_dict(pretrained_dict,strict=False)
-                return
-            pretrained_dict = pretrained_dict['model']
-            print("---start load pretrained modle of swin encoder---")
-
-            model_dict = self.swin_unet.state_dict()
-            full_dict = copy.deepcopy(pretrained_dict)
-            for k, v in pretrained_dict.items():
-                if "layers." in k:
-                    current_layer_num = 3-int(k[7:8])
-                    current_k = "layers_up." + str(current_layer_num) + k[8:]
-                    full_dict.update({current_k:v})
-            for k in list(full_dict.keys()):
-                if k in model_dict:
-                    if full_dict[k].shape != model_dict[k].shape:
-                        print("delete:{};shape pretrain:{};shape model:{}".format(k,v.shape,model_dict[k].shape))
-                        del full_dict[k]
-
-            msg = self.swin_unet.load_state_dict(full_dict, strict=False)
-        else:
-            print("none pretrain")
-
 
 class WorldModel(nn.Module):
+    """Single-RSSM DreamerV3 world model with optional MineCLIP shaping head."""
+
     def __init__(self, obs_space, act_space, step, config):
-        super(WorldModel, self).__init__()
-        self._use_amp = True if config.precision == 16 else False
+        super().__init__()
+        del act_space, step
+        self._use_amp = config.precision == 16
         self._config = config
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+
+        shapes = {key: tuple(space.shape) for key, space in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
-        if "heatmap" in getattr(self.encoder, "cnn_shapes", {}):
-            raise ValueError(
-                "RGB-only ISO variant forbids heatmap in the observation encoder. "
-                "Keep heatmap only as an auxiliary prediction target."
-            )
         self.embed_size = self.encoder.outdim
-        
         self.dynamics = networks.RSSM(
-            config.dyn_stoch, config.dyn_deter, config.dyn_hidden,
-            config.dyn_rec_depth, config.dyn_discrete, config.act,
-            config.norm, config.dyn_mean_act, config.dyn_std_act,
-            config.dyn_min_std, config.unimix_ratio, config.initial,
-            config.num_actions, self.embed_size, config.device,
+            config.dyn_stoch,
+            config.dyn_deter,
+            config.dyn_hidden,
+            config.dyn_rec_depth,
+            config.dyn_discrete,
+            config.act,
+            config.norm,
+            config.dyn_mean_act,
+            config.dyn_std_act,
+            config.dyn_min_std,
+            config.unimix_ratio,
+            config.initial,
+            config.num_actions,
+            self.embed_size,
+            config.device,
+        )
+
+        feat_size = (
+            config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            if config.dyn_discrete
+            else config.dyn_stoch + config.dyn_deter
         )
 
         self.heads = nn.ModuleDict()
-
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-        else:
-            feat_size = config.dyn_stoch + config.dyn_deter
-
-        self.heads["decoder"] = networks.MultiDecoder(feat_size, shapes, **config.decoder)
-
+        self.heads["decoder"] = networks.MultiDecoder(
+            feat_size, shapes, **config.decoder
+        )
         self.heads["reward"] = networks.MLP(
-            feat_size, (255,) if config.reward_head["dist"] == "symlog_disc" else (),
-            config.reward_head["layers"], config.units, config.act, config.norm,
-            dist=config.reward_head["dist"], outscale=config.reward_head["outscale"],
-            device=config.device, name="Reward",
+            feat_size,
+            (255,) if config.reward_head["dist"] == "symlog_disc" else (),
+            config.reward_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist=config.reward_head["dist"],
+            outscale=config.reward_head["outscale"],
+            device=config.device,
+            name="Reward",
         )
-
         self.heads["end"] = networks.MLP(
-            feat_size, (), config.end_head["layers"], config.units, config.act, config.norm,
-            dist="binary", outscale=config.end_head["outscale"], device=config.device, name="End",
+            feat_size,
+            (),
+            config.end_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist="binary",
+            outscale=config.end_head["outscale"],
+            device=config.device,
+            name="End",
+        )
+        self.heads["mineclip_reward"] = networks.MLP(
+            feat_size,
+            (255,) if config.mineclip_head["dist"] == "symlog_disc" else (),
+            config.mineclip_head["layers"],
+            config.units,
+            config.act,
+            config.norm,
+            dist=config.mineclip_head["dist"],
+            outscale=config.mineclip_head["outscale"],
+            device=config.device,
+            name="MineCLIPReward",
         )
 
-        self.heads["intrinsic"] = networks.MLP(
-            feat_size, (255,) if config.intrinsic_head["dist"] == "symlog_disc" else (),
-            config.intrinsic_head["layers"], config.units, config.act, config.norm,
-            dist=config.intrinsic_head["dist"], outscale=config.intrinsic_head["outscale"],
-            device=config.device, name="Intrinsic",
-        )
-
-        # Diagnostic/adversarial action probe for the action-free Z branch.
-        # Gradient reversal trains the probe to recognize actions while pushing Z
-        # toward action invariance. The scale can be set to zero for ablation.
-        act_fn = getattr(torch.nn, config.act)
-        z_stoch_dim = self.dynamics._stoch_z * (
-            self.dynamics._discrete if self.dynamics._discrete else 1
-        )
-        self._z_branch_feat_dim = z_stoch_dim + self.dynamics._deter_z
-        self.z_action_adversary = nn.Sequential(
-            nn.Linear(self._z_branch_feat_dim * 2, config.dyn_hidden),
-            act_fn(),
-            nn.Linear(config.dyn_hidden, config.num_actions),
-        )
-        self._z_action_grl_scale = getattr(config, "z_action_grl_scale", 1.0)
-
-        # S-only Experiment 5A. This has no trainable predictor: it directly
-        # regularizes the existing S prior transition used by imagination.
-        sms_cfg = getattr(config, "s_multi_step_consistency", {}) or {}
-        self._s_multistep_enabled = bool(sms_cfg.get("enabled", False))
-        self._s_multistep_scale = float(sms_cfg.get("loss_scale", 0.0))
-        self._s_multistep = None
-        if self._s_multistep_enabled:
-            s_stoch_dim = self.dynamics._stoch_s * (
-                self.dynamics._discrete if self.dynamics._discrete else 1
-            )
-            s_feat_dim = s_stoch_dim + self.dynamics._deter_s
-            diag_cfg = sms_cfg.get("diagnostics", {}) or {}
-            outcome_cfg = sms_cfg.get("outcome", {}) or {}
-            prototype_cfg = sms_cfg.get("prototype_utility", {}) or {}
-            self._s_outcome_enabled = bool(outcome_cfg.get("enabled", False))
-            self._s_outcome_scale = float(outcome_cfg.get("loss_scale", 0.0))
-            self._s_prototype_enabled = bool(prototype_cfg.get("enabled", False))
-            self._s_prototype_scale = float(prototype_cfg.get("loss_scale", 0.0))
-
-            # Stable-V1.2: conservative Proto-only gradient guard. We do not
-            # touch S-Aff, S5A, or Outcome because the current ablations show
-            # those paths are generally healthy. The guard is evaluated only
-            # every N model updates on the S prior-dynamics parameters.
-            self._proto_grad_guard_enabled = bool(
-                prototype_cfg.get("gradient_guard_enabled", False)
-            )
-            self._proto_grad_guard_interval = max(
-                1, int(prototype_cfg.get("gradient_guard_interval", 16))
-            )
-            self._proto_grad_guard_conflict_low = float(
-                prototype_cfg.get("gradient_guard_conflict_low", -0.20)
-            )
-            self._proto_grad_guard_conflict_high = float(
-                prototype_cfg.get("gradient_guard_conflict_high", 0.0)
-            )
-            self._proto_grad_guard_min_conflict_gate = float(
-                prototype_cfg.get("gradient_guard_min_conflict_gate", 0.25)
-            )
-            self._proto_grad_guard_max_norm_ratio = float(
-                prototype_cfg.get("gradient_guard_max_norm_ratio", 0.35)
-            )
-            self._proto_grad_guard_min_total_gate = float(
-                prototype_cfg.get("gradient_guard_min_total_gate", 0.10)
-            )
-            self._proto_grad_guard_ema = float(
-                prototype_cfg.get("gradient_guard_ema", 0.80)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_gate_ema", torch.tensor(1.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_cosine", torch.tensor(1.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_norm_ratio", torch.tensor(0.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_updates", torch.tensor(0, dtype=torch.long)
-            )
-            self._s_multistep = s_multistep_consistency.SOnlyMultiStepRSSMConsistency(
-                feat_dim=s_feat_dim,
-                horizons=sms_cfg.get("horizons", [1, 2, 4, 8, 15]),
-                horizon_weights=sms_cfg.get(
-                    "horizon_weights", [1.0, 1.0, 0.75, 0.5, 0.25]
-                ),
-                projection_dim=int(sms_cfg.get("projection_dim", 512)),
-                starts_per_sequence=int(sms_cfg.get("starts_per_sequence", 4)),
-                projection_seed=int(sms_cfg.get("projection_seed", 314159)),
-                diagnostics_enabled=bool(diag_cfg.get("enabled", True)),
-                counterfactual_diagnostics=bool(
-                    diag_cfg.get("counterfactual_actions", True)
-                ),
-                direct_vs_composed_diagnostics=bool(
-                    diag_cfg.get("direct_vs_composed", True)
-                ),
-                direct_vs_composed_horizon=diag_cfg.get(
-                    "direct_vs_composed_horizon", None
-                ),
-                direct_vs_composed_midpoint=diag_cfg.get(
-                    "direct_vs_composed_midpoint", None
-                ),
-                outcome_enabled=self._s_outcome_enabled,
-                outcome_hidden_dim=int(outcome_cfg.get("hidden_dim", 256)),
-                outcome_init_seed=int(outcome_cfg.get("init_seed", 161803)),
-                outcome_discount=(
-                    float(config.discount)
-                    if outcome_cfg.get("discount", None) is None
-                    else float(outcome_cfg.get("discount"))
-                ),
-                outcome_positive_weight=float(
-                    outcome_cfg.get("positive_weight", 1.0)
-                ),
-                outcome_balance_mode=str(
-                    outcome_cfg.get("balance_mode", "balanced")
-                ),
-                outcome_positive_mix=float(
-                    outcome_cfg.get("positive_mix", 0.5)
-                ),
-                outcome_positive_threshold=float(
-                    outcome_cfg.get("positive_threshold", 1.0e-6)
-                ),
-                outcome_calibration_enabled=bool(
-                    outcome_cfg.get("calibration_enabled", True)
-                ),
-                outcome_calibration_scale=float(
-                    outcome_cfg.get("calibration_scale", 0.5)
-                ),
-                outcome_gate_enabled=bool(
-                    outcome_cfg.get("evidence_gate_enabled", False)
-                ),
-                outcome_gate_ema=float(
-                    outcome_cfg.get("evidence_gate_ema", 0.99)
-                ),
-                outcome_gate_low=float(
-                    outcome_cfg.get("evidence_gate_low", 5.0e-5)
-                ),
-                outcome_gate_high=float(
-                    outcome_cfg.get("evidence_gate_high", 5.0e-4)
-                ),
-                outcome_gate_horizon=int(
-                    outcome_cfg.get("evidence_gate_horizon", 15)
-                ),
-                outcome_gate_min=float(
-                    outcome_cfg.get("evidence_gate_min", 0.0)
-                ),
-                prototype_enabled=self._s_prototype_enabled,
-                prototype_temperature=float(
-                    prototype_cfg.get("temperature", 0.10)
-                ),
-                prototype_ema=float(
-                    prototype_cfg.get("prototype_ema", 0.95)
-                ),
-                prototype_label_mode=str(
-                    prototype_cfg.get("label_mode", "task_evidence")
-                ),
-                prototype_positive_threshold=float(
-                    prototype_cfg.get("positive_threshold", 1.0e-6)
-                ),
-                prototype_semantic_weight=float(
-                    prototype_cfg.get("semantic_weight", 0.65)
-                ),
-                prototype_affordance_weight=float(
-                    prototype_cfg.get("affordance_weight", 0.30)
-                ),
-                prototype_intrinsic_weight=float(
-                    prototype_cfg.get("intrinsic_weight", 0.05)
-                ),
-                prototype_heatmap_topk_fraction=float(
-                    prototype_cfg.get("heatmap_topk_fraction", 0.05)
-                ),
-                prototype_robust_low_quantile=float(
-                    prototype_cfg.get("robust_low_quantile", 0.05)
-                ),
-                prototype_robust_high_quantile=float(
-                    prototype_cfg.get("robust_high_quantile", 0.95)
-                ),
-                prototype_stage_low_quantile=float(
-                    prototype_cfg.get("stage_low_quantile", 0.30)
-                ),
-                prototype_stage_high_quantile=float(
-                    prototype_cfg.get("stage_high_quantile", 0.70)
-                ),
-                prototype_boundary_margin=float(
-                    prototype_cfg.get("boundary_margin", 0.05)
-                ),
-                prototype_min_signal_span=float(
-                    prototype_cfg.get("min_signal_span", 1.0e-4)
-                ),
-                prototype_quantile_mode=str(
-                    prototype_cfg.get("quantile_mode", "batch")
-                ),
-                prototype_quantile_ema=float(
-                    prototype_cfg.get("quantile_ema", 0.99)
-                ),
-                prototype_success_min_support=int(
-                    prototype_cfg.get("success_min_support", 1)
-                ),
-                prototype_reliability_gate_enabled=bool(
-                    prototype_cfg.get("reliability_gate_enabled", False)
-                ),
-                prototype_reliability_ema=float(
-                    prototype_cfg.get("reliability_ema", 0.99)
-                ),
-                prototype_reliability_low=float(
-                    prototype_cfg.get("reliability_low", 0.30)
-                ),
-                prototype_reliability_high=float(
-                    prototype_cfg.get("reliability_high", 0.60)
-                ),
-                prototype_reliability_min=float(
-                    prototype_cfg.get("reliability_min", 0.0)
-                ),
-                prototype_reliability_semantic_weight=float(
-                    prototype_cfg.get("reliability_semantic_weight", 0.65)
-                ),
-                prototype_reliability_affordance_weight=float(
-                    prototype_cfg.get("reliability_affordance_weight", 0.30)
-                ),
-                prototype_success_reliability_min_gate=float(
-                    prototype_cfg.get("success_reliability_min_gate", 0.10)
-                ),
-                prototype_mask_pseudo_bank_when_gate_zero=bool(
-                    prototype_cfg.get("mask_pseudo_bank_when_gate_zero", False)
-                ),
-                # Retained only if label_mode=temporal_success for ablation.
-                prototype_ready_steps=int(
-                    prototype_cfg.get("ready_steps", 4)
-                ),
-                prototype_near_steps=int(
-                    prototype_cfg.get("near_steps", 15)
-                ),
-                prototype_progress_steps=prototype_cfg.get(
-                    "progress_steps", None
-                ),
-            )
-        else:
-            self._s_outcome_enabled = False
-            self._s_outcome_scale = 0.0
-            self._s_prototype_enabled = False
-            self._s_prototype_scale = 0.0
-            self._proto_grad_guard_enabled = False
-            self._proto_grad_guard_interval = 16
-            self._proto_grad_guard_conflict_low = -0.20
-            self._proto_grad_guard_conflict_high = 0.0
-            self._proto_grad_guard_min_conflict_gate = 0.25
-            self._proto_grad_guard_max_norm_ratio = 0.35
-            self._proto_grad_guard_min_total_gate = 0.10
-            self._proto_grad_guard_ema = 0.80
-            self.register_buffer(
-                "_proto_grad_guard_gate_ema", torch.tensor(1.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_cosine", torch.tensor(1.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_norm_ratio", torch.tensor(0.0, dtype=torch.float32)
-            )
-            self.register_buffer(
-                "_proto_grad_guard_updates", torch.tensor(0, dtype=torch.long)
-            )
-       
         for name in config.grad_heads:
-            assert name in self.heads, name
+            if name not in self.heads:
+                raise KeyError(f"Unknown gradient head: {name}")
 
         self._model_opt = tools.Optimizer(
-            "model", self.parameters(), config.model_lr, config.opt_eps, config.grad_clip,
-            config.weight_decay, opt=config.opt, use_amp=self._use_amp,
+            "model",
+            self.parameters(),
+            config.model_lr,
+            config.opt_eps,
+            config.grad_clip,
+            config.weight_decay,
+            opt=config.opt,
+            use_amp=self._use_amp,
+        )
+        print(
+            "Optimizer model_opt has "
+            f"{sum(parameter.numel() for parameter in self.parameters())} variables."
         )
 
-        print(f"Optimizer model_opt has {sum(param.numel() for param in self.parameters())} variables.")
-
-        self._scales = dict(
-            reward=config.reward_head["loss_scale"],
-            end=config.end_head["loss_scale"],
-            intrinsic=config.intrinsic_head["loss_scale"],
-            inverse=getattr(config, "inverse_loss_scale", 1.0),
-            affordance_s=getattr(config, "affordance_s_scale", 1.0),
-            z_action_adv=getattr(config, "z_action_adv_scale", 0.0),
-        )
-
-    def _proto_gradient_guard(self, base_core_loss, proto_term):
-        """Return a detached scalar gate and diagnostics for Proto.
-
-        The proxy parameter set is deliberately restricted to the controllable
-        S prior dynamics, because that is the shared mechanism Proto can perturb
-        and that S5A/action-fidelity diagnostics already validate. Evaluating
-        every update would add several backward passes, so Stable-V1.2 checks
-        every ``gradient_guard_interval`` updates and keeps an EMA gate between
-        checks.
-        """
-        if not self._proto_grad_guard_enabled or not self._s_prototype_enabled:
-            return 1.0, {
-                "s_proto_grad_guard_gate": 1.0,
-                "s_proto_grad_guard_cosine": 1.0,
-                "s_proto_grad_guard_norm_ratio": 0.0,
-                "s_proto_grad_guard_checked": 0.0,
-            }
-
-        update = int(self._proto_grad_guard_updates.item())
-        checked = (update % self._proto_grad_guard_interval) == 0
-        self._proto_grad_guard_updates.add_(1)
-
-        if checked:
-            proxy_modules = (
-                self.dynamics._img_in_s,
-                self.dynamics._cell_s,
-                self.dynamics._img_out_s,
-                self.dynamics._stat_s_img,
-            )
-            proxy_params = tuple(
-                p for module in proxy_modules for p in module.parameters()
-            )
-            gate_now, cosine, norm_ratio = gradient_guard_instant_gate(
-                base_core_loss,
-                proto_term,
-                proxy_params,
-                conflict_low=self._proto_grad_guard_conflict_low,
-                conflict_high=self._proto_grad_guard_conflict_high,
-                min_conflict_gate=self._proto_grad_guard_min_conflict_gate,
-                max_norm_ratio=self._proto_grad_guard_max_norm_ratio,
-                min_total_gate=self._proto_grad_guard_min_total_gate,
-            )
-            with torch.no_grad():
-                ema = self._proto_grad_guard_ema
-                self._proto_grad_guard_gate_ema.mul_(ema).add_(
-                    (1.0 - ema) * gate_now
-                )
-                self._proto_grad_guard_cosine.fill_(cosine)
-                self._proto_grad_guard_norm_ratio.fill_(norm_ratio)
-
-        gate = float(self._proto_grad_guard_gate_ema.detach().cpu())
-        return gate, {
-            "s_proto_grad_guard_gate": gate,
-            "s_proto_grad_guard_cosine": float(
-                self._proto_grad_guard_cosine.detach().cpu()
-            ),
-            "s_proto_grad_guard_norm_ratio": float(
-                self._proto_grad_guard_norm_ratio.detach().cpu()
-            ),
-            "s_proto_grad_guard_checked": float(checked),
+        self._scales = {
+            "reward": config.reward_head["loss_scale"],
+            "end": config.end_head["loss_scale"],
+            "mineclip_reward": config.mineclip_head["loss_scale"],
         }
 
+        # Detached diagnostics: no trainable parameters, no loss contribution.
+        diag_cfg = getattr(config, "dreamer_diagnostics", {})
+        self.diagnostics = None
+        if bool(diag_cfg.get("enabled", False)):
+            self.diagnostics = dreamer_diagnostics.DreamerDiagnostics(
+                feat_dim=feat_size,
+                horizons=diag_cfg.get("horizons", [1, 2, 4, 8, 15]),
+                starts_per_sequence=diag_cfg.get("starts_per_sequence", 4),
+                projection_dim=diag_cfg.get("projection_dim", 512),
+                projection_seed=diag_cfg.get("projection_seed", 314159),
+                discount=config.discount,
+                task_probe=diag_cfg.get("task_probe", True),
+            )
+
     def _train(self, data_origin):
-        # 仅预处理基础序列数据
         data = self.preprocess(data_origin)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
-                # 编码图像特征
                 embed = self.encoder(data)
-
-                # --- 正常序列观察 (Observe Phase) ---
                 post, prior = self.dynamics.observe(
                     embed, data["action"], data["is_first"]
                 )
 
-                # --- [改进1] 正确时间对齐的S分支逆动力学分类损失 ---
-                # Replay中的action[t]是到达observation[t]的动作，因此
-                # (state[t-1], state[t])必须监督action[t]，即data[:, 1:]。
-                h_s_t = post["deter_s"][:, :-1]
-                h_s_next = post["deter_s"][:, 1:]
-                feat_inv_s = torch.cat([h_s_t, h_s_next], dim=-1)
-                pred_action_s = self.dynamics._inverse_dynamics(feat_inv_s)
-
-                true_action_onehot = data["action"][:, 1:]
-                true_action = torch.argmax(true_action_onehot, dim=-1)
-                valid_transition = 1.0 - data["is_first"][:, 1:].float()
-                valid_den = torch.clamp(valid_transition.sum(), min=1.0)
-
-                inv_per_step = F.cross_entropy(
-                    pred_action_s.reshape(-1, pred_action_s.shape[-1]),
-                    true_action.reshape(-1),
-                    reduction="none",
-                ).reshape_as(valid_transition)
-                loss_inv = (inv_per_step * valid_transition).sum() / valid_den
-                acc_action_s = (
-                    (pred_action_s.argmax(dim=-1) == true_action).float()
-                    * valid_transition
-                ).sum() / valid_den
-
-                # --- [改进2] 对抗抑制Z分支中的动作泄漏 ---
-                z_stoch = post["stoch_z"]
-                if self.dynamics._discrete:
-                    z_stoch = z_stoch.reshape(
-                        list(z_stoch.shape[:-2])
-                        + [self.dynamics._stoch_z * self.dynamics._discrete]
-                    )
-                feat_z = torch.cat([z_stoch, post["deter_z"]], dim=-1)
-                feat_inv_z = torch.cat([feat_z[:, :-1], feat_z[:, 1:]], dim=-1)
-                pred_action_z = self.z_action_adversary(
-                    gradient_reverse(feat_inv_z, self._z_action_grl_scale)
-                )
-                z_adv_per_step = F.cross_entropy(
-                    pred_action_z.reshape(-1, pred_action_z.shape[-1]),
-                    true_action.reshape(-1),
-                    reduction="none",
-                ).reshape_as(valid_transition)
-                loss_z_action_adv = (z_adv_per_step * valid_transition).sum() / valid_den
-                acc_action_z = (
-                    (pred_action_z.argmax(dim=-1) == true_action).float()
-                    * valid_transition
-                ).sum() / valid_den
-
-                # --- [改进3] Affordance仅作为S分支辅助监督，不进入encoder ---
-                s_stoch_dim = self.dynamics._stoch_s * (self.dynamics._discrete if self.dynamics._discrete else 1)
-                s_feat_dim = s_stoch_dim + self.dynamics._deter_s
-                
-                feat_all = self.dynamics.get_feat(post)
-                feat_s_only = torch.zeros_like(feat_all)
-                feat_s_only[..., :s_feat_dim] = feat_all[..., :s_feat_dim]
-                
-                preds_s = self.heads["decoder"](feat_s_only)
-                loss_affordance_s = -preds_s['heatmap'].log_prob(data['heatmap'])
-
-                # 3. 计算 KL 散度损失
-                kl_free = self._config.kl_free 
-                dyn_scale = self._config.dyn_scale 
-                rep_scale = self._config.rep_scale 
-
-                (
-                    kl_loss_img, kl_value_img, dyn_loss_img, rep_loss_img,
-                    kl_value_s, kl_value_z,
-                ) = self.dynamics.kl_loss(
+                kl_free = self._config.kl_free
+                dyn_scale = self._config.dyn_scale
+                rep_scale = self._config.rep_scale
+                kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
+                if kl_loss.shape != embed.shape[:2]:
+                    raise RuntimeError(
+                        f"KL shape {kl_loss.shape} does not match sequence shape "
+                        f"{embed.shape[:2]}"
+                    )
 
-                # 4. 计算各个预测头 (Heads) 的损失
+                feat = self.dynamics.get_feat(post)
                 preds = {}
                 for name, head in self.heads.items():
-                    grad_head = name in self._config.grad_heads
-                    feat = self.dynamics.get_feat(post)
-                    feat = feat if grad_head else feat.detach()
-                    pred = head(feat)
-                    
+                    head_input = feat if name in self._config.grad_heads else feat.detach()
+                    pred = head(head_input)
                     if isinstance(pred, dict):
                         preds.update(pred)
                     else:
                         preds[name] = pred
-                        
+
                 losses = {}
                 for name, pred in preds.items():
+                    if name not in data:
+                        raise KeyError(
+                            f"World-model head '{name}' has no target in replay data"
+                        )
                     loss = -pred.log_prob(data[name])
+                    if loss.shape != embed.shape[:2]:
+                        raise RuntimeError(
+                            f"Loss shape for {name}: {loss.shape}; expected "
+                            f"{embed.shape[:2]}"
+                        )
                     losses[name] = loss
-                    
-                scaled = {
-                    key: value * self._scales.get(key, 1.0)
-                    for key, value in losses.items()
+
+                scaled_losses = {
+                    name: loss * self._scales.get(name, 1.0)
+                    for name, loss in losses.items()
                 }
+                model_loss = sum(scaled_losses.values()) + kl_loss
+                mean_model_loss = torch.mean(model_loss)
 
-                # 5. S-only 5A: 从 replay posterior S 出发，用真实连续动作
-                #    open-loop rollout S prior，并对齐未来 posterior S。
-                s_multistep_metrics = {}
-                s_multistep_loss = loss_inv * 0.0
-                s_outcome_loss = loss_inv * 0.0
-                s_prototype_loss = loss_inv * 0.0
-                if self._s_multistep_enabled:
-                    (
-                        s_multistep_loss,
-                        s_outcome_loss,
-                        s_prototype_loss,
-                        s_multistep_metrics,
-                    ) = self._s_multistep(
-                        self.dynamics,
-                        post,
-                        data["action"],
-                        data["is_first"],
-                        rewards=data["reward"],
-                        # Generic task-evidence teachers. These are auxiliary-only
-                        # and are not consumed by the RGB observation encoder.
-                        task_scores=data.get("task_score", None),
-                        heatmaps=data.get("heatmap", None),
-                        intrinsic=data.get("intrinsic", None),
-                    )
+            metrics = self._model_opt(mean_model_loss, self.parameters())
 
-                # 6. 汇总总损失。Stable-V1.2只在Proto外再加一个很克制的
-                #    gradient guard；S-Aff / S5A / Outcome路径保持Stable-V1.1不变。
-                model_loss = sum(scaled.values()) + kl_loss_img
-                base_core_loss = (
-                    torch.mean(model_loss)
-                    + loss_inv * self._scales.get("inverse", 1.0)
-                    + loss_z_action_adv * self._scales.get("z_action_adv", 0.0)
-                    + torch.mean(loss_affordance_s)
-                    * self._scales.get("affordance_s", 1.0)
-                    + self._s_multistep_scale * s_multistep_loss
-                )
-                outcome_term = self._s_outcome_scale * s_outcome_loss
-                prototype_term = self._s_prototype_scale * s_prototype_loss
-
-            proto_grad_gate, proto_grad_metrics = self._proto_gradient_guard(
-                base_core_loss, prototype_term
-            )
-            total_loss = (
-                base_core_loss
-                + outcome_term
-                + proto_grad_gate * prototype_term
-            )
-
-            # 统一执行优化
-            metrics = self._model_opt(total_loss, self.parameters())
-
-        # 记录指标
-        metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
-        metrics["loss_inverse"] = to_np(loss_inv)
-        metrics["action_acc_s"] = to_np(acc_action_s)
-        metrics["loss_z_action_adv"] = to_np(loss_z_action_adv)
-        metrics["action_acc_z"] = to_np(acc_action_z)
-        metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
-        metrics.update({name: to_np(value) for name, value in s_multistep_metrics.items()})
-        metrics["s_multistep_scale"] = self._s_multistep_scale
-        metrics["s_outcome_scale"] = self._s_outcome_scale
-        metrics["s_outcome_weighted_loss"] = to_np(
-            self._s_outcome_scale * s_outcome_loss
+        metrics.update(
+            {
+                f"{name}_loss": to_np(torch.mean(loss))
+                for name, loss in losses.items()
+            }
         )
-        metrics["s_prototype_scale"] = self._s_prototype_scale
-        metrics.update(proto_grad_metrics)
-        proto_gate_metric = s_multistep_metrics.get("s_proto_reliability_gate", None)
-        if proto_gate_metric is not None:
-            reliability_gate_value = to_np(proto_gate_metric)
-            metrics["s_prototype_effective_scale"] = (
-                float(reliability_gate_value)
-                * self._s_prototype_scale
-                * float(proto_grad_gate)
-            )
-        else:
-            metrics["s_prototype_effective_scale"] = (
-                self._s_prototype_scale * float(proto_grad_gate)
-            )
-        metrics["s_prototype_weighted_loss"] = to_np(
-            float(proto_grad_gate) * self._s_prototype_scale * s_prototype_loss
-        )
+        metrics["kl_free"] = kl_free
+        metrics["dyn_scale"] = dyn_scale
+        metrics["rep_scale"] = rep_scale
+        metrics["dyn_loss"] = to_np(torch.mean(dyn_loss))
+        metrics["rep_loss"] = to_np(torch.mean(rep_loss))
+        metrics["kl"] = to_np(torch.mean(kl_value))
+        metrics["model_loss"] = to_np(mean_model_loss)
 
-        # Stable-V1.2 replay diagnostics. ``replay_success_source`` means the
-        # sequence was sampled through the small success-priority mixture; the
-        # two reward metrics show whether the sampled window itself contains
-        # real positive reward.
-        if "replay_success_source" in data:
-            metrics["replay_success_source_fraction"] = to_np(
-                torch.mean(data["replay_success_source"].float())
-            )
-        reward_flat = data["reward"].float()
-        metrics["replay_positive_step_fraction"] = to_np(
-            torch.mean((reward_flat > 1.0e-6).float())
-        )
-        if reward_flat.ndim >= 2:
-            per_seq = reward_flat.reshape(reward_flat.shape[0], -1)
-            metrics["replay_positive_sequence_fraction"] = to_np(
-                torch.mean((torch.max(per_seq, dim=1).values > 1.0e-6).float())
-            )
-        metrics["model_loss"] = to_np(total_loss)
-        metrics["kl"] = to_np(torch.mean(kl_value_img))
-        metrics["kl_s"] = to_np(torch.mean(kl_value_s))
-        metrics["kl_z"] = to_np(torch.mean(kl_value_z))
-        
         with torch.cuda.amp.autocast(self._use_amp):
-            s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
-            z_stats = {k[2:]:v for k,v in post.items() if k.startswith("z_")}
-            metrics["post_ent_s"] = to_np(torch.mean(self.dynamics.get_dist(s_stats).entropy()))
-            metrics["post_ent_z"] = to_np(torch.mean(self.dynamics.get_dist(z_stats).entropy()))
+            prior_ent = self.dynamics.get_dist(prior).entropy()
+            post_ent = self.dynamics.get_dist(post).entropy()
+            metrics["prior_ent"] = to_np(torch.mean(prior_ent))
+            metrics["post_ent"] = to_np(torch.mean(post_ent))
+            context = {
+                "embed": embed,
+                "feat": self.dynamics.get_feat(post),
+                "kl": kl_value,
+                "postent": post_ent,
+            }
 
-        post = {k: v.detach() for k, v in post.items()}
-        context = dict(embed=embed, feat=self.dynamics.get_feat(post), kl=kl_value_img)
-
+        post = {key: value.detach() for key, value in post.items()}
         return post, None, context, metrics
+
+    @torch.no_grad()
+    def diagnostic_metrics(self, data_origin, posterior):
+        """Run detached diagnostics without changing Dreamer training."""
+        if self.diagnostics is None:
+            return {}
+        return self.diagnostics(
+            self.dynamics, self.heads["reward"], posterior, data_origin
+        )
 
     def preprocess(self, obs):
         obs = obs.copy()
-        obs["image"] = torch.Tensor(obs["image"]) / 255.0
-        obs["heatmap"] = torch.Tensor(obs["heatmap"]).unsqueeze(-1) / 255.0
-        
+        obs["image"] = torch.as_tensor(obs["image"], dtype=torch.float32) / 255.0
 
         if "discount" in obs:
-            obs["discount"] *= self._config.discount
-            obs["discount"] = torch.Tensor(obs["discount"]).unsqueeze(-1)
-            
-        assert "is_first" in obs
-        assert "is_terminal" in obs
+            obs["discount"] = torch.as_tensor(
+                obs["discount"] * self._config.discount,
+                dtype=torch.float32,
+            ).unsqueeze(-1)
 
-        obs["end"] = torch.Tensor(obs["is_terminal"]).unsqueeze(-1)
-        
-        # 兼容性处理：防止 wrapper 端漏传内在奖励
-        if "intrinsic" not in obs:
-            obs["intrinsic"] = np.zeros_like(obs["reward"], dtype=np.float32)
+        if "is_first" not in obs or "is_terminal" not in obs:
+            raise KeyError("Replay observations require is_first and is_terminal")
 
-        obs = {k: torch.Tensor(v).to(self._config.device) for k, v in obs.items()}
-        return obs
+        obs["end"] = torch.as_tensor(
+            obs["is_terminal"], dtype=torch.float32
+        ).unsqueeze(-1)
+
+        if "mineclip_reward" not in obs:
+            obs["mineclip_reward"] = np.zeros_like(
+                obs["reward"], dtype=np.float32
+            )
+
+        return {
+            key: value.to(self._config.device)
+            if torch.is_tensor(value)
+            else torch.as_tensor(
+                value, dtype=torch.float32, device=self._config.device
+            )
+            for key, value in obs.items()
+        }
 
     def video_pred(self, data):
         data = self.preprocess(data)
         embed = self.encoder(data)
-
         states, _ = self.dynamics.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
-    
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[:6]
+        recon = self.heads["decoder"](
+            self.dynamics.get_feat(states)
+        )["image"].mode()[:6]
 
-        init = {k: v[:, -1] for k, v in states.items()}
+        init = {key: value[:, -1] for key, value in states.items()}
         prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
-        
-        model = torch.cat([recon[:, :5], openl], 1)
+        open_loop = self.heads["decoder"](
+            self.dynamics.get_feat(prior)
+        )["image"].mode()
+
+        model = torch.cat([recon[:, :5], open_loop], 1)
         truth = data["image"][:6]
         error = (model - truth + 1.0) / 2.0
-
         return torch.cat([truth, model, error], 2)
 
 
@@ -816,7 +335,7 @@ class ImagBehavior(nn.Module):
             self,
             start,
             objective,
-            intrinsic_objective,
+            mineclip_objective,
             is_end,
         ):
         self._update_slow_target()
@@ -824,20 +343,19 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                # 展平初始状态
+                # Flatten posterior states from replay into imagination starts.
                 flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
                 start = {k: flatten(v) for k, v in start.items()} 
 
-                # 标准 15 步连续想象 (替换掉原先极其复杂的跳跃 for 循环)
+                # Standard one-step RSSM rollout repeated for the configured horizon
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
 
-                # 奖励计算与策略更新
+                # Predict rewards along imagined trajectories.
                 reward = objective(imag_feat, imag_state, imag_action)
-                intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
-                intrinsic_scale = getattr(self._config, "intrinsic_reward_scale", 1.0)
-                reward = reward + intrinsic_scale * intrinsic_reward
+                mineclip_reward = mineclip_objective(imag_feat, imag_state, imag_action)
+                reward = reward + self._config.mineclip_reward_scale * mineclip_reward
 
                 actor_ent = self.actor(imag_feat).entropy() 
 
@@ -854,7 +372,7 @@ class ImagBehavior(nn.Module):
                 metrics.update(mets)
                 value_input = imag_feat
 
-        # Value 网络更新
+        # Critic update.
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
                 value = self.value(value_input[:-1].detach())
@@ -897,7 +415,7 @@ class ImagBehavior(nn.Module):
         value = self.value(imag_feat).mode()
         discount = gamma * (1.0 - end)
         
-        # 恢复使用最标准的 lambda_return
+        # Standard lambda-return
         target = tools.lambda_return(
             reward[1:],
             value[:-1],

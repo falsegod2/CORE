@@ -1,5 +1,4 @@
 # MineDojo Installation Steps and Troubleshooting
-**If you find this documentation useful, please star ⭐  [LS-Imagine repo](https://github.com/qiwang067/LS-Imagine).**
 
 ## MineDojo Installation Steps
 

@@ -10,12 +10,22 @@ from datetime import datetime
 import tools
 from parallel import Parallel, Damy
 
-from expr import LS_Imagine, make_env, make_dataset
+from expr import DreamerV3Agent, make_env, make_dataset
 
 os.environ["MUJOCO_GL"] = "osmesa"
 sys.path.append(str(pathlib.Path(__file__).parent))
 
 to_np = lambda x: x.detach().cpu().numpy()
+
+
+def load_yaml_config(path):
+    """Load YAML with both ruamel.yaml 0.17 and 0.18+ APIs."""
+    text = pathlib.Path(path).read_text()
+    try:
+        return yaml.safe_load(text)
+    except AttributeError:
+        loader = yaml.YAML(typ="safe", pure=True)
+        return loader.load(text)
 
 def main(config):
 
@@ -47,19 +57,20 @@ def main(config):
     make = lambda mode, id: make_env(config, mode, id)
     suite, task = config.task.split("_", 1)
 
-    from envs.tasks import get_specs
+    if suite == "minedojo":
+        from envs.tasks import get_specs
 
-    kwargs=dict(
-            # log_dir=log_dir,
-            target_item=config.target_item
+        kwargs = dict(target_item=config.target_item)
+        _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
+        config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
+    elif suite == "vizdoom":
+        import envs.vizdoom as vizdoom
+
+        config.episode_max_steps = vizdoom.episode_max_steps(
+            task, getattr(config, "vizdoom_frame_skip", 4)
         )
-    task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
-
-    config.episode_max_steps = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
-    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
-    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
+    else:
+        raise NotImplementedError(suite)
 
     eval_envs = [make("eval", i) for i in range(config.envs)]
     if config.parallel:
@@ -75,7 +86,7 @@ def main(config):
 
     print("Start evaluation.")
     eval_dataset = make_dataset(eval_eps, config)
-    agent = LS_Imagine(
+    agent = DreamerV3Agent(
         eval_envs[0].observation_space,
         eval_envs[0].action_space,
         config,
@@ -127,8 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
 
-    configs = yaml.safe_load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
+    configs = load_yaml_config(
+        pathlib.Path(sys.argv[0]).parent / "configs.yaml"
     )
 
     def recursive_update(base, update):

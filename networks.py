@@ -10,294 +10,262 @@ from torch import distributions as torchd
 import tools
 
 
-import torch
-from torch import nn
-from torch import distributions as torchd
-import tools
-import numpy as np
-
 class RSSM(nn.Module):
+    """Standard single-stream DreamerV3 recurrent state-space model.
+
+    State dictionary:
+      - deter: deterministic recurrent state h_t
+      - stoch: stochastic categorical/continuous state z_t
+      - logit, or mean/std: distribution parameters
+    """
+
     def __init__(
-        self, stoch=30, deter=200, hidden=200, rec_depth=1, discrete=False,
-        act="SiLU", norm=True, mean_act="none", std_act="softplus", min_std=0.1,
-        unimix_ratio=0.01, initial="learned", num_actions=None, embed=None, device=None,
+        self,
+        stoch=30,
+        deter=200,
+        hidden=200,
+        rec_depth=1,
+        discrete=False,
+        act="SiLU",
+        norm=True,
+        mean_act="none",
+        std_act="softplus",
+        min_std=0.1,
+        unimix_ratio=0.01,
+        initial="learned",
+        num_actions=None,
+        embed=None,
+        device=None,
     ):
-        super(RSSM, self).__init__()
-        # 1. 维度拆分：s(受控), z(非受控)
-        self._stoch_s = stoch // 2
-        self._stoch_z = stoch - self._stoch_s
-        self._deter_s = deter // 2
-        self._deter_z = deter - self._deter_s
-        
-        self._stoch, self._deter = stoch, deter
-        self._hidden, self._min_std = hidden, min_std
-        self._rec_depth, self._discrete = rec_depth, discrete
-        act_fn = getattr(torch.nn, act)
-        self._mean_act, self._std_act = mean_act, std_act
-        self._unimix_ratio, self._initial = unimix_ratio, initial
+        super().__init__()
+        if num_actions is None or embed is None or device is None:
+            raise ValueError("num_actions, embed, and device must be provided")
+
+        self._stoch = stoch
+        self._deter = deter
+        self._hidden = hidden
+        self._min_std = min_std
+        self._rec_depth = rec_depth
+        self._discrete = discrete
+        self._mean_act = mean_act
+        self._std_act = std_act
+        self._unimix_ratio = unimix_ratio
+        self._initial = initial
         self._num_actions = num_actions
-        self._embed, self._device = embed, device
+        self._embed = embed
+        self._device = device
+        act_fn = getattr(torch.nn, act)
 
-        # 2. 受控分支网络 (输入包含动作)
-        stoch_size_s = self._stoch_s * (self._discrete if self._discrete else 1)
-        self._img_in_s = self._make_layer(stoch_size_s + self._num_actions, norm, act_fn)
-        self._cell_s = GRUCell(self._hidden, self._deter_s, norm=norm)
-        self._img_out_s = self._make_layer(self._deter_s, norm, act_fn)
-        self._obs_out_s = self._make_layer(self._deter_s + self._embed, norm, act_fn)
-
-        # 3. 非受控分支网络 (动作无关)
-        stoch_size_z = self._stoch_z * (self._discrete if self._discrete else 1)
-        self._img_in_z = self._make_layer(stoch_size_z, norm, act_fn)
-        self._cell_z = GRUCell(self._hidden, self._deter_z, norm=norm)
-        self._img_out_z = self._make_layer(self._deter_z, norm, act_fn)
-        self._obs_out_z = self._make_layer(self._deter_z + self._embed, norm, act_fn)
-
-        # 4. 映射层与逆动力学
-        self._stat_s_img = self._make_stat_layer(self._stoch_s)
-        self._stat_s_obs = self._make_stat_layer(self._stoch_s)
-        self._stat_z_img = self._make_stat_layer(self._stoch_z)
-        self._stat_z_obs = self._make_stat_layer(self._stoch_z)
-        self._inverse_dynamics = nn.Sequential(
-            nn.Linear(self._deter_s * 2, self._hidden), act_fn(),
-            nn.Linear(self._hidden, num_actions)
+        stoch_size = self._stoch * self._discrete if self._discrete else self._stoch
+        self._img_in_layers = nn.Sequential(
+            nn.Linear(stoch_size + self._num_actions, self._hidden, bias=False),
+            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
+            act_fn(),
         )
+        self._img_in_layers.apply(tools.weight_init)
+
+        self._cell = GRUCell(self._hidden, self._deter, norm=norm)
+        self._cell.apply(tools.weight_init)
+
+        self._img_out_layers = nn.Sequential(
+            nn.Linear(self._deter, self._hidden, bias=False),
+            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
+            act_fn(),
+        )
+        self._img_out_layers.apply(tools.weight_init)
+
+        self._obs_out_layers = nn.Sequential(
+            nn.Linear(self._deter + self._embed, self._hidden, bias=False),
+            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
+            act_fn(),
+        )
+        self._obs_out_layers.apply(tools.weight_init)
+
+        stat_size = self._stoch * self._discrete if self._discrete else 2 * self._stoch
+        self._imgs_stat_layer = nn.Linear(self._hidden, stat_size)
+        self._obs_stat_layer = nn.Linear(self._hidden, stat_size)
+        self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
 
         if self._initial == "learned":
-            self.W = torch.nn.Parameter(torch.zeros((1, self._deter), device=torch.device(self._device)), requires_grad=True)
-        
-    def _make_layer(self, inp_dim, norm, act_fn):
-        layers = [nn.Linear(inp_dim, self._hidden, bias=False)]
-        if norm: layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
-        layers.append(act_fn()); net = nn.Sequential(*layers)
-        net.apply(tools.weight_init); return net
-
-    def _make_stat_layer(self, dim):
-        l = nn.Linear(self._hidden, dim * (self._discrete if self._discrete else 2))
-        l.apply(tools.uniform_weight_init(1.0)); return l
+            self.W = nn.Parameter(
+                torch.zeros((1, self._deter), device=torch.device(self._device))
+            )
 
     def initial(self, batch_size):
-        # 1. 初始化确定性状态 (deter)
-        deter_s = torch.zeros(batch_size, self._deter_s).to(self._device)
-        deter_z = torch.zeros(batch_size, self._deter_z).to(self._device)
-        
+        deter = torch.zeros(batch_size, self._deter, device=self._device)
+        if self._discrete:
+            state = {
+                "logit": torch.zeros(
+                    batch_size, self._stoch, self._discrete, device=self._device
+                ),
+                "stoch": torch.zeros(
+                    batch_size, self._stoch, self._discrete, device=self._device
+                ),
+                "deter": deter,
+            }
+        else:
+            state = {
+                "mean": torch.zeros(batch_size, self._stoch, device=self._device),
+                "std": torch.zeros(batch_size, self._stoch, device=self._device),
+                "stoch": torch.zeros(batch_size, self._stoch, device=self._device),
+                "deter": deter,
+            }
+
+        if self._initial == "zeros":
+            return state
         if self._initial == "learned":
-            W_s, W_z = torch.split(torch.tanh(self.W), [self._deter_s, self._deter_z], -1)
-            deter_s = W_s.repeat(batch_size, 1)
-            deter_z = W_z.repeat(batch_size, 1)
+            state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
+            state["stoch"] = self.get_stoch(state["deter"])
+            stats = self._suff_stats_layer("ims", self._img_out_layers(state["deter"]))
+            state.update(stats)
+            return state
+        raise NotImplementedError(self._initial)
 
-        # 2. 构造初始状态字典
-        state = {"deter_s": deter_s, "deter_z": deter_z}
-        
-        # --- 修复点：获取受控分支(s)的初始随机状态及分布参数 ---
-        stoch_s, stats_s = self._get_stoch_and_stats_init(deter_s, "s")
-        state["stoch_s"] = stoch_s
-        state.update({f"s_{k}": v for k, v in stats_s.items()}) # 添加 s_logit 或 s_mean/std
-        
-        # --- 修复点：获取非受控分支(z)的初始随机状态及分布参数 ---
-        stoch_z, stats_z = self._get_stoch_and_stats_init(deter_z, "z")
-        state["stoch_z"] = stoch_z
-        state.update({f"z_{k}": v for k, v in stats_z.items()}) # 添加 z_logit 或 z_mean/std
-        
-        return state
-
-    # --- 辅助函数：统一获取初始随机态和参数 ---
-    def _get_stoch_and_stats_init(self, deter, branch):
-        net = self._img_out_s if branch == "s" else self._img_out_z
-        stat_layer = self._stat_s_img if branch == "s" else self._stat_z_img
-        stoch_dim = self._stoch_s if branch == "s" else self._stoch_z
-        
-        x = net(deter)
-        stats = self._suff_stats_layer(stat_layer, x, stoch_dim)
-        stoch = self.get_dist(stats).mode()
-        return stoch, stats
-
-    # --- 必须保留的核心接口：处理正常序列 ---
     def observe(self, embed, action, is_first, state=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
         post, prior = tools.static_scan(
-            lambda prev_state, prev_act, embed, is_first: self.obs_step(prev_state[0], prev_act, embed, is_first),
-            (action, embed, is_first), (state, state),
+            lambda prev, prev_action, current_embed, first: self.obs_step(
+                prev[0], prev_action, current_embed, first
+            ),
+            (action, embed, is_first),
+            (state, state),
         )
-        return {k: swap(v) for k, v in post.items()}, {k: swap(v) for k, v in prior.items()}
-
-    # --- 必须保留的核心接口：处理缩放跳跃序列 ---
-    def observe_zoomed(self, embed_z, action_z, is_f_z, rely_post, rely_prior):
-        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-        embed_z, action_z, is_f_z = swap(embed_z), swap(action_z), swap(is_f_z)
-        rely_p = {k: swap(v) for k, v in rely_post.items()}
-        rely_pr = {k: swap(v) for k, v in rely_prior.items()}
-        # 注意：这里调用的是重构后的 obs_step，它会自动处理解耦状态
-        post_z, prior_z = tools.static_scan_zoomed(
-            lambda r_s, p_a, e_z, i_f_z: self.obs_step(r_s, p_a, e_z, i_f_z),
-            (action_z, embed_z, is_f_z), (rely_p, rely_pr),
+        return (
+            {key: swap(value) for key, value in post.items()},
+            {key: swap(value) for key, value in prior.items()},
         )
-        return {k: swap(v) for k, v in post_z.items()}, {k: swap(v) for k, v in prior_z.items()}
 
-    # --- 必须保留的核心接口：闭眼想象 ---
     def imagine_with_action(self, action, state):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
         action = swap(action)
         prior = tools.static_scan(self.img_step, [action], state)[0]
-        return {k: swap(v) for k, v in prior.items()}
-
-    def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        if prev_state == None or torch.sum(is_first) == len(is_first):
-            prev_state = self.initial(len(is_first))
-            prev_action = torch.zeros((len(is_first), self._num_actions)).to(self._device)
-        elif torch.sum(is_first) > 0:
-            is_first = is_first[:, None]
-            prev_action *= 1.0 - is_first
-            init_s = self.initial(len(is_first))
-            for k, v in prev_state.items():
-                is_f_r = torch.reshape(is_first, is_first.shape + (1,) * (len(v.shape) - len(is_first.shape)))
-                prev_state[k] = v * (1.0 - is_f_r) + init_s[k] * is_f_r
-
-
-
-        prior = self.img_step(prev_state, prev_action)
-        # 受控后验
-        stats_s = self._suff_stats_layer(self._stat_s_obs, self._obs_out_s(torch.cat([prior["deter_s"], embed], -1)), self._stoch_s)
-        stoch_s = self.get_dist(stats_s).sample() if sample else self.get_dist(stats_s).mode()
-        # 非受控后验
-        stats_z = self._suff_stats_layer(self._stat_z_obs, self._obs_out_z(torch.cat([prior["deter_z"], embed], -1)), self._stoch_z)
-        stoch_z = self.get_dist(stats_z).sample() if sample else self.get_dist(stats_z).mode()
-
-        post = {"stoch_s": stoch_s, "deter_s": prior["deter_s"], "stoch_z": stoch_z, "deter_z": prior["deter_z"]}
-        # 合并分布参数以便后续计算 KL (添加前缀防止冲突)
-        post.update({f"s_{k}": v for k, v in stats_s.items()})
-        post.update({f"z_{k}": v for k, v in stats_z.items()})
-        return post, prior
-
-    def img_step_s(self, prev_state, prev_action, sample=True):
-        """Advance ONLY the controllable S branch by one prior step.
-
-        This reuses exactly the same S transition modules as ``img_step`` but
-        does not evaluate or sample Z. It is used by the S-only 5A objective so
-        that the auxiliary loss has no computational or gradient path through Z.
-
-        Expected keys in ``prev_state``: ``stoch_s`` and ``deter_s``.
-        Returned keys: ``stoch_s``, ``deter_s`` and S distribution statistics
-        (e.g. ``s_logit`` for the discrete RSSM).
-        """
-        prev_s = prev_state["stoch_s"]
-        if self._discrete:
-            s_dim = self._stoch_s * self._discrete
-            if prev_s.numel() > 0:
-                prev_s = prev_s.reshape(list(prev_s.shape[:-2]) + [s_dim])
-
-        x_s = torch.cat([prev_s, prev_action], -1)
-        x_s, deter_s = self._cell_s(
-            self._img_in_s(x_s), [prev_state["deter_s"]]
-        )
-        stats_s = self._suff_stats_layer(
-            self._stat_s_img, self._img_out_s(x_s), self._stoch_s
-        )
-        stoch_s = (
-            self.get_dist(stats_s).sample()
-            if sample else self.get_dist(stats_s).mode()
-        )
-        prior_s = {"stoch_s": stoch_s, "deter_s": deter_s[0]}
-        prior_s.update({f"s_{k}": v for k, v in stats_s.items()})
-        return prior_s
-
-    def img_step(self, prev_state, prev_action, sample=True):
-        # --- 受控分支演化 (s) ---
-        prev_s = prev_state["stoch_s"]
-        if self._discrete:
-            # 修复点：显式指定维度
-            s_dim = self._stoch_s * self._discrete
-            if prev_s.numel() > 0:
-                prev_s = prev_s.reshape(list(prev_s.shape[:-2]) + [s_dim])
-        
-        # 确保 prev_action 与 prev_s 形状对齐（处理空 Batch 情况）
-        x_s = torch.cat([prev_s, prev_action], -1)
-        x_s, deter_s = self._cell_s(self._img_in_s(x_s), [prev_state["deter_s"]])
-        stats_s = self._suff_stats_layer(self._stat_s_img, self._img_out_s(x_s), self._stoch_s)
-        stoch_s = self.get_dist(stats_s).sample() if sample else self.get_dist(stats_s).mode()
-
-        # --- 非受控分支演化 (z) ---
-        prev_z = prev_state["stoch_z"]
-        if self._discrete:
-            z_dim = self._stoch_z * self._discrete
-            if prev_z.numel() > 0:
-                prev_z = prev_z.reshape(list(prev_z.shape[:-2]) + [z_dim])
-            
-        x_z, deter_z = self._cell_z(self._img_in_z(prev_z), [prev_state["deter_z"]])
-        stats_z = self._suff_stats_layer(self._stat_z_img, self._img_out_z(x_z), self._stoch_z)
-        stoch_z = self.get_dist(stats_z).sample() if sample else self.get_dist(stats_z).mode()
-
-        prior = {"stoch_s": stoch_s, "deter_s": deter_s[0], "stoch_z": stoch_z, "deter_z": deter_z[0]}
-        prior.update({f"s_{k}": v for k, v in stats_s.items()})
-        prior.update({f"z_{k}": v for k, v in stats_z.items()})
-        return prior
-
-    def _suff_stats_layer(self, layer, x, dim):
-        x = layer(x)
-        if self._discrete: return {"logit": x.reshape(list(x.shape[:-1]) + [dim, self._discrete])}
-        mean, std = torch.split(x, [dim] * 2, -1)
-        mean = {"none": lambda: mean, "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0)}[self._mean_act]()
-        std = {"softplus": lambda: torch.softplus(std), "abs": lambda: torch.abs(std + 1)}[self._std_act]()
-        return {"mean": mean, "std": std + self._min_std}
-
-    def get_dist(self, stats):
-        if self._discrete:
-            return torchd.independent.Independent(tools.OneHotDist(stats["logit"], unimix_ratio=self._unimix_ratio), 1)
-        return tools.ContDist(torchd.independent.Independent(torchd.normal.Normal(stats["mean"], stats["std"]), 1))
+        return {key: swap(value) for key, value in prior.items()}
 
     def get_feat(self, state):
-        s_stoch = state.get("stoch_s", torch.tensor([]).to(self._device))
-        z_stoch = state.get("stoch_z", torch.tensor([]).to(self._device))
-        deter_s = state.get("deter_s", torch.tensor([]).to(self._device))
-        deter_z = state.get("deter_z", torch.tensor([]).to(self._device))
+        stoch = state["stoch"]
+        if self._discrete:
+            stoch = stoch.reshape(
+                list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+            )
+        return torch.cat([stoch, state["deter"]], -1)
+
+    def get_dist(self, state, dtype=None):
+        del dtype
+        if self._discrete:
+            return torchd.independent.Independent(
+                tools.OneHotDist(
+                    state["logit"], unimix_ratio=self._unimix_ratio
+                ),
+                1,
+            )
+        return tools.ContDist(
+            torchd.independent.Independent(
+                torchd.normal.Normal(state["mean"], state["std"]), 1
+            )
+        )
+
+    def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+        batch_size = len(is_first)
+        if prev_state is None or torch.sum(is_first) == batch_size:
+            prev_state = self.initial(batch_size)
+            prev_action = torch.zeros(
+                batch_size, self._num_actions, device=self._device
+            )
+        elif torch.sum(is_first) > 0:
+            first = is_first[:, None]
+            prev_action = prev_action * (1.0 - first)
+            initial = self.initial(batch_size)
+            prev_state = dict(prev_state)
+            for key, value in prev_state.items():
+                first_r = torch.reshape(
+                    first,
+                    first.shape + (1,) * (len(value.shape) - len(first.shape)),
+                )
+                prev_state[key] = value * (1.0 - first_r) + initial[key] * first_r
+
+        prior = self.img_step(prev_state, prev_action, sample=sample)
+        x = self._obs_out_layers(torch.cat([prior["deter"], embed], -1))
+        stats = self._suff_stats_layer("obs", x)
+        dist = self.get_dist(stats)
+        stoch = dist.sample() if sample else dist.mode()
+        post = {"stoch": stoch, "deter": prior["deter"], **stats}
+        return post, prior
+
+    def img_step(self, prev_state, prev_action, sample=True):
+        prev_stoch = prev_state["stoch"]
+        if self._discrete:
+            prev_stoch = prev_stoch.reshape(
+                list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+            )
+        x = self._img_in_layers(torch.cat([prev_stoch, prev_action], -1))
+        deter = prev_state["deter"]
+        for _ in range(self._rec_depth):
+            x, deter_state = self._cell(x, [deter])
+            deter = deter_state[0]
+        x = self._img_out_layers(x)
+        stats = self._suff_stats_layer("ims", x)
+        dist = self.get_dist(stats)
+        stoch = dist.sample() if sample else dist.mode()
+        return {"stoch": stoch, "deter": deter, **stats}
+
+    def get_stoch(self, deter):
+        x = self._img_out_layers(deter)
+        stats = self._suff_stats_layer("ims", x)
+        return self.get_dist(stats).mode()
+
+    def _suff_stats_layer(self, name, x):
+        if name == "ims":
+            x = self._imgs_stat_layer(x)
+        elif name == "obs":
+            x = self._obs_stat_layer(x)
+        else:
+            raise NotImplementedError(name)
 
         if self._discrete:
-            s_dim = self._stoch_s * self._discrete
-            z_dim = self._stoch_z * self._discrete
-            if s_stoch.numel() > 0:
-                s_stoch = s_stoch.reshape(list(s_stoch.shape[:-2]) + [s_dim])
-            if z_stoch.numel() > 0:
-                z_stoch = z_stoch.reshape(list(z_stoch.shape[:-2]) + [z_dim])
-        
-        # 确认顺序：s_stoch -> deter_s -> z_stoch -> deter_z
-        # 这保证了前 (s_stoch + deter_s) 位全是受控信息
-        return torch.cat([s_stoch, deter_s, z_stoch, deter_z], -1)
+            return {
+                "logit": x.reshape(
+                    list(x.shape[:-1]) + [self._stoch, self._discrete]
+                )
+            }
+
+        mean, std = torch.split(x, [self._stoch] * 2, -1)
+        mean = {
+            "none": lambda: mean,
+            "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
+        }[self._mean_act]()
+        std = {
+            "softplus": lambda: F.softplus(std),
+            "abs": lambda: torch.abs(std + 1.0),
+            "sigmoid": lambda: torch.sigmoid(std),
+            "sigmoid2": lambda: 2.0 * torch.sigmoid(std / 2.0),
+        }[self._std_act]()
+        return {"mean": mean, "std": std + self._min_std}
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
-        # 适配双分支的 KL 损失计算
-        def get_branch_dist(state, prefix):
-            # 从合并后的 state 字典中提取对应分支的参数
-            branch_stats = {k[2:]: v for k, v in state.items() if k.startswith(f"{prefix}_")}
-            return self.get_dist(branch_stats)
-
         kld = torchd.kl.kl_divergence
-        sg = lambda x: {k: v.detach() for k, v in x.items()}
+        stop_gradient = lambda state: {
+            key: value.detach() for key, value in state.items()
+        }
 
-        # 受控分支与非受控分支分别计算 KL
-        kl_s = kld(get_branch_dist(post, "s"), get_branch_dist(sg(prior), "s"))
-        kl_z = kld(get_branch_dist(post, "z"), get_branch_dist(sg(prior), "z"))
-        
-        # 对两个分支分别应用free-bits，避免一个分支承担全部KL而另一个塌缩。
-        # 每个分支使用总free-bits的一半，保持与原总预算大致一致。
-        branch_free = free / 2.0
-        rep_loss_s = torch.clip(kl_s, min=branch_free)
-        rep_loss_z = torch.clip(kl_z, min=branch_free)
-        rep_loss = rep_loss_s + rep_loss_z
+        post_dist = self.get_dist(post)
+        prior_sg_dist = self.get_dist(stop_gradient(prior))
+        post_sg_dist = self.get_dist(stop_gradient(post))
+        prior_dist = self.get_dist(prior)
 
-        dyn_kl_s = kld(get_branch_dist(sg(post), "s"), get_branch_dist(prior, "s"))
-        dyn_kl_z = kld(get_branch_dist(sg(post), "z"), get_branch_dist(prior, "z"))
-        dyn_loss_s = torch.clip(dyn_kl_s, min=branch_free)
-        dyn_loss_z = torch.clip(dyn_kl_z, min=branch_free)
-        dyn_loss = dyn_loss_s + dyn_loss_z
+        if self._discrete:
+            rep_loss = value = kld(post_dist, prior_sg_dist)
+            dyn_loss = kld(post_sg_dist, prior_dist)
+        else:
+            rep_loss = value = kld(post_dist._dist, prior_sg_dist._dist)
+            dyn_loss = kld(post_sg_dist._dist, prior_dist._dist)
 
-        return (
-            dyn_scale * dyn_loss + rep_scale * rep_loss,
-            kl_s + kl_z,
-            dyn_loss,
-            rep_loss,
-            kl_s,
-            kl_z,
-        )
+        rep_loss = torch.clip(rep_loss, min=free)
+        dyn_loss = torch.clip(dyn_loss, min=free)
+        loss = dyn_scale * dyn_loss + rep_scale * rep_loss
+        return loss, value, dyn_loss, rep_loss
+
 
 class MultiEncoder(nn.Module):
     def __init__(

@@ -6,7 +6,6 @@ import pathlib
 import time
 import random
 import wandb
-import copy
 import numpy as np
 import torch
 
@@ -14,44 +13,9 @@ from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
-from collections import defaultdict
-from bisect import insort
-
-from stable_v1_2_utils import episode_has_positive_reward
 
 
 to_np = lambda x: x.detach().cpu().numpy()
-
-class ScoreStorage:
-    def __init__(self, max_steps=1000):
-        self.data = defaultdict(list)
-        self.max_steps = max_steps
-    
-    def add(self, env_id, step, score_on_zoomed):
-        insort(self.data[env_id], (score_on_zoomed, step))
-    
-    def get_and_remove_less_than(self, env_id, current_step, score):
-        if env_id not in self.data:
-            return []
-        
-        removable_indices = []
-        steps = []
-        for i, (score_on_zoomed, step) in enumerate(self.data[env_id]):
-            if score_on_zoomed < score or (current_step - step >= self.max_steps):
-                removable_indices.append(i)
-                steps.append(step)
-        
-        for index in reversed(removable_indices):
-            del self.data[env_id][index]
-        
-        return steps
-    
-    def remove_all(self, env_id):
-        if env_id in self.data:
-            del self.data[env_id]
-    
-    def count_data_pairs(self, env_id):
-        return len(self.data[env_id])
 
 
 def symlog(x):
@@ -96,8 +60,6 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
-        self._compact_health_log = bool(getattr(config, "compact_health_log", False))
-        self._print_all_scalars = bool(getattr(config, "print_all_scalars", True))
         self.step = step
 
         if self._wandb:
@@ -125,16 +87,7 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
-        scalar_dict = dict(scalars)
-        if self._print_all_scalars:
-            print(
-                f"[{step}]",
-                " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars),
-            )
-        elif self._compact_health_log:
-            self._print_compact_summary(step, scalar_dict)
-        elif scalars:
-            print(f"[{step}]", " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars))
+        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
 
@@ -178,89 +131,6 @@ class Logger:
             self._images = {}
             self._videos = {}
 
-    @staticmethod
-    def _format_scalar(value):
-        value = float(value)
-        av = abs(value)
-        if av == 0.0:
-            return "0"
-        if av >= 1000.0:
-            return f"{value:.1f}"
-        if av >= 10.0:
-            return f"{value:.2f}"
-        if av >= 1.0:
-            return f"{value:.3f}"
-        if av >= 1.0e-3:
-            return f"{value:.4f}"
-        return f"{value:.2e}"
-
-    def _print_compact_summary(self, step, d):
-        if not d:
-            return
-        f = self._format_scalar
-        if "eval_success" in d:
-            print(
-                f"[EVAL {step}] success={f(d.get('eval_success', 0.0))} "
-                f"return={f(d.get('eval_return', 0.0))} "
-                f"length={f(d.get('eval_length', 0.0))} "
-                f"first_success={f(d.get('eval_first_success_step', 0.0))}"
-            )
-            return
-        if "train_success" in d and "model_loss" not in d:
-            print(
-                f"[EP {step}] success={f(d.get('train_success', 0.0))} "
-                f"return={f(d.get('train_return', 0.0))} "
-                f"length={f(d.get('train_length', 0.0))} "
-                f"episodes={f(d.get('train_episodes', 0.0))}"
-            )
-            return
-
-        if "model_loss" in d:
-            print(
-                f"[TRAIN {step}] model={f(d.get('model_loss', 0.0))} "
-                f"image={f(d.get('image_loss', 0.0))} "
-                f"heat={f(d.get('heatmap_loss', 0.0))} "
-                f"S-Aff={f(d.get('loss_affordance_s', 0.0))} "
-                f"fps={f(d.get('fps', 0.0))}"
-            )
-            print(
-                "[HEALTH] "
-                f"S5A(cos/margin/gap)="
-                f"{f(d.get('health/s5a_cos15', 0.0))}/"
-                f"{f(d.get('health/cf_margin15', 0.0))}/"
-                f"{f(d.get('health/response_gap15', 0.0))} | "
-                f"Proto(acc/known/gate/succReady)="
-                f"{f(d.get('health/proto_acc15', 0.0))}/"
-                f"{f(d.get('health/proto_known', 0.0))}/"
-                f"{f(d.get('health/proto_gate', 1.0))}/"
-                f"{f(d.get('health/proto_success_ready', 0.0))} | "
-                f"Rel(batch/ema/effScale)="
-                f"{f(d.get('health/proto_reliability_batch', 0.0))}/"
-                f"{f(d.get('health/proto_reliability_ema', 0.0))}/"
-                f"{f(d.get('health/proto_effective_scale', 0.0))} | "
-                f"Guard(cos/norm/gate)="
-                f"{f(d.get('health/proto_grad_cos', 1.0))}/"
-                f"{f(d.get('health/proto_grad_norm_ratio', 0.0))}/"
-                f"{f(d.get('health/proto_grad_gate', 1.0))} | "
-                f"Replay(pri/posSeq)="
-                f"{f(d.get('health/replay_success_source', 0.0))}/"
-                f"{f(d.get('health/replay_positive_sequence', 0.0))} | "
-                f"Outcome(gate/posEMA/corr)="
-                f"{f(d.get('health/outcome_gate', 0.0))}/"
-                f"{f(d.get('health/outcome_positive_ema', 0.0))}/"
-                f"{f(d.get('health/outcome_corr15', 0.0))} | "
-                f"Policy(Rstd/Vstd/Agrad)="
-                f"{f(d.get('health/imag_reward_std', 0.0))}/"
-                f"{f(d.get('health/value_std', 0.0))}/"
-                f"{f(d.get('health/actor_grad_norm', 0.0))} | "
-                f"ALERT={int(d.get('health/policy_collapse_alert', 0.0) >= 0.5)}"
-            )
-            return
-
-        # Fallback for rare logger writes that do not match train/eval schemas.
-        short = list(d.items())[:8]
-        print(f"[{step}]", " / ".join(f"{k} {f(v)}" for k, v in short))
-
     def _compute_fps(self, step):
         if self._last_step is None:
             self._last_time = time.time()
@@ -292,19 +162,6 @@ class Logger:
         if self._wandb:
             wandb.finish()
 
-def calculate_accumulated_reward(rewards, intrinsics, gamma):
-    if len(rewards) == 0:
-        return 0
-    
-    rewards = np.array(rewards)
-    intrinsics = np.array(intrinsics)
-    gammas = np.power(gamma, np.arange(len(rewards)))
-    discounted_rewards = rewards * gammas
-    discounted_intrinsics = intrinsics * gammas
-    total_reward = np.sum(discounted_rewards + discounted_intrinsics)
-    gamma_sum = np.sum(gammas)
-    
-    return total_reward / gamma_sum  
 
 def simulate(
     agent,
@@ -519,16 +376,6 @@ def convert(value, precision=32):
         raise NotImplementedError(value.dtype)
     return value.astype(dtype)
 
-def selective_deepcopy(episode):
-    episode_copy = episode.copy()
-
-    if "zoomed_image" in episode_copy:
-        episode_copy["zoomed_image"] = copy.deepcopy(episode_copy["zoomed_image"])
-    
-    if "heatmap_on_zoomed" in episode_copy:
-        episode_copy["heatmap_on_zoomed"] = copy.deepcopy(episode_copy["heatmap_on_zoomed"])
-    
-    return episode_copy
 
 def save_episodes(directory, episodes):
     directory = pathlib.Path(directory).expanduser()
@@ -537,8 +384,7 @@ def save_episodes(directory, episodes):
         length = len(episode["reward"])
         filename = directory / f"{filename}-{length}.npz"
         with io.BytesIO() as f1:
-            episode_copy = selective_deepcopy(episode)
-            episode_copy = replace_none_with_zeros(episode_copy)
+            episode_copy = episode.copy()
             np.savez_compressed(f1, **episode_copy)
             f1.seek(0)
             with filename.open("wb") as f2:
@@ -546,28 +392,6 @@ def save_episodes(directory, episodes):
             del episode_copy
     return True
 
-def replace_none_with_zeros(episode):
-    if "image" in episode and len(episode["image"]) > 0:
-        reference_shape = episode["image"][0].shape
-    else:
-        raise ValueError("Image data is missing or malformed in episode.")
-    
-    if "zoomed_image" in episode:
-        episode["zoomed_image"] = [
-            np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
-        ]
-    
-    if "heatmap" in episode and len(episode["heatmap"]) > 0:
-        heatmap_shape = episode["heatmap"][0].shape
-    else:
-        heatmap_shape = None
-    
-    if "heatmap_on_zoomed" in episode and heatmap_shape:
-        episode["heatmap_on_zoomed"] = [
-            np.zeros(heatmap_shape) if hm is None else hm for hm in episode["heatmap_on_zoomed"]
-        ]
-    
-    return episode
 
 def from_generator(generator, batch_size):
 
@@ -584,88 +408,24 @@ def from_generator(generator, batch_size):
         yield data
 
 
-def sample_episodes(
-    episodes,
-    length,
-    seed=0,
-    success_replay_ratio=0.0,
-    success_positive_threshold=1.0e-6,
-):
-    """Sample fixed-length replay sequences.
+def sample_episodes(episodes, length, seed=0):
 
-    Stable-V1.2 adds a deliberately small success-aware mixture. With probability
-    ``success_replay_ratio`` an episode is drawn from the subset that has ever
-    contained a real positive environment reward; otherwise the original
-    length-proportional sampler is used. When no successful episode exists, this
-    is exactly the original sampler.
-
-    The sampled window itself does not have to contain the terminal reward. This
-    is intentional: windows from a successful trajectory also preserve useful
-    near-success context.
-    """
     np_random = np.random.RandomState(seed)
-    success_replay_ratio = float(np.clip(success_replay_ratio, 0.0, 1.0))
-    success_positive_threshold = float(success_positive_threshold)
-    # Cache per-episode success metadata so the 10% priority mixture never
-    # rescans the entire replay reward history on every training sample.
-    success_cache = {}
-
     while True:
         size = 0
         ret = None
-        used_success_priority = False
-
-        # ``episodes`` is updated online, therefore rebuild the light-weight
-        # sampling tables for every yielded training sequence just like the
-        # original implementation rebuilt its length probabilities.
-        episode_items = list(episodes.items())
-        episode_values = [episode for _, episode in episode_items]
-        lengths = np.asarray(
-            [len(next(iter(episode.values()))) for episode in episode_values],
-            dtype=np.float64,
+        p = np.array(
+            [len(next(iter(episode.values()))) for episode in episodes.values()]
         )
-        p_all = lengths / np.sum(lengths)
-
-        success_indices = []
-        if success_replay_ratio > 0.0:
-            for i, (episode_id, episode) in enumerate(episode_items):
-                if episode_id not in success_cache:
-                    success_cache[episode_id] = episode_has_positive_reward(
-                        episode, success_positive_threshold
-                    )
-                if success_cache[episode_id]:
-                    success_indices.append(i)
-        if success_indices:
-            success_lengths = lengths[success_indices]
-            p_success = success_lengths / np.sum(success_lengths)
-        else:
-            p_success = None
-
+        p = p / np.sum(p)
         while size < length:
-            draw_success = (
-                p_success is not None
-                and success_replay_ratio > 0.0
-                and np_random.rand() < success_replay_ratio
-            )
-            if draw_success:
-                local_index = int(
-                    np_random.choice(np.arange(len(success_indices)), p=p_success)
-                )
-                episode_index = int(success_indices[local_index])
-                used_success_priority = True
-            else:
-                episode_index = int(
-                    np_random.choice(np.arange(len(episode_values)), p=p_all)
-                )
-            episode = episode_values[episode_index]
-
+            episode = np_random.choice(list(episodes.values()), p=p)
             total = len(next(iter(episode.values())))
             # make sure at least one transition included
             if total < 2:
                 continue
 
-            episode_copy = selective_deepcopy(episode)
-            episode_copy = replace_none_with_zeros(episode_copy)
+            episode_copy = episode.copy()
 
             if not ret:
                 index = int(np_random.randint(0, total - 1))
@@ -691,12 +451,6 @@ def sample_episodes(
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
             del episode_copy
-
-        # Diagnostic-only sequence flag. WorldModel ignores it for prediction
-        # heads, but logs the actual fraction of prioritized sequences.
-        ret["replay_success_source"] = np.full(
-            (length,), float(used_success_priority), dtype=np.float32
-        )
         yield ret
 
 
@@ -1037,41 +791,6 @@ def static_scan_for_lambda_return(fn, inputs, start):
     return outputs
 
 
-def lambda_return_for_ls_imagine(reward, value, gamma, end, jumping_steps, accumulated_reward, bootstrap, lambda_, axis):
-    # Setting lambda=1 gives a discounted Monte Carlo return.
-    # Setting lambda=0 gives a fixed 1-step return.
-    # assert reward.shape.ndims == value.shape.ndims, (reward.shape, value.shape)
-    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
-    
-    if isinstance(gamma, (int, float)):
-        gamma = gamma * torch.ones_like(reward)
-
-    dims = list(range(len(reward.shape)))
-    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1 :]
-
-    if axis != 0:
-        reward = reward.permute(dims)
-        value = value.permute(dims)
-        gamma = gamma.permute(dims)
-
-    if bootstrap is None:
-        bootstrap = torch.zeros_like(value[-1])
-    next_values = torch.cat([value[1:], bootstrap[None]], 0)
-
-    new_reward = torch.pow(gamma, jumping_steps-1) * reward + accumulated_reward
-    discount = torch.pow(gamma, jumping_steps)
-            
-    inputs = new_reward + discount * next_values * (1 - lambda_)
-    # returns = static_scan(
-    #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
-    #    (inputs, pcont), bootstrap, reverse=True)
-    # reimplement to optimize performance
-    returns = static_scan_for_lambda_return(
-        lambda agg, cur0, cur1, cur2: (1.0 - cur2) * (cur0 + cur1 * lambda_ * agg), (inputs, discount, end), bootstrap
-    )
-    if axis != 0:
-        returns = returns.permute(dims)
-    return returns
 
 def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
     # Setting lambda=1 gives a discounted Monte Carlo return.
@@ -1184,54 +903,6 @@ def static_scan(fn, inputs, start):
     for index in indices:
         inp = lambda x: (_input[x] for _input in inputs)
         last = fn(last, *inp(index))
-        if flag:
-            if type(last) == type({}):
-                outputs = {
-                    key: value.clone().unsqueeze(0) for key, value in last.items()
-                }
-            else:
-                outputs = []
-                for _last in last:
-                    if type(_last) == type({}):
-                        outputs.append(
-                            {
-                                key: value.clone().unsqueeze(0)
-                                for key, value in _last.items()
-                            }
-                        )
-                    else:
-                        outputs.append(_last.clone().unsqueeze(0))
-            flag = False
-        else:
-            if type(last) == type({}):
-                for key in last.keys():
-                    outputs[key] = torch.cat(
-                        [outputs[key], last[key].unsqueeze(0)], dim=0
-                    )
-            else:
-                for j in range(len(outputs)):
-                    if type(last[j]) == type({}):
-                        for key in last[j].keys():
-                            outputs[j][key] = torch.cat(
-                                [outputs[j][key], last[j][key].unsqueeze(0)], dim=0
-                            )
-                    else:
-                        outputs[j] = torch.cat(
-                            [outputs[j], last[j].unsqueeze(0)], dim=0
-                        )
-    if type(last) == type({}):
-        outputs = [outputs]
-    return outputs
-
-def static_scan_zoomed(fn, inputs, rely):
-    indices = range(inputs[0].shape[0])
-    flag = True
-
-    for index in indices:
-        inp = lambda x: (_input[x] for _input in inputs)
-        rely_on_index = {k: v[index] for k, v in rely[0].items()}
-        last = fn(rely_on_index, *inp(index))
-
         if flag:
             if type(last) == type({}):
                 outputs = {

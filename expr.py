@@ -22,9 +22,19 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-class LS_Imagine(nn.Module):
+def load_yaml_config(path):
+    """Load YAML with both ruamel.yaml 0.17 and 0.18+ APIs."""
+    text = pathlib.Path(path).read_text()
+    try:
+        return yaml.safe_load(text)
+    except AttributeError:
+        loader = yaml.YAML(typ="safe", pure=True)
+        return loader.load(text)
+
+
+class DreamerV3Agent(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super(LS_Imagine, self).__init__()
+        super().__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -88,7 +98,7 @@ class LS_Imagine(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
+            latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -115,11 +125,20 @@ class LS_Imagine(nn.Module):
         post, _, context, mets = self._wm._train(data)
         metrics.update(mets)
 
+        # Detached baseline diagnostics. They are deliberately executed outside
+        # the compiled world-model training graph and only at the configured
+        # interval. They never enter any optimizer/loss.
+        diag_cfg = getattr(self._config, "dreamer_diagnostics", {})
+        diag_every = max(1, int(diag_cfg.get("every", 16)))
+        if bool(diag_cfg.get("enabled", False)) and self._update_count % diag_every == 0:
+            wm_for_diag = getattr(self._wm, "_orig_mod", self._wm)
+            metrics.update(wm_for_diag.diagnostic_metrics(data, post))
+
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
+        mineclip_reward = lambda f, s, a: self._wm.heads["mineclip_reward"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
 
@@ -127,105 +146,21 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, mineclip_reward, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
-        if getattr(self._config, "health_metrics_enabled", False):
-            metrics = self._add_health_metrics(metrics)
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
 
-    def _add_health_metrics(self, metrics):
-        """Add human-readable aliases and a conservative collapse alert.
-
-        These diagnostics never enter any loss and do not alter RNG state.
-        """
-        aliases = {
-            "s_multistep_cosine_h15": "health/s5a_cos15",
-            "s_cf_margin_shuffle_h15": "health/cf_margin15",
-            "s_cf_response_gap_shuffle_h15": "health/response_gap15",
-            "s_dvc_reanchor_gain_h15": "health/reanchor_gain15",
-            "s_proto_acc_h15": "health/proto_acc15",
-            "s_proto_known_fraction": "health/proto_known",
-            "s_proto_unknown_fraction": "health/proto_unknown",
-            "s_proto_success_ready": "health/proto_success_ready",
-            "s_proto_success_support_ratio": "health/proto_success_support_ratio",
-            "s_proto_teacher_semantic_span": "health/proto_semantic_span",
-            "s_proto_teacher_affordance_span": "health/proto_affordance_span",
-            "s_proto_teacher_active_weight_fraction": "health/proto_teacher_active_weight",
-            "s_proto_reliability_score_batch": "health/proto_reliability_batch",
-            "s_proto_reliability_score_ema": "health/proto_reliability_ema",
-            "s_proto_reliability_gate": "health/proto_gate",
-            "s_proto_success_reliability_ready": "health/proto_success_rel_ready",
-            "s_proto_pseudo_bank_update_enabled": "health/proto_bank_update",
-            "s_prototype_effective_scale": "health/proto_effective_scale",
-            "s_proto_grad_guard_gate": "health/proto_grad_gate",
-            "s_proto_grad_guard_cosine": "health/proto_grad_cos",
-            "s_proto_grad_guard_norm_ratio": "health/proto_grad_norm_ratio",
-            "s_proto_grad_guard_checked": "health/proto_grad_checked",
-            "replay_success_source_fraction": "health/replay_success_source",
-            "replay_positive_step_fraction": "health/replay_positive_step",
-            "replay_positive_sequence_fraction": "health/replay_positive_sequence",
-            "s_outcome_gate": "health/outcome_gate",
-            "s_outcome_positive_ema": "health/outcome_positive_ema",
-            "s_outcome_corr_h15": "health/outcome_corr15",
-            "s_outcome_target_nonzero_frac_h15": "health/outcome_nonzero15",
-            "imag_reward_std": "health/imag_reward_std",
-            "value_std": "health/value_std",
-            "actor_grad_norm": "health/actor_grad_norm",
-        }
-        for src, dst in aliases.items():
-            if src in metrics:
-                metrics[dst] = metrics[src]
-
-        def scalar(name, default=float("nan")):
-            if name not in metrics:
-                return default
-            try:
-                return float(np.asarray(metrics[name]).mean())
-            except Exception:
-                return default
-
-        value_std = scalar("value_std")
-        actor_grad = scalar("actor_grad_norm")
-        reward_std = scalar("imag_reward_std")
-        if np.isfinite(value_std) and np.isfinite(actor_grad) and np.isfinite(reward_std):
-            collapse = (
-                value_std < float(self._config.health_value_std_low)
-                and actor_grad < float(self._config.health_actor_grad_low)
-                and reward_std < float(self._config.health_imag_reward_std_low)
-            )
-            metrics["health/policy_collapse_alert"] = float(collapse)
-        return metrics
-
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
-def make_dataset(episodes, config, training=False):
-    # Stable-V1.2 keeps the original replay implementation and adds only a
-    # small mixture bias toward already-successful episodes for the training
-    # dataset. Evaluation/video datasets remain uniform.
-    replay_enabled = bool(getattr(config, "success_replay_enabled", False))
-    replay_ratio = (
-        float(getattr(config, "success_replay_ratio", 0.0))
-        if training and replay_enabled
-        else 0.0
-    )
-    generator = tools.sample_episodes(
-        episodes,
-        config.batch_length,
-        # Preserve the original replay sampler RNG path (sample_episodes
-        # historically used seed=0 independent of environment seed).
-        seed=0,
-        success_replay_ratio=replay_ratio,
-        success_positive_threshold=float(
-            getattr(config, "success_replay_positive_threshold", 1.0e-6)
-        ),
-    )
+def make_dataset(episodes, config):
+    generator = tools.sample_episodes(episodes, config.batch_length)
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
 
@@ -233,13 +168,33 @@ def make_env(config, mode, id):
     suite, task = config.task.split("_", 1)
     if suite == "minedojo":
         import envs.minedojo as minedojo
-        log_dir = os.path.join(config.results_dir, config.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-
-        kwargs=dict(
-                log_dir=log_dir,
-                target_item=config.target_item
-            )
+        log_dir = os.path.join(
+            config.results_dir,
+            config.name + "_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+        )
+        kwargs = dict(log_dir=log_dir, target_item=config.target_item)
         env = minedojo.make_env(task, **kwargs)
+        env = wrappers.OneHotAction(env)
+
+    elif suite == "vizdoom":
+        import envs.vizdoom as vizdoom
+
+        # Keep evaluation stochasticity independent from the training stream.
+        seed_offset = 10000 if mode == "eval" else 0
+        success_threshold = getattr(config, "vizdoom_success_threshold", -1.0)
+        env = vizdoom.make_env(
+            task,
+            seed=config.seed + seed_offset + id,
+            image_size=getattr(config, "vizdoom_image_size", 64),
+            frame_skip=getattr(config, "vizdoom_frame_skip", 4),
+            reward_mode=getattr(config, "vizdoom_reward_mode", "native"),
+            success_threshold=success_threshold,
+            teacher_mode=getattr(config, "vizdoom_diagnostic_teacher_mode", "auto"),
+            render_mode=(
+                "human" if getattr(config, "vizdoom_render", False) and mode == "eval"
+                else None
+            ),
+        )
         env = wrappers.OneHotAction(env)
 
     else:
@@ -298,19 +253,20 @@ def main(config): # config is namespace
     make = lambda mode, id: make_env(config, mode, id)
     suite, task = config.task.split("_", 1)
     
-    from envs.tasks import get_specs
+    if suite == "minedojo":
+        from envs.tasks import get_specs
 
-    kwargs=dict(
-            # log_dir=log_dir,
-            target_item=config.target_item
+        kwargs = dict(target_item=config.target_item)
+        _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
+        config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
+    elif suite == "vizdoom":
+        import envs.vizdoom as vizdoom
+
+        config.episode_max_steps = vizdoom.episode_max_steps(
+            task, getattr(config, "vizdoom_frame_skip", 4)
         )
-    task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
-
-    config.episode_max_steps = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
-    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
-    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
-    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
+    else:
+        raise NotImplementedError(suite)
     
     train_envs = [make("train", i) for i in range(config.envs)]
     eval_envs = [make("eval", i) for i in range(config.envs)]
@@ -364,9 +320,9 @@ def main(config): # config is namespace
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config, training=True)
-    eval_dataset = make_dataset(eval_eps, config, training=False)
-    agent = LS_Imagine(
+    train_dataset = make_dataset(train_eps, config)
+    eval_dataset = make_dataset(eval_eps, config)
+    agent = DreamerV3Agent(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -408,7 +364,7 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent, # LS_Imagine
+            agent,
             train_envs, 
             train_eps,
             config.traindir,
@@ -427,17 +383,12 @@ def main(config): # config is namespace
         
         torch.save(items_to_save, logdir / "latest.pt")
 
-        # Publication-grade historical checkpoints for independent evaluation.
-        # Save every 100k environment steps without changing optimization.
-        current_step = int(agent._step)
-        previous_step = max(0, current_step - int(config.eval_every))
-        crossed_100k_boundary = (
-            current_step // 100000 > previous_step // 100000
-        )
-        if current_step > 0 and crossed_100k_boundary:
-            # With prefill=2500 the actual checkpoints are typically 102.5k,
-            # 202.5k, ...; use the true environment step in the filename.
-            torch.save(items_to_save, logdir / f"checkpoint_{current_step}.pt")
+        # Keep publication-grade historical checkpoints for independent evaluation.
+        if agent._step % 100000 == 0:
+            torch.save(
+                items_to_save,
+                logdir / f"checkpoint_{agent._step}.pt",
+            )
 
     for env in train_envs + eval_envs:
         try:
@@ -453,8 +404,8 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
 
-    configs = yaml.safe_load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
+    configs = load_yaml_config(
+        pathlib.Path(sys.argv[0]).parent / "configs.yaml"
     )
 
     def recursive_update(base, update):
