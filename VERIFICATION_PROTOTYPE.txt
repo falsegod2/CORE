@@ -1,0 +1,24 @@
+Verification status: PASS
+
+Executed successfully:
+- python test_prototype_utility.py
+- python audit_prototype_utility.py
+- python test_s_outcome.py
+- python test_s5a_diagnostics_invariance.py
+- python audit_s_outcome.py
+- python audit_s5a_diagnostics.py
+- python audit_saff_sonly5a_noinverse.py
+- python audit_rgb_only_iso.py
+- python audit_saff_inverse_sonly5a.py
+- python -m compileall -q .
+
+Key verified properties:
+- Generic task-evidence prototype labels are the default.
+- No task-name / sheep-specific stage is hard-coded.
+- Flat teacher signals remain Unknown.
+- Real reward is the hard Success anchor.
+- MineCLIP task_score is replay-only auxiliary supervision.
+- Encoder stays RGB-only.
+- Prototype path does not alter S5A stochastic RNG consumption.
+- Prototype loss gradients reach predicted S / S dynamics.
+- Prototype utility is not added to actor imagined reward.

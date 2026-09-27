@@ -1,0 +1,233 @@
+# ISO3-RGB-Aux-NoLong patch
+
+--- configs.yaml.bak	2026-08-04 00:23:36.165361239 +0000
++++ configs.yaml	2026-08-04 00:23:37.493361239 +0000
+@@ -26,8 +26,10 @@
+   # ==========================================
+   # 2. 核心创新点与消融实验控制 (CJJ Innovations)
+   # ==========================================
+-  inverse_loss_scale: 1.0      # 创新1：S分支逆动力学约束权重
+-  affordance_s_scale: 2.0      # 创新2：S分支可供性地图(Heatmap)对齐约束权重
++  inverse_loss_scale: 1.0      # S分支逆动力学分类约束（已修正动作时间对齐）
++  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
++  z_action_adv_scale: 0.05     # 对抗抑制Z分支中的动作信息；设为0可做消融
++  z_action_grl_scale: 1.0      # Gradient Reversal强度
+   # 【已移除 long_term_branch_weight】
+ 
+   gaussian_reward_weight: 0.0  
+@@ -39,7 +41,7 @@
+   steps: 1e6                   
+   parallel: False
+   eval_every: 10000            
+-  eval_episode_num: 3
++  eval_episode_num: 10          # 减少3-episode评估造成的离散高方差
+   log_every: 20000
+   reset_every: 0
+   train_ratio: 16              
+@@ -101,7 +103,7 @@
+   initial: 'learned'
+   
+   encoder:
+-    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
++    {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath|obs_reward', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+   decoder:
+     {mlp_keys: 'inventory|inventory_max|equipped|health|hunger|breath', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+   
+--- models.py.bak	2026-08-04 00:23:36.169361239 +0000
++++ models.py	2026-08-04 00:25:25.513361239 +0000
+@@ -26,6 +26,12 @@
+ logger = logging.getLogger(__name__)
+ to_np = lambda x: x.detach().cpu().numpy()
+ 
++
++def gradient_reverse(x, scale=1.0):
++    """Forward identity with a compile-friendly negative backward scale."""
++    scale = float(scale)
++    return (1.0 + scale) * x.detach() - scale * x
++
+ class RewardEMA:
+     """
+     运行时的奖励均值和标准差估计 (Exponential Moving Average)
+@@ -120,6 +126,11 @@
+         self._config = config
+         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
++        if "heatmap" in getattr(self.encoder, "cnn_shapes", {}):
++            raise ValueError(
++                "RGB-only ISO variant forbids heatmap in the observation encoder. "
++                "Keep heatmap only as an auxiliary prediction target."
++            )
+         self.embed_size = self.encoder.outdim
+         
+         self.dynamics = networks.RSSM(
+@@ -157,6 +168,21 @@
+             dist=config.intrinsic_head["dist"], outscale=config.intrinsic_head["outscale"],
+             device=config.device, name="Intrinsic",
+         )
++
++        # Diagnostic/adversarial action probe for the action-free Z branch.
++        # Gradient reversal trains the probe to recognize actions while pushing Z
++        # toward action invariance. The scale can be set to zero for ablation.
++        act_fn = getattr(torch.nn, config.act)
++        z_stoch_dim = self.dynamics._stoch_z * (
++            self.dynamics._discrete if self.dynamics._discrete else 1
++        )
++        self._z_branch_feat_dim = z_stoch_dim + self.dynamics._deter_z
++        self.z_action_adversary = nn.Sequential(
++            nn.Linear(self._z_branch_feat_dim * 2, config.dyn_hidden),
++            act_fn(),
++            nn.Linear(config.dyn_hidden, config.num_actions),
++        )
++        self._z_action_grl_scale = getattr(config, "z_action_grl_scale", 1.0)
+        
+         for name in config.grad_heads:
+             assert name in self.heads, name
+@@ -174,6 +200,7 @@
+             intrinsic=config.intrinsic_head["loss_scale"],
+             inverse=getattr(config, "inverse_loss_scale", 1.0),
+             affordance_s=getattr(config, "affordance_s_scale", 1.0),
++            z_action_adv=getattr(config, "z_action_adv_scale", 0.0),
+         )
+ 
+     def _train(self, data_origin):
+@@ -190,16 +217,54 @@
+                     embed, data["action"], data["is_first"]
+                 )
+ 
+-                # --- [创新点 1：解耦约束] 计算逆动力学损失 ---
++                # --- [改进1] 正确时间对齐的S分支逆动力学分类损失 ---
++                # Replay中的action[t]是到达observation[t]的动作，因此
++                # (state[t-1], state[t])必须监督action[t]，即data[:, 1:]。
+                 h_s_t = post["deter_s"][:, :-1]
+                 h_s_next = post["deter_s"][:, 1:]
+-                feat_inv = torch.cat([h_s_t, h_s_next], dim=-1)
+-                pred_action = self.dynamics._inverse_dynamics(feat_inv)
+-                
+-                true_action = data["action"][:, :-1]
+-                loss_inv = F.mse_loss(pred_action, true_action)
++                feat_inv_s = torch.cat([h_s_t, h_s_next], dim=-1)
++                pred_action_s = self.dynamics._inverse_dynamics(feat_inv_s)
++
++                true_action_onehot = data["action"][:, 1:]
++                true_action = torch.argmax(true_action_onehot, dim=-1)
++                valid_transition = 1.0 - data["is_first"][:, 1:].float()
++                valid_den = torch.clamp(valid_transition.sum(), min=1.0)
++
++                inv_per_step = F.cross_entropy(
++                    pred_action_s.reshape(-1, pred_action_s.shape[-1]),
++                    true_action.reshape(-1),
++                    reduction="none",
++                ).reshape_as(valid_transition)
++                loss_inv = (inv_per_step * valid_transition).sum() / valid_den
++                acc_action_s = (
++                    (pred_action_s.argmax(dim=-1) == true_action).float()
++                    * valid_transition
++                ).sum() / valid_den
++
++                # --- [改进2] 对抗抑制Z分支中的动作泄漏 ---
++                z_stoch = post["stoch_z"]
++                if self.dynamics._discrete:
++                    z_stoch = z_stoch.reshape(
++                        list(z_stoch.shape[:-2])
++                        + [self.dynamics._stoch_z * self.dynamics._discrete]
++                    )
++                feat_z = torch.cat([z_stoch, post["deter_z"]], dim=-1)
++                feat_inv_z = torch.cat([feat_z[:, :-1], feat_z[:, 1:]], dim=-1)
++                pred_action_z = self.z_action_adversary(
++                    gradient_reverse(feat_inv_z, self._z_action_grl_scale)
++                )
++                z_adv_per_step = F.cross_entropy(
++                    pred_action_z.reshape(-1, pred_action_z.shape[-1]),
++                    true_action.reshape(-1),
++                    reduction="none",
++                ).reshape_as(valid_transition)
++                loss_z_action_adv = (z_adv_per_step * valid_transition).sum() / valid_den
++                acc_action_z = (
++                    (pred_action_z.argmax(dim=-1) == true_action).float()
++                    * valid_transition
++                ).sum() / valid_den
+ 
+-                # --- [创新点 2：可供性先验指导的解耦增强] ---
++                # --- [改进3] Affordance仅作为S分支辅助监督，不进入encoder ---
+                 s_stoch_dim = self.dynamics._stoch_s * (self.dynamics._discrete if self.dynamics._discrete else 1)
+                 s_feat_dim = s_stoch_dim + self.dynamics._deter_s
+                 
+@@ -215,7 +280,10 @@
+                 dyn_scale = self._config.dyn_scale 
+                 rep_scale = self._config.rep_scale 
+ 
+-                kl_loss_img, kl_value_img, dyn_loss_img, rep_loss_img = self.dynamics.kl_loss(
++                (
++                    kl_loss_img, kl_value_img, dyn_loss_img, rep_loss_img,
++                    kl_value_s, kl_value_z,
++                ) = self.dynamics.kl_loss(
+                     post, prior, kl_free, dyn_scale, rep_scale
+                 )
+ 
+@@ -244,9 +312,13 @@
+ 
+                 # 5. 汇总总损失
+                 model_loss = sum(scaled.values()) + kl_loss_img
+-                total_loss = torch.mean(model_loss) + \
+-                            loss_inv * self._scales.get("inverse", 1.0) + \
+-                            torch.mean(loss_affordance_s) * self._scales.get("affordance_s", 1.0)
++                total_loss = (
++                    torch.mean(model_loss)
++                    + loss_inv * self._scales.get("inverse", 1.0)
++                    + loss_z_action_adv * self._scales.get("z_action_adv", 0.0)
++                    + torch.mean(loss_affordance_s)
++                    * self._scales.get("affordance_s", 1.0)
++                )
+ 
+             # 统一执行优化
+             metrics = self._model_opt(total_loss, self.parameters())
+@@ -254,9 +326,14 @@
+         # 记录指标
+         metrics.update({f"{name}_loss": to_np(torch.mean(loss)) for name, loss in losses.items()})
+         metrics["loss_inverse"] = to_np(loss_inv)
++        metrics["action_acc_s"] = to_np(acc_action_s)
++        metrics["loss_z_action_adv"] = to_np(loss_z_action_adv)
++        metrics["action_acc_z"] = to_np(acc_action_z)
+         metrics["loss_affordance_s"] = to_np(torch.mean(loss_affordance_s))
+         metrics["model_loss"] = to_np(total_loss)
+         metrics["kl"] = to_np(torch.mean(kl_value_img))
++        metrics["kl_s"] = to_np(torch.mean(kl_value_s))
++        metrics["kl_z"] = to_np(torch.mean(kl_value_z))
+         
+         with torch.cuda.amp.autocast(self._use_amp):
+             s_stats = {k[2:]:v for k,v in post.items() if k.startswith("s_")}
+--- networks.py.bak	2026-08-04 00:23:36.177361239 +0000
++++ networks.py	2026-08-04 00:24:20.749361239 +0000
+@@ -245,14 +245,27 @@
+         kl_s = kld(get_branch_dist(post, "s"), get_branch_dist(sg(prior), "s"))
+         kl_z = kld(get_branch_dist(post, "z"), get_branch_dist(sg(prior), "z"))
+         
+-        # 按照 DreamerV3 逻辑计算 rep_loss 和 dyn_loss
+-        rep_loss = torch.clip(kl_s + kl_z, min=free)
+-        
++        # 对两个分支分别应用free-bits，避免一个分支承担全部KL而另一个塌缩。
++        # 每个分支使用总free-bits的一半，保持与原总预算大致一致。
++        branch_free = free / 2.0
++        rep_loss_s = torch.clip(kl_s, min=branch_free)
++        rep_loss_z = torch.clip(kl_z, min=branch_free)
++        rep_loss = rep_loss_s + rep_loss_z
++
+         dyn_kl_s = kld(get_branch_dist(sg(post), "s"), get_branch_dist(prior, "s"))
+         dyn_kl_z = kld(get_branch_dist(sg(post), "z"), get_branch_dist(prior, "z"))
+-        dyn_loss = torch.clip(dyn_kl_s + dyn_kl_z, min=free)
++        dyn_loss_s = torch.clip(dyn_kl_s, min=branch_free)
++        dyn_loss_z = torch.clip(dyn_kl_z, min=branch_free)
++        dyn_loss = dyn_loss_s + dyn_loss_z
+ 
+-        return dyn_scale * dyn_loss + rep_scale * rep_loss, (kl_s + kl_z), dyn_loss, rep_loss
++        return (
++            dyn_scale * dyn_loss + rep_scale * rep_loss,
++            kl_s + kl_z,
++            dyn_loss,
++            rep_loss,
++            kl_s,
++            kl_z,
++        )
+ 
+ class MultiEncoder(nn.Module):
+     def __init__(

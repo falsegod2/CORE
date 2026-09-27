@@ -1,0 +1,58 @@
+Files changed from Outcome + ProtoNet v1 to Generic Task-Evidence ProtoNet v2
+=============================================================================
+
+Core algorithm:
+- s_prototype_utility.py
+  * NEW default build_task_evidence_labels()
+  * generic Low/Mid/High/Success stages
+  * task-score + affordance + intrinsic evidence
+  * robust batch quantile normalization
+  * ambiguous boundary samples remain Unknown
+  * real positive reward overrides pseudo labels as Success
+  * old time-to-success labels kept only as optional ablation
+
+- s_multistep_consistency.py
+  * default prototype label_mode changed to task_evidence
+  * accepts replay task_score / heatmap / intrinsic as teacher signals
+  * posterior-S support and predicted-S query path unchanged
+  * generic prototype metrics added
+
+- models.py
+  * parses generic prototype teacher parameters
+  * passes task_score, heatmap and intrinsic into S5A prototype path
+  * RGB encoder / actor reward path unchanged
+
+Environment/replay teacher signal:
+- envs/tasks/base/clip_wrapper.py
+  * exposes raw MineCLIP task_score in [0,1]
+
+- envs/tasks/base/ls_imagine_wrapper.py
+  * carries task_score into replay observation
+  * task_score remains auxiliary-only
+
+Configuration:
+- configs.yaml
+  * label_mode: task_evidence
+  * semantic_weight: 0.65
+  * affordance_weight: 0.30
+  * intrinsic_weight: 0.05
+  * task-adaptive quantile parameters
+
+Tests/audits/docs:
+- test_prototype_utility.py
+- audit_prototype_utility.py
+- README_GENERIC_PROTOTYPE_UTILITY_CN.md
+- README_PROTOTYPE_UTILITY_CN.md (legacy notice)
+- METHOD_CHANGES.md
+- MODIFICATION_SUMMARY.txt
+- VERIFICATION_PROTOTYPE.txt
+
+Unchanged core design:
+- Dual S/Z RSSM
+- RGB-only encoder
+- S-Aff
+- S5A horizons [1,2,4,8,15]
+- FixedRandomProjector 2560 -> 512
+- Balanced Outcome
+- Actor/Critic
+- Prototype Utility NOT added to imagined reward

@@ -47,27 +47,19 @@ def main(config):
     make = lambda mode, id: make_env(config, mode, id)
     suite, task = config.task.split("_", 1)
 
-    if suite == "minedojo":
-        from envs.tasks import get_specs
+    from envs.tasks import get_specs
 
-        kwargs = dict(target_item=config.target_item)
-        _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
-        config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
-        task_specs["concentration_specs"]["max_steps"] = config.episode_max_steps
-        task_specs["concentration_specs"]["gaussian_reward_weight"] = config.gaussian_reward_weight
-        task_specs["concentration_specs"]["gaussian_sigma_weight"] = config.gaussian_sigma_weight
-        task_specs["clip_specs"]["target_object"] = (
-            task_specs["success_specs"]["all"]["item"]["type"]
-            if "all" in task_specs["success_specs"]
-            else task_specs["success_specs"]["any"]["item"]["type"]
+    kwargs=dict(
+            # log_dir=log_dir,
+            target_item=config.target_item
         )
-    elif suite == "vizdoom":
-        import envs.vizdoom as vizdoom
-        config.episode_max_steps = vizdoom.episode_max_steps(
-            task, getattr(config, "vizdoom_frame_skip", 4)
-        )
-    else:
-        raise NotImplementedError(suite)
+    task_id, task_specs, sim_specs = get_specs(task, **kwargs)  # Note: additional kwargs end up in task_specs dict
+
+    config.episode_max_steps = task_specs['terminal_specs']['max_steps']
+    task_specs['concentration_specs']['max_steps'] = task_specs['terminal_specs']['max_steps']
+    task_specs['concentration_specs']['gaussian_reward_weight'] = config.gaussian_reward_weight
+    task_specs['concentration_specs']['gaussian_sigma_weight'] = config.gaussian_sigma_weight
+    task_specs['clip_specs']['target_object'] = task_specs['success_specs']['all']['item']['type'] if 'all' in task_specs['success_specs'] else task_specs['success_specs']['any']['item']['type']
 
     eval_envs = [make("eval", i) for i in range(config.envs)]
     if config.parallel:
@@ -78,7 +70,6 @@ def main(config):
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
-    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
@@ -113,9 +104,7 @@ def main(config):
             eval_eps,
             config.evaldir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             is_eval=True,
             episodes=config.eval_episode_num,
             is_training=False,

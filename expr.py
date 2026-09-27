@@ -112,18 +112,8 @@ class LS_Imagine(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, post_zoomed, context, mets = self._wm._train(data)
+        post, _, context, mets = self._wm._train(data)
         metrics.update(mets)
-        # start = (post, post_zoomed)
-
-        # Detached mechanism diagnostics.  They are deliberately evaluated
-        # outside the world-model loss/optimizer and only at a sparse cadence.
-        # This keeps LS-Imagine's training behavior unchanged.
-        diag_cfg = getattr(self._config, "ls_diagnostics", {})
-        diag_every = max(1, int(diag_cfg.get("every", 16)))
-        if bool(diag_cfg.get("enabled", False)) and self._update_count % diag_every == 0:
-            wm_for_diag = getattr(self._wm, "_orig_mod", self._wm)
-            metrics.update(wm_for_diag.diagnostic_metrics(data, post))
 
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
@@ -133,37 +123,112 @@ class LS_Imagine(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode() 
 
-        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
-            f
-        ).mean().clamp_min(1).int()
-
-        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
-            f
-        ).mode()
-
-        jump_indicator = lambda s: self._wm.heads["jump"](
-            self._wm.dynamics.get_feat(s)
-        ).mean
-
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, reward, intrinsic, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
+        if getattr(self._config, "health_metrics_enabled", False):
+            metrics = self._add_health_metrics(metrics)
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
 
+    def _add_health_metrics(self, metrics):
+        """Add human-readable aliases and a conservative collapse alert.
+
+        These diagnostics never enter any loss and do not alter RNG state.
+        """
+        aliases = {
+            "s_multistep_cosine_h15": "health/s5a_cos15",
+            "s_cf_margin_shuffle_h15": "health/cf_margin15",
+            "s_cf_response_gap_shuffle_h15": "health/response_gap15",
+            "s_dvc_reanchor_gain_h15": "health/reanchor_gain15",
+            "s_proto_acc_h15": "health/proto_acc15",
+            "s_proto_known_fraction": "health/proto_known",
+            "s_proto_unknown_fraction": "health/proto_unknown",
+            "s_proto_success_ready": "health/proto_success_ready",
+            "s_proto_success_support_ratio": "health/proto_success_support_ratio",
+            "s_proto_teacher_semantic_span": "health/proto_semantic_span",
+            "s_proto_teacher_affordance_span": "health/proto_affordance_span",
+            "s_proto_teacher_active_weight_fraction": "health/proto_teacher_active_weight",
+            "s_proto_reliability_score_batch": "health/proto_reliability_batch",
+            "s_proto_reliability_score_ema": "health/proto_reliability_ema",
+            "s_proto_reliability_gate": "health/proto_gate",
+            "s_proto_success_reliability_ready": "health/proto_success_rel_ready",
+            "s_proto_pseudo_bank_update_enabled": "health/proto_bank_update",
+            "s_prototype_effective_scale": "health/proto_effective_scale",
+            "s_proto_grad_guard_gate": "health/proto_grad_gate",
+            "s_proto_grad_guard_cosine": "health/proto_grad_cos",
+            "s_proto_grad_guard_norm_ratio": "health/proto_grad_norm_ratio",
+            "s_proto_grad_guard_checked": "health/proto_grad_checked",
+            "replay_success_source_fraction": "health/replay_success_source",
+            "replay_positive_step_fraction": "health/replay_positive_step",
+            "replay_positive_sequence_fraction": "health/replay_positive_sequence",
+            "s_outcome_gate": "health/outcome_gate",
+            "s_outcome_positive_ema": "health/outcome_positive_ema",
+            "s_outcome_corr_h15": "health/outcome_corr15",
+            "s_outcome_target_nonzero_frac_h15": "health/outcome_nonzero15",
+            "s_outcome_target_positive_frac_h15": "health/outcome_positive15",
+            "s_outcome_positive_mode_positive_return": "health/outcome_positive_mode",
+            "s_proto_reliability_mode_relative": "health/proto_reliability_relative",
+            "imag_reward_std": "health/imag_reward_std",
+            "value_std": "health/value_std",
+            "actor_grad_norm": "health/actor_grad_norm",
+        }
+        for src, dst in aliases.items():
+            if src in metrics:
+                metrics[dst] = metrics[src]
+
+        def scalar(name, default=float("nan")):
+            if name not in metrics:
+                return default
+            try:
+                return float(np.asarray(metrics[name]).mean())
+            except Exception:
+                return default
+
+        value_std = scalar("value_std")
+        actor_grad = scalar("actor_grad_norm")
+        reward_std = scalar("imag_reward_std")
+        if np.isfinite(value_std) and np.isfinite(actor_grad) and np.isfinite(reward_std):
+            collapse = (
+                value_std < float(self._config.health_value_std_low)
+                and actor_grad < float(self._config.health_actor_grad_low)
+                and reward_std < float(self._config.health_imag_reward_std_low)
+            )
+            metrics["health/policy_collapse_alert"] = float(collapse)
+        return metrics
+
 def count_steps(folder):
     return sum(int(str(n).split("-")[-1][:-4]) - 1 for n in folder.glob("*.npz"))
 
-def make_dataset(episodes, config):
-    generator = tools.sample_episodes(episodes, config.batch_length)
+def make_dataset(episodes, config, training=False):
+    # Stable-V1.2 keeps the original replay implementation and adds only a
+    # small mixture bias toward already-successful episodes for the training
+    # dataset. Evaluation/video datasets remain uniform.
+    replay_enabled = bool(getattr(config, "success_replay_enabled", False))
+    replay_ratio = (
+        float(getattr(config, "success_replay_ratio", 0.0))
+        if training and replay_enabled
+        else 0.0
+    )
+    generator = tools.sample_episodes(
+        episodes,
+        config.batch_length,
+        # Preserve the original replay sampler RNG path (sample_episodes
+        # historically used seed=0 independent of environment seed).
+        seed=0,
+        success_replay_ratio=replay_ratio,
+        success_positive_threshold=float(
+            getattr(config, "success_replay_positive_threshold", 1.0e-6)
+        ),
+    )
     dataset = tools.from_generator(generator, config.batch_size)
     return dataset
 
@@ -181,40 +246,23 @@ def make_env(config, mode, id):
 
     elif suite == "vizdoom":
         import envs.vizdoom as vizdoom
-
-        # Use an independent evaluation RNG stream while keeping all methods
-        # on the same seed convention.
-        seed_offset = 10000 if mode == "eval" else 0
-        success_threshold = getattr(config, "vizdoom_success_threshold", -1.0)
         env = vizdoom.make_env(
             task,
-            seed=config.seed + seed_offset + id,
-            image_size=getattr(config, "vizdoom_image_size", 64),
-            frame_skip=getattr(config, "vizdoom_frame_skip", 4),
-            reward_mode=getattr(config, "vizdoom_reward_mode", "native"),
-            success_threshold=success_threshold,
-            teacher_mode=getattr(config, "vizdoom_teacher_mode", "auto"),
-            intrinsic_mode=getattr(
-                config, "vizdoom_intrinsic_mode", "score_improvement"
-            ),
-            intrinsic_scale=getattr(config, "vizdoom_intrinsic_scale", 0.01),
-            zoom_factor=getattr(config, "vizdoom_zoom_factor", 1.35),
-            jump_min_gain=getattr(config, "vizdoom_jump_min_gain", 0.015),
-            render_mode=(
-                "human"
-                if getattr(config, "vizdoom_render", False) and mode == "eval"
-                else None
-            ),
+            seed=int(config.seed) + int(id),
+            image_size=int(config.size[0]),
+            frame_skip=int(config.vizdoom_frame_skip),
+            reward_mode=config.vizdoom_reward_mode,
+            success_threshold=float(config.vizdoom_success_threshold),
+            teacher_mode=config.vizdoom_teacher_mode,
+            render_mode=None,
         )
         env = wrappers.OneHotAction(env)
 
     else:
         raise NotImplementedError(suite)
-    
-    # env = wrappers.TimeLimit(env, config.time_limit)
+
     env = wrappers.SelectAction(env, key="action")
     env = wrappers.UUID(env)
-
     return env
 
 
@@ -224,11 +272,15 @@ def main(config): # config is namespace
     if config.deterministic_run:
         tools.enable_deterministic_run()
 
-    logdir = pathlib.Path(config.logdir).expanduser() 
-    logdir = logdir / config.task
-    logdir = logdir / 'seed_{}'.format(config.seed)
-    timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
-    logdir = logdir / timestamp
+    logdir = pathlib.Path(config.logdir).expanduser()
+    # 增加一个判断：如果传入的 logdir 中还不包含 seed_，说明是新开训练，生成新路径；
+    # 否则说明用户直接传入了旧的时间戳断点目录，直接使用即可。
+    if "seed_" not in str(logdir): 
+        logdir = logdir / config.task
+        logdir = logdir / 'seed_{}'.format(config.seed)
+        timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
+        logdir = logdir / timestamp
+        
     config.logdir = logdir
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
@@ -264,9 +316,9 @@ def main(config): # config is namespace
         from envs.tasks import get_specs
 
         kwargs = dict(target_item=config.target_item)
-        _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
+        task_id, task_specs, sim_specs = get_specs(task, **kwargs)
         config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
-        task_specs["concentration_specs"]["max_steps"] = config.episode_max_steps
+        task_specs["concentration_specs"]["max_steps"] = task_specs["terminal_specs"]["max_steps"]
         task_specs["concentration_specs"]["gaussian_reward_weight"] = config.gaussian_reward_weight
         task_specs["concentration_specs"]["gaussian_sigma_weight"] = config.gaussian_sigma_weight
         task_specs["clip_specs"]["target_object"] = (
@@ -275,10 +327,12 @@ def main(config): # config is namespace
             else task_specs["success_specs"]["any"]["item"]["type"]
         )
     elif suite == "vizdoom":
-        import envs.vizdoom as vizdoom
+        from envs.vizdoom import episode_max_steps
 
-        config.episode_max_steps = vizdoom.episode_max_steps(
-            task, getattr(config, "vizdoom_frame_skip", 4)
+        # max_steps must be expressed in Dreamer decisions; frame_skip is
+        # already handled inside the ViZDoom Gymnasium environment.
+        config.episode_max_steps = episode_max_steps(
+            task, config.vizdoom_frame_skip
         )
     else:
         raise NotImplementedError(suite)
@@ -295,8 +349,6 @@ def main(config): # config is namespace
     acts = train_envs[0].action_space
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
@@ -327,9 +379,7 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
@@ -339,8 +389,8 @@ def main(config): # config is namespace
         print(f"Logger: ({logger.step} steps).")
 
     print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
+    train_dataset = make_dataset(train_eps, config, training=True)
+    eval_dataset = make_dataset(eval_eps, config, training=False)
     agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,
@@ -371,9 +421,7 @@ def main(config): # config is namespace
                 eval_eps,
                 config.evaldir,
                 logger,
-                step_calculator,
                 config.episode_max_steps,
-                config.discount,
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
@@ -390,9 +438,7 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
-            step_calculator,
             config.episode_max_steps,
-            config.discount,
             limit=config.dataset_size,
             steps=config.eval_every, 
             state=state,
@@ -406,14 +452,17 @@ def main(config): # config is namespace
         
         torch.save(items_to_save, logdir / "latest.pt")
 
-        # Keep publication-grade historical checkpoints instead of only
-        # overwriting latest.pt. This does not change training gradients.
-        checkpoint_every = int(getattr(config, "checkpoint_every", 0))
-        if checkpoint_every > 0 and int(agent._step) % checkpoint_every == 0:
-            torch.save(
-                items_to_save,
-                logdir / f"checkpoint_{int(agent._step)}.pt",
-            )
+        # Publication-grade historical checkpoints for independent evaluation.
+        # Save every 100k environment steps without changing optimization.
+        current_step = int(agent._step)
+        previous_step = max(0, current_step - int(config.eval_every))
+        crossed_100k_boundary = (
+            current_step // 100000 > previous_step // 100000
+        )
+        if current_step > 0 and crossed_100k_boundary:
+            # With prefill=2500 the actual checkpoints are typically 102.5k,
+            # 202.5k, ...; use the true environment step in the filename.
+            torch.save(items_to_save, logdir / f"checkpoint_{current_step}.pt")
 
     for env in train_envs + eval_envs:
         try:
