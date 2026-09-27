@@ -10,22 +10,12 @@ from datetime import datetime
 import tools
 from parallel import Parallel, Damy
 
-from expr import DreamerV3Agent, make_env, make_dataset
+from expr import LS_Imagine, make_env, make_dataset
 
 os.environ["MUJOCO_GL"] = "osmesa"
 sys.path.append(str(pathlib.Path(__file__).parent))
 
 to_np = lambda x: x.detach().cpu().numpy()
-
-
-def load_yaml_config(path):
-    """Load YAML with both ruamel.yaml 0.17 and 0.18+ APIs."""
-    text = pathlib.Path(path).read_text()
-    try:
-        return yaml.safe_load(text)
-    except AttributeError:
-        loader = yaml.YAML(typ="safe", pure=True)
-        return loader.load(text)
 
 def main(config):
 
@@ -63,9 +53,16 @@ def main(config):
         kwargs = dict(target_item=config.target_item)
         _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
         config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
+        task_specs["concentration_specs"]["max_steps"] = config.episode_max_steps
+        task_specs["concentration_specs"]["gaussian_reward_weight"] = config.gaussian_reward_weight
+        task_specs["concentration_specs"]["gaussian_sigma_weight"] = config.gaussian_sigma_weight
+        task_specs["clip_specs"]["target_object"] = (
+            task_specs["success_specs"]["all"]["item"]["type"]
+            if "all" in task_specs["success_specs"]
+            else task_specs["success_specs"]["any"]["item"]["type"]
+        )
     elif suite == "vizdoom":
         import envs.vizdoom as vizdoom
-
         config.episode_max_steps = vizdoom.episode_max_steps(
             task, getattr(config, "vizdoom_frame_skip", 4)
         )
@@ -81,12 +78,13 @@ def main(config):
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
+    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
     print("Start evaluation.")
     eval_dataset = make_dataset(eval_eps, config)
-    agent = DreamerV3Agent(
+    agent = LS_Imagine(
         eval_envs[0].observation_space,
         eval_envs[0].action_space,
         config,
@@ -115,7 +113,9 @@ def main(config):
             eval_eps,
             config.evaldir,
             logger,
+            step_calculator,
             config.episode_max_steps,
+            config.discount,
             is_eval=True,
             episodes=config.eval_episode_num,
             is_training=False,
@@ -138,8 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
 
-    configs = load_yaml_config(
-        pathlib.Path(sys.argv[0]).parent / "configs.yaml"
+    configs = yaml.safe_load(
+        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
     )
 
     def recursive_update(base, update):

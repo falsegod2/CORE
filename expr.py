@@ -22,19 +22,9 @@ sys.path.append(str(pathlib.Path(__file__).parent))
 to_np = lambda x: x.detach().cpu().numpy()
 
 
-def load_yaml_config(path):
-    """Load YAML with both ruamel.yaml 0.17 and 0.18+ APIs."""
-    text = pathlib.Path(path).read_text()
-    try:
-        return yaml.safe_load(text)
-    except AttributeError:
-        loader = yaml.YAML(typ="safe", pure=True)
-        return loader.load(text)
-
-
-class DreamerV3Agent(nn.Module):
+class LS_Imagine(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
-        super().__init__()
+        super(LS_Imagine, self).__init__()
         self._config = config
         self._logger = logger
         self._should_log = tools.Every(config.log_every)
@@ -98,7 +88,7 @@ class DreamerV3Agent(nn.Module):
         embed = self._wm.encoder(obs)
         latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
         if self._config.eval_state_mean:
-            latent["stoch"] = self._wm.dynamics.get_dist(latent).mode()
+            latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
             actor = self._task_behavior.actor(feat)
@@ -122,13 +112,14 @@ class DreamerV3Agent(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, _, context, mets = self._wm._train(data)
+        post, post_zoomed, context, mets = self._wm._train(data)
         metrics.update(mets)
+        # start = (post, post_zoomed)
 
-        # Detached baseline diagnostics. They are deliberately executed outside
-        # the compiled world-model training graph and only at the configured
-        # interval. They never enter any optimizer/loss.
-        diag_cfg = getattr(self._config, "dreamer_diagnostics", {})
+        # Detached mechanism diagnostics.  They are deliberately evaluated
+        # outside the world-model loss/optimizer and only at a sparse cadence.
+        # This keeps LS-Imagine's training behavior unchanged.
+        diag_cfg = getattr(self._config, "ls_diagnostics", {})
         diag_every = max(1, int(diag_cfg.get("every", 16)))
         if bool(diag_cfg.get("enabled", False)) and self._update_count % diag_every == 0:
             wm_for_diag = getattr(self._wm, "_orig_mod", self._wm)
@@ -138,15 +129,27 @@ class DreamerV3Agent(nn.Module):
             self._wm.dynamics.get_feat(s)
         ).mode()
 
-        mineclip_reward = lambda f, s, a: self._wm.heads["mineclip_reward"](
+        intrinsic = lambda f, s, a: self._wm.heads["intrinsic"](
             self._wm.dynamics.get_feat(s)
         ).mode() 
+
+        jumping_steps = lambda f, s, a: self._wm.heads["jumping_steps"](
+            f
+        ).mean().clamp_min(1).int()
+
+        accumulated_reward = lambda f, s, a: self._wm.heads["accumulated_reward"](
+            f
+        ).mode()
+
+        jump_indicator = lambda s: self._wm.heads["jump"](
+            self._wm.dynamics.get_feat(s)
+        ).mean
 
         is_end = lambda s: self._wm.heads["end"](
             self._wm.dynamics.get_feat(s)
         ).mean
 
-        metrics.update(self._task_behavior._train(post, reward, mineclip_reward, is_end)[-1])
+        metrics.update(self._task_behavior._train(post, post_zoomed, reward, intrinsic, jumping_steps, accumulated_reward, jump_indicator, is_end)[-1])
         if self._config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(post, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
@@ -179,7 +182,8 @@ def make_env(config, mode, id):
     elif suite == "vizdoom":
         import envs.vizdoom as vizdoom
 
-        # Keep evaluation stochasticity independent from the training stream.
+        # Use an independent evaluation RNG stream while keeping all methods
+        # on the same seed convention.
         seed_offset = 10000 if mode == "eval" else 0
         success_threshold = getattr(config, "vizdoom_success_threshold", -1.0)
         env = vizdoom.make_env(
@@ -189,9 +193,16 @@ def make_env(config, mode, id):
             frame_skip=getattr(config, "vizdoom_frame_skip", 4),
             reward_mode=getattr(config, "vizdoom_reward_mode", "native"),
             success_threshold=success_threshold,
-            teacher_mode=getattr(config, "vizdoom_diagnostic_teacher_mode", "auto"),
+            teacher_mode=getattr(config, "vizdoom_teacher_mode", "auto"),
+            intrinsic_mode=getattr(
+                config, "vizdoom_intrinsic_mode", "score_improvement"
+            ),
+            intrinsic_scale=getattr(config, "vizdoom_intrinsic_scale", 0.01),
+            zoom_factor=getattr(config, "vizdoom_zoom_factor", 1.35),
+            jump_min_gain=getattr(config, "vizdoom_jump_min_gain", 0.015),
             render_mode=(
-                "human" if getattr(config, "vizdoom_render", False) and mode == "eval"
+                "human"
+                if getattr(config, "vizdoom_render", False) and mode == "eval"
                 else None
             ),
         )
@@ -213,15 +224,11 @@ def main(config): # config is namespace
     if config.deterministic_run:
         tools.enable_deterministic_run()
 
-    logdir = pathlib.Path(config.logdir).expanduser()
-    # 增加一个判断：如果传入的 logdir 中还不包含 seed_，说明是新开训练，生成新路径；
-    # 否则说明用户直接传入了旧的时间戳断点目录，直接使用即可。
-    if "seed_" not in str(logdir): 
-        logdir = logdir / config.task
-        logdir = logdir / 'seed_{}'.format(config.seed)
-        timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
-        logdir = logdir / timestamp
-        
+    logdir = pathlib.Path(config.logdir).expanduser() 
+    logdir = logdir / config.task
+    logdir = logdir / 'seed_{}'.format(config.seed)
+    timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
+    logdir = logdir / timestamp
     config.logdir = logdir
     config.traindir = config.traindir or logdir / "train_eps"
     config.evaldir = config.evaldir or logdir / "eval_eps"
@@ -259,6 +266,14 @@ def main(config): # config is namespace
         kwargs = dict(target_item=config.target_item)
         _task_id, task_specs, _sim_specs = get_specs(task, **kwargs)
         config.episode_max_steps = task_specs["terminal_specs"]["max_steps"]
+        task_specs["concentration_specs"]["max_steps"] = config.episode_max_steps
+        task_specs["concentration_specs"]["gaussian_reward_weight"] = config.gaussian_reward_weight
+        task_specs["concentration_specs"]["gaussian_sigma_weight"] = config.gaussian_sigma_weight
+        task_specs["clip_specs"]["target_object"] = (
+            task_specs["success_specs"]["all"]["item"]["type"]
+            if "all" in task_specs["success_specs"]
+            else task_specs["success_specs"]["any"]["item"]["type"]
+        )
     elif suite == "vizdoom":
         import envs.vizdoom as vizdoom
 
@@ -267,7 +282,7 @@ def main(config): # config is namespace
         )
     else:
         raise NotImplementedError(suite)
-    
+
     train_envs = [make("train", i) for i in range(config.envs)]
     eval_envs = [make("eval", i) for i in range(config.envs)]
 
@@ -280,6 +295,8 @@ def main(config): # config is namespace
     acts = train_envs[0].action_space
 
     config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+
+    step_calculator = tools.ScoreStorage(max_steps=config.episode_max_steps)
 
     state = None
 
@@ -310,7 +327,9 @@ def main(config): # config is namespace
             train_eps,
             config.traindir,
             logger,
+            step_calculator,
             config.episode_max_steps,
+            config.discount,
             limit=config.dataset_size,
             steps=prefill,
             is_training=False,
@@ -322,7 +341,7 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = DreamerV3Agent(
+    agent = LS_Imagine(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,
@@ -352,7 +371,9 @@ def main(config): # config is namespace
                 eval_eps,
                 config.evaldir,
                 logger,
+                step_calculator,
                 config.episode_max_steps,
+                config.discount,
                 is_eval=True,
                 episodes=config.eval_episode_num,
                 is_training=False,
@@ -364,12 +385,14 @@ def main(config): # config is namespace
         print("Start training.")
 
         state = tools.simulate(
-            agent,
+            agent, # LS_Imagine
             train_envs, 
             train_eps,
             config.traindir,
             logger,
+            step_calculator,
             config.episode_max_steps,
+            config.discount,
             limit=config.dataset_size,
             steps=config.eval_every, 
             state=state,
@@ -383,11 +406,13 @@ def main(config): # config is namespace
         
         torch.save(items_to_save, logdir / "latest.pt")
 
-        # Keep publication-grade historical checkpoints for independent evaluation.
-        if agent._step % 100000 == 0:
+        # Keep publication-grade historical checkpoints instead of only
+        # overwriting latest.pt. This does not change training gradients.
+        checkpoint_every = int(getattr(config, "checkpoint_every", 0))
+        if checkpoint_every > 0 and int(agent._step) % checkpoint_every == 0:
             torch.save(
                 items_to_save,
-                logdir / f"checkpoint_{agent._step}.pt",
+                logdir / f"checkpoint_{int(agent._step)}.pt",
             )
 
     for env in train_envs + eval_envs:
@@ -404,8 +429,8 @@ if __name__ == "__main__":
     parser.add_argument("--configs", nargs="+")
     args, remaining = parser.parse_known_args()
 
-    configs = load_yaml_config(
-        pathlib.Path(sys.argv[0]).parent / "configs.yaml"
+    configs = yaml.safe_load(
+        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
     )
 
     def recursive_update(base, update):

@@ -11,14 +11,6 @@ import tools
 
 
 class RSSM(nn.Module):
-    """Standard single-stream DreamerV3 recurrent state-space model.
-
-    State dictionary:
-      - deter: deterministic recurrent state h_t
-      - stoch: stochastic categorical/continuous state z_t
-      - logit, or mean/std: distribution parameters
-    """
-
     def __init__(
         self,
         stoch=30,
@@ -37,235 +29,295 @@ class RSSM(nn.Module):
         embed=None,
         device=None,
     ):
-        super().__init__()
-        if num_actions is None or embed is None or device is None:
-            raise ValueError("num_actions, embed, and device must be provided")
-
+        super(RSSM, self).__init__()
         self._stoch = stoch
         self._deter = deter
         self._hidden = hidden
         self._min_std = min_std
         self._rec_depth = rec_depth
         self._discrete = discrete
+        act = getattr(torch.nn, act)
         self._mean_act = mean_act
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions
+        self._num_actions = num_actions + 1
         self._embed = embed
         self._device = device
-        act_fn = getattr(torch.nn, act)
 
-        stoch_size = self._stoch * self._discrete if self._discrete else self._stoch
-        self._img_in_layers = nn.Sequential(
-            nn.Linear(stoch_size + self._num_actions, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        inp_layers = []
+        if self._discrete:
+            inp_dim = self._stoch * self._discrete + num_actions + 1
+        else:
+            inp_dim = self._stoch + num_actions + 1
+        inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        inp_layers.append(act())
+        self._img_in_layers = nn.Sequential(*inp_layers)
         self._img_in_layers.apply(tools.weight_init)
-
         self._cell = GRUCell(self._hidden, self._deter, norm=norm)
         self._cell.apply(tools.weight_init)
 
-        self._img_out_layers = nn.Sequential(
-            nn.Linear(self._deter, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        img_out_layers = []
+        inp_dim = self._deter
+        img_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            img_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        img_out_layers.append(act())
+        self._img_out_layers = nn.Sequential(*img_out_layers)
         self._img_out_layers.apply(tools.weight_init)
 
-        self._obs_out_layers = nn.Sequential(
-            nn.Linear(self._deter + self._embed, self._hidden, bias=False),
-            *([nn.LayerNorm(self._hidden, eps=1e-3)] if norm else []),
-            act_fn(),
-        )
+        obs_out_layers = []
+        inp_dim = self._deter + self._embed
+        obs_out_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
+        if norm:
+            obs_out_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))
+        obs_out_layers.append(act())
+        self._obs_out_layers = nn.Sequential(*obs_out_layers)
         self._obs_out_layers.apply(tools.weight_init)
 
-        stat_size = self._stoch * self._discrete if self._discrete else 2 * self._stoch
-        self._imgs_stat_layer = nn.Linear(self._hidden, stat_size)
-        self._obs_stat_layer = nn.Linear(self._hidden, stat_size)
-        self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
-        self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        if self._discrete:
+            self._imgs_stat_layer = nn.Linear(
+                self._hidden, self._stoch * self._discrete
+            )
+            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer = nn.Linear(self._hidden, self._stoch * self._discrete)
+            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
+        else:
+            self._imgs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._imgs_stat_layer.apply(tools.uniform_weight_init(1.0))
+            self._obs_stat_layer = nn.Linear(self._hidden, 2 * self._stoch)
+            self._obs_stat_layer.apply(tools.uniform_weight_init(1.0))
 
         if self._initial == "learned":
-            self.W = nn.Parameter(
-                torch.zeros((1, self._deter), device=torch.device(self._device))
+            self.W = torch.nn.Parameter(
+                torch.zeros((1, self._deter), device=torch.device(self._device)),
+                requires_grad=True,
             )
 
     def initial(self, batch_size):
-        deter = torch.zeros(batch_size, self._deter, device=self._device)
+        deter = torch.zeros(batch_size, self._deter).to(self._device)
         if self._discrete:
-            state = {
-                "logit": torch.zeros(
-                    batch_size, self._stoch, self._discrete, device=self._device
+            state = dict(
+                logit=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
                 ),
-                "stoch": torch.zeros(
-                    batch_size, self._stoch, self._discrete, device=self._device
+                stoch=torch.zeros([batch_size, self._stoch, self._discrete]).to(
+                    self._device
                 ),
-                "deter": deter,
-            }
+                deter=deter,
+            )
         else:
-            state = {
-                "mean": torch.zeros(batch_size, self._stoch, device=self._device),
-                "std": torch.zeros(batch_size, self._stoch, device=self._device),
-                "stoch": torch.zeros(batch_size, self._stoch, device=self._device),
-                "deter": deter,
-            }
-
+            state = dict(
+                mean=torch.zeros([batch_size, self._stoch]).to(self._device),
+                std=torch.zeros([batch_size, self._stoch]).to(self._device),
+                stoch=torch.zeros([batch_size, self._stoch]).to(self._device),
+                deter=deter,
+            )
         if self._initial == "zeros":
             return state
-        if self._initial == "learned":
+        elif self._initial == "learned":
             state["deter"] = torch.tanh(self.W).repeat(batch_size, 1)
             state["stoch"] = self.get_stoch(state["deter"])
-            stats = self._suff_stats_layer("ims", self._img_out_layers(state["deter"]))
-            state.update(stats)
             return state
-        raise NotImplementedError(self._initial)
+        else:
+            raise NotImplementedError(self._initial)
 
     def observe(self, embed, action, is_first, state=None):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        # (batch, time, ch) -> (time, batch, ch)
         embed, action, is_first = swap(embed), swap(action), swap(is_first)
+        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
         post, prior = tools.static_scan(
-            lambda prev, prev_action, current_embed, first: self.obs_step(
-                prev[0], prev_action, current_embed, first
+            lambda prev_state, prev_act, embed, is_first: self.obs_step(
+                prev_state[0], prev_act, embed, is_first
             ),
             (action, embed, is_first),
             (state, state),
         )
-        return (
-            {key: swap(value) for key, value in post.items()},
-            {key: swap(value) for key, value in prior.items()},
+
+        # (batch, time, stoch, discrete_num) -> (batch, time, stoch, discrete_num)
+        post = {k: swap(v) for k, v in post.items()}
+        prior = {k: swap(v) for k, v in prior.items()}
+
+        return post, prior
+
+    def observe_zoomed(self, embed_zoomed, action_zoomed, is_first_zoomed, rely_post, rely_prior):
+        swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        # (batch, time, ch) -> (time, batch, ch)
+        embed_zoomed, action_zoomed, is_first_zoomed = swap(embed_zoomed), swap(action_zoomed), swap(is_first_zoomed)
+
+        rely_post = {k: swap(v) for k, v in rely_post.items()}
+        rely_prior = {k: swap(v) for k, v in rely_prior.items()}
+
+        # prev_state[0] means selecting posterior of return(posterior, prior) from obs_step
+        post_zoomed, prior_zoomed = tools.static_scan_zoomed(
+            lambda rely_state, prev_act, embed_zoomed, is_first_zoomed: self.obs_step(
+                rely_state, prev_act, embed_zoomed, is_first_zoomed
+            ),
+            (action_zoomed, embed_zoomed, is_first_zoomed), 
+            (rely_post, rely_prior),
         )
+
+        post_zoomed = {k: swap(v) for k, v in post_zoomed.items()}
+        prior_zoomed = {k: swap(v) for k, v in prior_zoomed.items()}
+
+        return post_zoomed, prior_zoomed
 
     def imagine_with_action(self, action, state):
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
+        assert isinstance(state, dict), state
         action = swap(action)
-        prior = tools.static_scan(self.img_step, [action], state)[0]
-        return {key: swap(value) for key, value in prior.items()}
+        prior = tools.static_scan(self.img_step, [action], state)
+        prior = prior[0]
+        prior = {k: swap(v) for k, v in prior.items()}
+        return prior
 
     def get_feat(self, state):
         stoch = state["stoch"]
         if self._discrete:
-            stoch = stoch.reshape(
-                list(stoch.shape[:-2]) + [self._stoch * self._discrete]
-            )
+            shape = list(stoch.shape[:-2]) + [self._stoch * self._discrete]
+            stoch = stoch.reshape(shape)
         return torch.cat([stoch, state["deter"]], -1)
 
     def get_dist(self, state, dtype=None):
-        del dtype
         if self._discrete:
-            return torchd.independent.Independent(
-                tools.OneHotDist(
-                    state["logit"], unimix_ratio=self._unimix_ratio
-                ),
-                1,
+            logit = state["logit"]
+            dist = torchd.independent.Independent(
+                tools.OneHotDist(logit, unimix_ratio=self._unimix_ratio), 1
             )
-        return tools.ContDist(
-            torchd.independent.Independent(
-                torchd.normal.Normal(state["mean"], state["std"]), 1
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = tools.ContDist(
+                torchd.independent.Independent(torchd.normal.Normal(mean, std), 1)
             )
-        )
+        return dist
 
     def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
-        batch_size = len(is_first)
-        if prev_state is None or torch.sum(is_first) == batch_size:
-            prev_state = self.initial(batch_size)
-            prev_action = torch.zeros(
-                batch_size, self._num_actions, device=self._device
-            )
-        elif torch.sum(is_first) > 0:
-            first = is_first[:, None]
-            prev_action = prev_action * (1.0 - first)
-            initial = self.initial(batch_size)
-            prev_state = dict(prev_state)
-            for key, value in prev_state.items():
-                first_r = torch.reshape(
-                    first,
-                    first.shape + (1,) * (len(value.shape) - len(first.shape)),
-                )
-                prev_state[key] = value * (1.0 - first_r) + initial[key] * first_r
+        if prev_action is not None and prev_action.shape[-1] != self._num_actions:
+            shape = prev_action.shape
+            new_shape = list(shape[:-1]) + [1]
+            zero_tensor = torch.zeros(*new_shape).to(prev_action.device)
+            prev_action = torch.cat((prev_action, zero_tensor), dim=-1)
 
-        prior = self.img_step(prev_state, prev_action, sample=sample)
-        x = self._obs_out_layers(torch.cat([prior["deter"], embed], -1))
+
+        if prev_state == None or torch.sum(is_first) == len(is_first):
+            prev_state = self.initial(len(is_first))
+            prev_action = torch.zeros((len(is_first), self._num_actions)).to(
+                self._device
+            )
+            # prev_action.requires_grad_()
+        # overwrite the prev_state only where is_first=True
+        elif torch.sum(is_first) > 0:
+            is_first = is_first[:, None]
+            prev_action *= 1.0 - is_first
+            init_state = self.initial(len(is_first))
+            for key, val in prev_state.items():
+                is_first_r = torch.reshape(
+                    is_first,
+                    is_first.shape + (1,) * (len(val.shape) - len(is_first.shape)),
+                )
+                prev_state[key] = (
+                    val * (1.0 - is_first_r) + init_state[key] * is_first_r
+                )
+
+        prior = self.img_step(prev_state, prev_action)
+        x = torch.cat([prior["deter"], embed], -1)
+        # (batch_size, prior_deter + embed) -> (batch_size, hidden)
+        x = self._obs_out_layers(x)
+        # (batch_size, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("obs", x)
-        dist = self.get_dist(stats)
-        stoch = dist.sample() if sample else dist.mode()
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
 
     def img_step(self, prev_state, prev_action, sample=True):
+        # (batch, stoch, discrete_num)
         prev_stoch = prev_state["stoch"]
         if self._discrete:
-            prev_stoch = prev_stoch.reshape(
-                list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            )
-        x = self._img_in_layers(torch.cat([prev_stoch, prev_action], -1))
-        deter = prev_state["deter"]
-        for _ in range(self._rec_depth):
-            x, deter_state = self._cell(x, [deter])
-            deter = deter_state[0]
+            shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
+            # (batch, stoch, discrete_num) -> (batch, stoch * discrete_num)
+            prev_stoch = prev_stoch.reshape(shape)
+        # (batch, stoch * discrete_num) -> (batch, stoch * discrete_num + action)
+        x = torch.cat([prev_stoch, prev_action], -1)
+        # (batch, stoch * discrete_num + action, embed) -> (batch, hidden)
+        x = self._img_in_layers(x)
+        for _ in range(self._rec_depth):  # rec depth is not correctly implemented
+            deter = prev_state["deter"]
+            # (batch, hidden), (batch, deter) -> (batch, deter), (batch, deter)
+            x, deter = self._cell(x, [deter])
+            deter = deter[0]  # Keras wraps the state in a list.
+        # (batch, deter) -> (batch, hidden)
         x = self._img_out_layers(x)
+        # (batch, hidden) -> (batch_size, stoch, discrete_num)
         stats = self._suff_stats_layer("ims", x)
-        dist = self.get_dist(stats)
-        stoch = dist.sample() if sample else dist.mode()
-        return {"stoch": stoch, "deter": deter, **stats}
+        if sample:
+            stoch = self.get_dist(stats).sample()
+        else:
+            stoch = self.get_dist(stats).mode()
+        prior = {"stoch": stoch, "deter": deter, **stats}
+        return prior
 
     def get_stoch(self, deter):
         x = self._img_out_layers(deter)
         stats = self._suff_stats_layer("ims", x)
-        return self.get_dist(stats).mode()
+        dist = self.get_dist(stats)
+        return dist.mode()
 
     def _suff_stats_layer(self, name, x):
-        if name == "ims":
-            x = self._imgs_stat_layer(x)
-        elif name == "obs":
-            x = self._obs_stat_layer(x)
-        else:
-            raise NotImplementedError(name)
-
         if self._discrete:
-            return {
-                "logit": x.reshape(
-                    list(x.shape[:-1]) + [self._stoch, self._discrete]
-                )
-            }
-
-        mean, std = torch.split(x, [self._stoch] * 2, -1)
-        mean = {
-            "none": lambda: mean,
-            "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
-        }[self._mean_act]()
-        std = {
-            "softplus": lambda: F.softplus(std),
-            "abs": lambda: torch.abs(std + 1.0),
-            "sigmoid": lambda: torch.sigmoid(std),
-            "sigmoid2": lambda: 2.0 * torch.sigmoid(std / 2.0),
-        }[self._std_act]()
-        return {"mean": mean, "std": std + self._min_std}
+            if name == "ims":
+                x = self._imgs_stat_layer(x)
+            elif name == "obs":
+                x = self._obs_stat_layer(x)
+            else:
+                raise NotImplementedError
+            logit = x.reshape(list(x.shape[:-1]) + [self._stoch, self._discrete])
+            return {"logit": logit}
+        else:
+            if name == "ims":
+                x = self._imgs_stat_layer(x)
+            elif name == "obs":
+                x = self._obs_stat_layer(x)
+            else:
+                raise NotImplementedError
+            mean, std = torch.split(x, [self._stoch] * 2, -1)
+            mean = {
+                "none": lambda: mean,
+                "tanh5": lambda: 5.0 * torch.tanh(mean / 5.0),
+            }[self._mean_act]()
+            std = {
+                "softplus": lambda: torch.softplus(std),
+                "abs": lambda: torch.abs(std + 1),
+                "sigmoid": lambda: torch.sigmoid(std),
+                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
+            }[self._std_act]()
+            std = std + self._min_std
+            return {"mean": mean, "std": std}
 
     def kl_loss(self, post, prior, free, dyn_scale, rep_scale):
         kld = torchd.kl.kl_divergence
-        stop_gradient = lambda state: {
-            key: value.detach() for key, value in state.items()
-        }
+        dist = lambda x: self.get_dist(x)
+        sg = lambda x: {k: v.detach() for k, v in x.items()}
 
-        post_dist = self.get_dist(post)
-        prior_sg_dist = self.get_dist(stop_gradient(prior))
-        post_sg_dist = self.get_dist(stop_gradient(post))
-        prior_dist = self.get_dist(prior)
-
-        if self._discrete:
-            rep_loss = value = kld(post_dist, prior_sg_dist)
-            dyn_loss = kld(post_sg_dist, prior_dist)
-        else:
-            rep_loss = value = kld(post_dist._dist, prior_sg_dist._dist)
-            dyn_loss = kld(post_sg_dist._dist, prior_dist._dist)
-
+        rep_loss = value = kld(
+            dist(post) if self._discrete else dist(post)._dist,
+            dist(sg(prior)) if self._discrete else dist(sg(prior))._dist,
+        )
+        dyn_loss = kld(
+            dist(sg(post)) if self._discrete else dist(sg(post))._dist,
+            dist(prior) if self._discrete else dist(prior)._dist,
+        )
+        # this is implemented using maximum at the original repo as the gradients are not backpropagated for the out of limits.
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
         loss = dyn_scale * dyn_loss + rep_scale * rep_loss
-        return loss, value, dyn_loss, rep_loss
 
+        return loss, value, dyn_loss, rep_loss
 
 class MultiEncoder(nn.Module):
     def __init__(

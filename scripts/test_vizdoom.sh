@@ -1,22 +1,12 @@
-#!/bin/bash
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$ROOT_DIR"
-
-if [ -z "$1" ] || [ -z "$2" ]; then
-  echo "Usage: bash scripts/test_vizdoom.sh <scenario> <checkpoint_dir> [extra args]"
-  echo "Example: bash scripts/test_vizdoom.sh my_way_home ./logdir/vizdoom_my_way_home/seed_0/20260923T120000"
-  exit 1
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+TASK="${1:-my_way_home}"
+SEED="${2:-0}"
+VARIANT="${3:-full}"
+CONFIGS=(vizdoom)
+if [[ "$VARIANT" == "nointrinsic" || "$VARIANT" == "no_intrinsic" ]]; then
+  CONFIGS+=(vizdoom_nointrinsic)
 fi
-SCENARIO="$1"
-CHECKPOINT="$2"
-shift 2
-
-python test.py \
-  --configs vizdoom \
-  --task "vizdoom_${SCENARIO}" \
-  --agent_checkpoint_dir "$CHECKPOINT" \
-  --logdir ./eval_logdir \
-  "$@"
+python test.py --configs "${CONFIGS[@]}" --task "vizdoom_${TASK}" --seed "$SEED" --logdir ./logdir

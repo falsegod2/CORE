@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-light invariance test for detached Dreamer diagnostics."""
+"""Dependency-light invariance test for detached LS-Imagine diagnostics."""
 import pathlib
 import sys
 
@@ -8,11 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
-from dreamer_diagnostics import DreamerDiagnostics
+from ls_diagnostics import LSImagineDiagnostics
 
 
 class DummyDynamics(nn.Module):
-    def __init__(self, actions=3, stoch=4, discrete=4, deter=8):
+    def __init__(self, actions=4, stoch=4, discrete=4, deter=8):
         super().__init__()
         self._discrete = discrete
         self._stoch = stoch
@@ -36,6 +36,7 @@ class DummyDynamics(nn.Module):
 class _Dist:
     def __init__(self, value):
         self.value = value
+
     def mode(self):
         return self.value
 
@@ -44,12 +45,13 @@ class DummyRewardHead(nn.Module):
     def __init__(self, feat_dim):
         super().__init__()
         self.linear = nn.Linear(feat_dim, 1)
+
     def forward(self, x):
         return _Dist(self.linear(x))
 
 
 def main():
-    batch, time, actions, stoch, discrete, deter = 3, 24, 3, 4, 4, 8
+    batch, time, actions, stoch, discrete, deter = 3, 24, 4, 4, 4, 8
     dynamics = DummyDynamics(actions, stoch, discrete, deter)
     feat_dim = stoch * discrete + deter
     reward_head = DummyRewardHead(feat_dim)
@@ -71,26 +73,26 @@ def main():
         "is_first": is_first,
         "reward": reward,
         "heatmap": torch.randint(0, 256, (batch, time, 8, 8, 1), dtype=torch.uint8),
-        "task_score": torch.linspace(0, 1, batch * time).reshape(batch, time, 1),
+        "score": torch.linspace(0, 1, batch * time).reshape(batch, time, 1),
     }
 
-    diag = DreamerDiagnostics(feat_dim, projection_dim=32, task_probe=True)
+    diag = LSImagineDiagnostics(feat_dim, projection_dim=32, task_probe=True)
     rng_before = torch.random.get_rng_state().clone()
     metrics = diag(dynamics, reward_head, posterior, data)
     rng_after = torch.random.get_rng_state().clone()
     assert torch.equal(rng_before, rng_after), "diagnostics changed global RNG"
 
     required = (
-        "dreamer_multistep_cosine_h15",
-        "dreamer_cf_margin_shuffle_h15",
-        "dreamer_return_corr_h4",
-        "dreamer_return_mae_h8",
-        "dreamer_task_probe_acc",
-        "dreamer_reanchor_gain_h15",
+        "ls_multistep_cosine_h15",
+        "ls_cf_margin_shuffle_h15",
+        "ls_return_corr_h4",
+        "ls_return_mae_h8",
+        "ls_task_probe_acc",
+        "ls_reanchor_gain_h15",
     )
     for key in required:
         assert key in metrics, key
-    print("PASS: detached Dreamer diagnostics")
+    print("PASS: detached LS-Imagine diagnostics")
     print("PASS: global torch RNG unchanged")
     for key in required:
         print(f"{key}: {float(metrics[key]):.6f}")

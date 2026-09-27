@@ -1,14 +1,21 @@
-"""ViZDoom -> DreamerV3 pixel-only environment adapter.
+"""ViZDoom adapter for LS-Imagine.
 
-The rest of this repository uses the legacy Gym 4-tuple API and legacy
-``gym.spaces`` objects. Current ViZDoom releases expose Gymnasium. This module
-keeps that incompatibility local: it owns the Gymnasium environment and
-exports the same old-style interface as the existing MineDojo wrapper.
+This module bridges the current Gymnasium ViZDoom API to the legacy Gym-style
+interface used by this repository.  It preserves LS-Imagine's environment-
+dependent inputs instead of zeroing them out:
 
-Only RGB pixels are consumed by Dreamer. Diagnostic-only ``heatmap`` and
-``task_score`` fields may be stored in replay, but encoder/decoder regexes remain
-``^image$`` and no diagnostic enters a training loss. ViZDoom game variables,
-labels, depth, and automap buffers are intentionally excluded.
+* RGB observation (``image``)
+* task-affordance heatmap (``heatmap``)
+* a mild RGB-only zoomed pseudo-observation for the long-term branch
+* ``jump`` / ``is_zoomed`` labels
+* score pairs used by ``ScoreStorage`` to recover jumping steps and accumulated
+  reward targets
+
+For MyWayHome and DeadlyCorridor the task-specific teacher is an RGB-only
+"green goal" detector.  It never reads depth, labels, automap, game variables,
+or agent coordinates.  Other scenarios are supported for interface testing but
+use teacher_mode='none' by default; they should not be presented as a full
+LS-Imagine evaluation until a task-equivalent semantic teacher is supplied.
 """
 
 import math
@@ -18,8 +25,6 @@ import gym
 import numpy as np
 
 
-# Current ViZDoom uses -v1 IDs. -v0 is kept as a compatibility fallback for
-# older 1.2/early-1.3 installations.
 _SCENARIOS = {
     "basic": {
         "env_ids": ("VizdoomBasic-v1", "VizdoomBasic-v0"),
@@ -49,7 +54,7 @@ _SCENARIOS = {
         "env_ids": ("VizdoomPredictPosition-v1", "VizdoomPredictPosition-v0"),
         "timeout_tics": 300,
         "success_threshold": 0.5,
-        "teacher": "moving_target",
+        "teacher": "none",
     },
 }
 
@@ -71,7 +76,7 @@ def _normalize_task(task):
     task = _ALIASES.get(task, task)
     if task not in _SCENARIOS:
         options = ", ".join(sorted(_SCENARIOS))
-        raise KeyError(f"Unknown ViZDoom task '{task}'. Available: {options}")
+        raise KeyError(f"Unknown ViZDoom task {task!r}. Available: {options}")
     return task
 
 
@@ -80,37 +85,25 @@ def available_tasks():
 
 
 def episode_max_steps(task, frame_skip=1):
-    """Return the scenario timeout in *agent decisions*, not Doom tics."""
     task = _normalize_task(task)
     frame_skip = max(1, int(frame_skip))
     return int(math.ceil(_SCENARIOS[task]["timeout_tics"] / frame_skip))
 
 
 def default_teacher_mode(task):
-    task = _normalize_task(task)
-    return _SCENARIOS[task]["teacher"]
+    return _SCENARIOS[_normalize_task(task)]["teacher"]
 
 
-class VizDoomPixelEnv:
-    """Pixel-only ViZDoom environment using the repository's legacy API.
+class VizDoomLSImagineEnv:
+    """Legacy-Gym interface with LS-Imagine auxiliary observations.
 
     Parameters
     ----------
-    task:
-        One of :func:`available_tasks`.
-    seed:
-        Seed used on the first Gymnasium reset.
-    image_size:
-        Square RGB size given to Dreamer (default 64).
-    frame_skip:
-        Number of Doom tics advanced per agent decision.
-    reward_mode:
-        ``native`` keeps the scenario reward. ``sparse_success`` emits +1 only
-        on the first success event in an episode and 0 otherwise. The latter is
-        useful for explicitly sparse-reward ablations.
-    success_threshold:
-        Optional override for the task-specific single-step reward threshold
-        used only for logging ``success`` / ``first_success_step``.
+    intrinsic_mode:
+        ``score_improvement`` reproduces the *role* of LS-Imagine's semantic
+        intrinsic signal using the environment-compatible RGB teacher.
+        ``none`` emits zero intrinsic reward while leaving affordance/jump/zoom
+        machinery active.  The latter is used by the no-intrinsic ablation.
     """
 
     def __init__(
@@ -122,6 +115,10 @@ class VizDoomPixelEnv:
         reward_mode="native",
         success_threshold=None,
         teacher_mode="auto",
+        intrinsic_mode="score_improvement",
+        intrinsic_scale=0.01,
+        zoom_factor=1.35,
+        jump_min_gain=0.015,
         render_mode=None,
     ):
         task = _normalize_task(task)
@@ -130,39 +127,52 @@ class VizDoomPixelEnv:
         self._seed_pending = True
         self._image_size = int(image_size)
         self._frame_skip = max(1, int(frame_skip))
-        self._reward_mode = str(reward_mode).lower()
+        self._max_steps = episode_max_steps(task, self._frame_skip)
+
+        self._reward_mode = str(reward_mode).strip().lower()
         if self._reward_mode not in ("native", "sparse_success"):
             raise ValueError(
                 "vizdoom_reward_mode must be 'native' or 'sparse_success', "
                 f"got {reward_mode!r}"
             )
-        if teacher_mode is None or str(teacher_mode).lower() == "auto":
+
+        if teacher_mode is None or str(teacher_mode).strip().lower() == "auto":
             teacher_mode = default_teacher_mode(task)
         self._teacher_mode = str(teacher_mode).strip().lower()
-        if self._teacher_mode not in ("green_goal", "moving_target", "none"):
+        if self._teacher_mode not in ("green_goal", "none"):
             raise ValueError(
-                "vizdoom_diagnostic_teacher_mode must be 'auto', 'green_goal', "
-                "'moving_target', or 'none'"
+                "vizdoom_teacher_mode must be auto|green_goal|none, got "
+                f"{teacher_mode!r}"
             )
+
+        self._intrinsic_mode = str(intrinsic_mode).strip().lower()
+        if self._intrinsic_mode not in ("score_improvement", "none"):
+            raise ValueError(
+                "vizdoom_intrinsic_mode must be score_improvement|none, got "
+                f"{intrinsic_mode!r}"
+            )
+        self._intrinsic_scale = float(intrinsic_scale)
+        self._zoom_factor = max(1.0, float(zoom_factor))
+        self._jump_min_gain = max(0.0, float(jump_min_gain))
+
         default_threshold = _SCENARIOS[task]["success_threshold"]
         if success_threshold is None or float(success_threshold) < 0:
             success_threshold = default_threshold
         self._success_threshold = float(success_threshold)
-        self._max_steps = episode_max_steps(task, self._frame_skip)
+
         self._episode_step = 0
         self._success = False
         self._first_success_step = self._max_steps
-        self._teacher_prev_image = None
+        self._best_score = 0.0
+        self._best_zoom_score = 0.0
 
         try:
             import gymnasium as gymnasium
-            # Import is intentionally retained even if unused: ViZDoom performs
-            # Gymnasium environment registration as an import side effect.
+            # Registration side effect.
             from vizdoom import gymnasium_wrapper  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "ViZDoom support requires `pip install vizdoom` and Gymnasium. "
-                "See docs/vizdoom.md."
+                "ViZDoom support requires `pip install \"vizdoom>=1.3.0,<2.0\"`."
             ) from exc
 
         errors = []
@@ -178,49 +188,46 @@ class VizDoomPixelEnv:
                 )
                 self._env_id = env_id
                 break
-            except Exception as exc:  # version fallback; report all failures
+            except Exception as exc:  # allow v1/v0 compatibility fallback
                 errors.append(f"{env_id}: {type(exc).__name__}: {exc}")
         if self._env is None:
-            details = "\n".join(errors)
             raise RuntimeError(
-                f"Could not create ViZDoom scenario '{task}'. Tried:\n{details}"
+                f"Could not create ViZDoom scenario {task!r}. Tried:\n"
+                + "\n".join(errors)
             )
 
-        # Dreamer expects legacy gym.spaces, so do not expose Gymnasium spaces.
         n = getattr(self._env.action_space, "n", None)
         if n is None:
             raise TypeError(
                 f"{self._env_id} did not expose a Discrete action space. "
-                "This adapter intentionally uses max_buttons_pressed=1 so all "
-                "algorithms share a compact categorical action space."
+                "LS-Imagine uses max_buttons_pressed=1 so that the real-action "
+                "branch remains categorical; the extra jump action is still "
+                "reserved internally by its RSSM."
             )
         self.action_space = gym.spaces.Discrete(int(n))
         self.action_space.discrete = True
+
+        # These shapes intentionally mirror LSImagineWrapper.  The replay item
+        # for heatmap is HxW; WorldModel.preprocess appends the singleton
+        # channel, exactly as in the MineDojo path.
+        s = self._image_size
         self.observation_space = gym.spaces.Dict(
             {
-                "image": gym.spaces.Box(
-                    0, 255,
-                    shape=(self._image_size, self._image_size, 3),
-                    dtype=np.uint8,
-                ),
-                # Diagnostic-only RGB teacher outputs. Encoder/decoder regexes
-                # remain '^image$', so Dreamer never consumes these as inputs.
-                "heatmap": gym.spaces.Box(
-                    0, 255,
-                    shape=(self._image_size, self._image_size, 1),
-                    dtype=np.uint8,
-                ),
-                "task_score": gym.spaces.Box(
-                    0.0, 1.0, shape=(1,), dtype=np.float32
-                ),
-                "is_first": gym.spaces.Box(0, 1, shape=(), dtype=np.uint8),
-                "is_last": gym.spaces.Box(0, 1, shape=(), dtype=np.uint8),
-                "is_terminal": gym.spaces.Box(0, 1, shape=(), dtype=np.uint8),
-                # The current clean Dreamer code still defines this head. For
-                # ViZDoom it is a zero target and its loss/reward scales are 0.
-                "mineclip_reward": gym.spaces.Box(
-                    -np.inf, np.inf, shape=(), dtype=np.float32
-                ),
+                "image": gym.spaces.Box(0, 255, shape=(s, s, 3), dtype=np.uint8),
+                "heatmap": gym.spaces.Box(0, 255, shape=(s, s, 1), dtype=np.uint8),
+                "jump": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "is_zoomed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "is_calculated": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "is_first": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "is_last": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "is_terminal": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.uint8),
+                "reward_on_zoomed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "intrinsic": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "intrinsic_on_zoomed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "score": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "score_on_zoomed": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "jumping_steps": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
+                "accumulated_reward": gym.spaces.Box(-np.inf, np.inf, (1,), dtype=np.float32),
             }
         )
 
@@ -232,6 +239,14 @@ class VizDoomPixelEnv:
     def max_episode_steps(self):
         return self._max_steps
 
+    @property
+    def teacher_mode(self):
+        return self._teacher_mode
+
+    @property
+    def intrinsic_mode(self):
+        return self._intrinsic_mode
+
     def reset(self):
         if self._seed_pending:
             raw_obs, _info = self._env.reset(seed=self._seed)
@@ -241,8 +256,15 @@ class VizDoomPixelEnv:
         self._episode_step = 0
         self._success = False
         self._first_success_step = self._max_steps
-        self._teacher_prev_image = None
-        return self._convert_obs(raw_obs, is_first=True, is_last=False, is_terminal=False)
+        self._best_score = 0.0
+        self._best_zoom_score = 0.0
+        return self._convert_obs(
+            raw_obs,
+            native_reward=0.0,
+            is_first=True,
+            is_last=False,
+            is_terminal=False,
+        )
 
     def step(self, action):
         raw_obs, native_reward, terminated, truncated, info = self._env.step(int(action))
@@ -250,20 +272,21 @@ class VizDoomPixelEnv:
         native_reward = float(native_reward)
 
         success_now = native_reward >= self._success_threshold
-        if success_now and not self._success:
+        first_success_event = success_now and not self._success
+        if first_success_event:
             self._success = True
             self._first_success_step = self._episode_step
 
         if self._reward_mode == "native":
             reward = native_reward
-        else:  # sparse_success
-            reward = 1.0 if success_now and self._first_success_step == self._episode_step else 0.0
+        else:
+            reward = 1.0 if first_success_event else 0.0
 
         done = bool(terminated or truncated)
-        # A time-limit truncation is not an environment terminal for Dreamer.
         is_terminal = bool(terminated)
         obs = self._convert_obs(
             raw_obs,
+            native_reward=native_reward,
             is_first=False,
             is_last=done,
             is_terminal=is_terminal,
@@ -275,14 +298,61 @@ class VizDoomPixelEnv:
         info["success"] = bool(success_now)
         info["first_success_step"] = int(self._first_success_step)
         info["native_reward"] = native_reward
-        info["vizdoom_diagnostic_teacher_mode"] = self._teacher_mode
+        info["vizdoom_teacher_mode"] = self._teacher_mode
+        info["vizdoom_intrinsic_mode"] = self._intrinsic_mode
         return obs, np.float32(reward), done, info
 
-    def _convert_obs(self, raw_obs, is_first, is_last, is_terminal):
+    def _convert_obs(self, raw_obs, native_reward, is_first, is_last, is_terminal):
+        image = self._screen(raw_obs)
+        heatmap, score, target = self._teacher(image)
+
+        zoomed_image = None
+        heatmap_on_zoomed = None
+        zoom_score = 0.0
+        is_zoomed = False
+        jump = False
+
+        if target is not None:
+            cx, cy = target
+            zoomed_image = self._zoom_crop(image, cx, cy)
+            heatmap_on_zoomed, zoom_score, _ = self._teacher(zoomed_image)
+            is_zoomed = True
+            jump = bool(zoom_score > score + self._jump_min_gain)
+
+        intrinsic = 0.0
+        intrinsic_on_zoomed = 0.0
+        if self._intrinsic_mode == "score_improvement":
+            if score > self._best_score:
+                intrinsic = self._intrinsic_scale * score
+                self._best_score = score
+            if is_zoomed and zoom_score > self._best_zoom_score:
+                intrinsic_on_zoomed = self._intrinsic_scale * zoom_score
+                self._best_zoom_score = zoom_score
+
+        return {
+            "image": image,
+            "heatmap": heatmap,
+            "jump": np.asarray(jump, dtype=np.uint8),
+            "is_zoomed": np.asarray(is_zoomed, dtype=np.uint8),
+            "is_calculated": np.asarray(False, dtype=np.uint8),
+            "is_first": np.asarray(is_first, dtype=np.uint8),
+            "is_last": np.asarray(is_last, dtype=np.uint8),
+            "is_terminal": np.asarray(is_terminal, dtype=np.uint8),
+            "reward_on_zoomed": np.asarray(native_reward, dtype=np.float32),
+            "intrinsic": np.asarray(intrinsic, dtype=np.float32),
+            "intrinsic_on_zoomed": np.asarray(intrinsic_on_zoomed, dtype=np.float32),
+            # Raw [0,1] semantic score is used only by ScoreStorage pairing.
+            "score": np.asarray(score, dtype=np.float32),
+            "score_on_zoomed": np.asarray(zoom_score, dtype=np.float32),
+            "jumping_steps": np.asarray(float(self._max_steps), dtype=np.float32),
+            "accumulated_reward": np.asarray(0.0, dtype=np.float32),
+            "zoomed_image": zoomed_image,
+            "heatmap_on_zoomed": heatmap_on_zoomed,
+        }
+
+    def _screen(self, raw_obs):
         if not isinstance(raw_obs, dict) or "screen" not in raw_obs:
-            raise KeyError(
-                "ViZDoom Gymnasium observation must contain the 'screen' RGB buffer"
-            )
+            raise KeyError("ViZDoom Gymnasium observation must contain 'screen'.")
         image = np.asarray(raw_obs["screen"])
         if image.ndim == 2:
             image = np.repeat(image[..., None], 3, axis=-1)
@@ -290,30 +360,22 @@ class VizDoomPixelEnv:
             image = np.repeat(image, 3, axis=-1)
         if image.shape[-1] > 3:
             image = image[..., :3]
-        image = cv2.resize(
+        return cv2.resize(
             image.astype(np.uint8),
             (self._image_size, self._image_size),
             interpolation=cv2.INTER_AREA,
         )
-        heatmap, task_score = self._teacher(image)
-        return {
-            "image": image,
-            "heatmap": heatmap[..., None],
-            "task_score": np.asarray([task_score], dtype=np.float32),
-            "is_first": np.asarray(is_first, dtype=np.uint8),
-            "is_last": np.asarray(is_last, dtype=np.uint8),
-            "is_terminal": np.asarray(is_terminal, dtype=np.uint8),
-            "mineclip_reward": np.asarray(0.0, dtype=np.float32),
-        }
 
-    @staticmethod
-    def _top_score(response, fraction=0.02):
-        flat = np.asarray(response, dtype=np.float32).reshape(-1)
-        k = max(1, int(math.ceil(float(fraction) * flat.size)))
-        top = np.partition(flat, flat.size - k)[-k:]
-        return float(np.clip(np.mean(top), 0.0, 1.0))
+    def _teacher(self, image):
+        if self._teacher_mode == "none":
+            return (
+                np.zeros((self._image_size, self._image_size), dtype=np.uint8),
+                0.0,
+                None,
+            )
 
-    def _green_goal_teacher(self, image):
+        # Same RGB-only green-goal semantics used for the Stable V1.2 ViZDoom
+        # adapter.  Hue/saturation/value produce a continuous affordance target.
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
         hue = hsv[..., 0]
         sat = hsv[..., 1] / 255.0
@@ -324,59 +386,47 @@ class VizDoomPixelEnv:
         response = hue_score * np.power(sat, 1.5) * np.power(val, 0.75)
         response = np.clip(response, 0.0, 1.0)
         response = cv2.GaussianBlur(response, (0, 0), sigmaX=1.0)
-        return np.clip(response, 0.0, 1.0)
+        response = np.clip(response, 0.0, 1.0)
 
-    def _moving_target_teacher(self, image):
-        current = image.astype(np.float32) / 255.0
-        previous_u8 = self._teacher_prev_image
-        if previous_u8 is None:
-            return np.zeros((self._image_size, self._image_size), np.float32)
-        previous = previous_u8.astype(np.float32) / 255.0
-        cur_gray = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        prev_gray = cv2.cvtColor(previous, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        try:
-            (dx, dy), _ = cv2.phaseCorrelate(prev_gray, cur_gray)
-            dx = float(np.clip(dx, -self._image_size / 3, self._image_size / 3))
-            dy = float(np.clip(dy, -self._image_size / 3, self._image_size / 3))
-        except Exception:
-            dx = dy = 0.0
-        candidates = []
-        for sign in (1.0, -1.0):
-            matrix = np.asarray(
-                [[1.0, 0.0, sign * dx], [0.0, 1.0, sign * dy]],
-                dtype=np.float32,
-            )
-            aligned = cv2.warpAffine(
-                previous, matrix, (self._image_size, self._image_size),
-                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101,
-            )
-            residual = np.mean(np.abs(current - aligned), axis=-1)
-            candidates.append((float(np.median(residual)), residual))
-        residual = min(candidates, key=lambda x: x[0])[1]
-        lo = float(np.quantile(residual, 0.70))
-        hi = float(np.quantile(residual, 0.995))
-        denom = max(hi - lo, 1.0e-4)
-        response = np.clip((residual - lo) / denom, 0.0, 1.0)
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
-        sat = hsv[..., 1] / 255.0
-        response *= (0.35 + 0.65 * np.sqrt(np.clip(sat, 0.0, 1.0)))
-        response = cv2.GaussianBlur(response, (0, 0), sigmaX=1.0)
-        response[response < 0.08] = 0.0
-        return np.clip(response, 0.0, 1.0)
+        flat = response.reshape(-1)
+        k = max(1, int(math.ceil(0.02 * flat.size)))
+        top = np.partition(flat, flat.size - k)[-k:]
+        score = float(np.clip(np.mean(top), 0.0, 1.0))
+        heatmap = np.round(response * 255.0).astype(np.uint8)
 
-    def _teacher(self, image):
-        if self._teacher_mode == "none":
-            response = np.zeros((self._image_size, self._image_size), np.float32)
-        elif self._teacher_mode == "green_goal":
-            response = self._green_goal_teacher(image)
-        elif self._teacher_mode == "moving_target":
-            response = self._moving_target_teacher(image)
-        else:
-            raise RuntimeError(self._teacher_mode)
-        task_score = self._top_score(response, fraction=0.02)
-        heatmap = np.round(np.clip(response, 0.0, 1.0) * 255.0).astype(np.uint8)
-        self._teacher_prev_image = image.copy()
-        return heatmap, np.float32(task_score)
+        # Zoom only compact, high-confidence green components.  This suppresses
+        # broad green-ish wall/lighting regions while still reacting to the vest.
+        binary = (response >= 0.35).astype(np.uint8)
+        num, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+        best = None
+        best_quality = -1.0
+        max_area = int(0.12 * self._image_size * self._image_size)
+        for idx in range(1, num):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < 2 or area > max_area:
+                continue
+            component = response[labels == idx]
+            quality = float(component.mean()) * math.sqrt(float(area))
+            if quality > best_quality:
+                best_quality = quality
+                best = centroids[idx]
+
+        target = None if best is None else (float(best[0]), float(best[1]))
+        return heatmap, score, target
+
+    def _zoom_crop(self, image, cx, cy):
+        # Mild zoom: strong enough to define a long-term pseudo-state, but not
+        # so strong that ScoreStorage can never find a later real observation
+        # whose semantic score surpasses score_on_zoomed.
+        s = self._image_size
+        crop = max(8, min(s, int(round(s / self._zoom_factor))))
+        half = crop // 2
+        x0 = int(round(cx)) - half
+        y0 = int(round(cy)) - half
+        x0 = min(max(0, x0), s - crop)
+        y0 = min(max(0, y0), s - crop)
+        patch = image[y0 : y0 + crop, x0 : x0 + crop]
+        return cv2.resize(patch, (s, s), interpolation=cv2.INTER_LINEAR)
 
     def render(self):
         return self._env.render()
@@ -386,4 +436,4 @@ class VizDoomPixelEnv:
 
 
 def make_env(task, **kwargs):
-    return VizDoomPixelEnv(task, **kwargs)
+    return VizDoomLSImagineEnv(task, **kwargs)

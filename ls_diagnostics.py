@@ -1,7 +1,7 @@
-"""Detached internal-state diagnostics for the clean DreamerV3 baseline.
+"""Detached internal-state diagnostics for the LS-Imagine baseline.
 
 These metrics are observation-only.  They never contribute to any loss and
-never update Dreamer parameters.  Deterministic RSSM mode rollouts are used so
+never update LS-Imagine parameters.  Deterministic RSSM mode rollouts are used so
 logging does not consume PyTorch's global RNG state.
 """
 
@@ -38,7 +38,7 @@ class FixedRandomProjector(nn.Module):
         return F.linear(x, weight)
 
 
-class DreamerDiagnostics(nn.Module):
+class LSImagineDiagnostics(nn.Module):
     """Counterfactual, return-quality, and task-separability diagnostics."""
 
     def __init__(
@@ -200,18 +200,18 @@ class DreamerDiagnostics(nn.Module):
             t = self._masked_mean(true_target, mask)
             s = self._masked_mean(shuffle_target, mask)
             z = self._masked_mean(zero_target, mask)
-            metrics[f"dreamer_multistep_cosine_h{step}"] = t
-            metrics[f"dreamer_cf_shuffle_target_cos_h{step}"] = s
-            metrics[f"dreamer_cf_zero_target_cos_h{step}"] = z
-            metrics[f"dreamer_cf_margin_shuffle_h{step}"] = t - s
-            metrics[f"dreamer_cf_margin_zero_h{step}"] = t - z
-            metrics[f"dreamer_cf_response_gap_shuffle_h{step}"] = 1.0 - self._masked_mean(
+            metrics[f"ls_multistep_cosine_h{step}"] = t
+            metrics[f"ls_cf_shuffle_target_cos_h{step}"] = s
+            metrics[f"ls_cf_zero_target_cos_h{step}"] = z
+            metrics[f"ls_cf_margin_shuffle_h{step}"] = t - s
+            metrics[f"ls_cf_margin_zero_h{step}"] = t - z
+            metrics[f"ls_cf_response_gap_shuffle_h{step}"] = 1.0 - self._masked_mean(
                 true_shuffle, mask
             )
-            metrics[f"dreamer_cf_response_gap_zero_h{step}"] = 1.0 - self._masked_mean(
+            metrics[f"ls_cf_response_gap_zero_h{step}"] = 1.0 - self._masked_mean(
                 true_zero, mask
             )
-            metrics[f"dreamer_cf_valid_h{step}"] = mask.float().mean()
+            metrics[f"ls_cf_valid_h{step}"] = mask.float().mean()
         return metrics, true_states
 
     def _return_metrics(
@@ -257,19 +257,19 @@ class DreamerDiagnostics(nn.Module):
             mask = valid_prefix.reshape(-1)
             pred_flat = pred_return.reshape(-1)
             true_flat = true_return.reshape(-1)
-            metrics[f"dreamer_return_corr_h{step}"] = self._masked_corr(
+            metrics[f"ls_return_corr_h{step}"] = self._masked_corr(
                 pred_flat, true_flat, mask, self.eps
             )
-            metrics[f"dreamer_return_mae_h{step}"] = self._masked_mean(
+            metrics[f"ls_return_mae_h{step}"] = self._masked_mean(
                 (pred_flat - true_flat).abs(), mask
             )
-            metrics[f"dreamer_return_pred_std_h{step}"] = self._masked_std(
+            metrics[f"ls_return_pred_std_h{step}"] = self._masked_std(
                 pred_flat, mask
             )
-            metrics[f"dreamer_return_target_std_h{step}"] = self._masked_std(
+            metrics[f"ls_return_target_std_h{step}"] = self._masked_std(
                 true_flat, mask
             )
-            metrics[f"dreamer_return_valid_h{step}"] = mask.float().mean()
+            metrics[f"ls_return_valid_h{step}"] = mask.float().mean()
         return metrics
 
     def _masked_std(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -321,10 +321,10 @@ class DreamerDiagnostics(nn.Module):
         reanchor_target = self._masked_mean((reanchor_p * target_p).sum(-1), mask)
         direct_reanchor = self._masked_mean((direct_p * reanchor_p).sum(-1), mask)
         return {
-            f"dreamer_reanchored_consistency_cos_h{horizon}": direct_reanchor,
-            f"dreamer_reanchor_gain_h{horizon}": reanchor_target - direct_target,
-            f"dreamer_reanchored_target_cos_h{horizon}": reanchor_target,
-            f"dreamer_direct_target_cos_h{horizon}": direct_target,
+            f"ls_reanchored_consistency_cos_h{horizon}": direct_reanchor,
+            f"ls_reanchor_gain_h{horizon}": reanchor_target - direct_target,
+            f"ls_reanchored_target_cos_h{horizon}": reanchor_target,
+            f"ls_direct_target_cos_h{horizon}": direct_target,
         }
 
     def _task_probe_metrics(
@@ -335,12 +335,12 @@ class DreamerDiagnostics(nn.Module):
         data,
         device: torch.device,
     ):
-        if not self.task_probe or "task_score" not in data or "heatmap" not in data:
+        if not self.task_probe or "score" not in data or "heatmap" not in data:
             return {
-                "dreamer_task_probe_available": torch.zeros((), device=device),
+                "ls_task_probe_available": torch.zeros((), device=device),
             }
 
-        task_score = self._as_tensor(data["task_score"], device)
+        task_score = self._as_tensor(data["score"], device)
         if task_score.ndim == 3 and task_score.shape[-1] == 1:
             task_score = task_score[..., 0]
         heatmap = self._as_tensor(data["heatmap"], device)
@@ -367,11 +367,11 @@ class DreamerDiagnostics(nn.Module):
         non_success = evidence[~success]
         if non_success.numel() < 4:
             return {
-                "dreamer_task_probe_available": torch.ones((), device=device),
-                "dreamer_task_probe_acc": torch.zeros((), device=device),
-                "dreamer_task_probe_margin": torch.zeros((), device=device),
-                "dreamer_task_probe_active_classes": torch.zeros((), device=device),
-                "dreamer_task_evidence_span": evidence.max() - evidence.min(),
+                "ls_task_probe_available": torch.ones((), device=device),
+                "ls_task_probe_acc": torch.zeros((), device=device),
+                "ls_task_probe_margin": torch.zeros((), device=device),
+                "ls_task_probe_active_classes": torch.zeros((), device=device),
+                "ls_task_evidence_span": evidence.max() - evidence.min(),
             }
         low = torch.quantile(non_success, 0.30)
         high = torch.quantile(non_success, 0.70)
@@ -412,11 +412,11 @@ class DreamerDiagnostics(nn.Module):
 
         if len(centers) < 2:
             return {
-                "dreamer_task_probe_available": torch.ones((), device=device),
-                "dreamer_task_probe_acc": torch.zeros((), device=device),
-                "dreamer_task_probe_margin": torch.zeros((), device=device),
-                "dreamer_task_probe_active_classes": torch.tensor(float(len(centers)), device=device),
-                "dreamer_task_evidence_span": evidence.max() - evidence.min(),
+                "ls_task_probe_available": torch.ones((), device=device),
+                "ls_task_probe_acc": torch.zeros((), device=device),
+                "ls_task_probe_margin": torch.zeros((), device=device),
+                "ls_task_probe_active_classes": torch.tensor(float(len(centers)), device=device),
+                "ls_task_evidence_span": evidence.max() - evidence.min(),
             }
 
         centers = torch.stack(centers, 0)
@@ -431,17 +431,17 @@ class DreamerDiagnostics(nn.Module):
         wrong = masked.max(-1).values
         margin = (correct - wrong).mean()
         return {
-            "dreamer_task_probe_available": torch.ones((), device=device),
-            "dreamer_task_probe_acc": acc,
-            "dreamer_task_probe_margin": margin,
-            "dreamer_task_probe_active_classes": torch.tensor(float(len(centers)), device=device),
-            "dreamer_task_probe_query_fraction": torch.tensor(
+            "ls_task_probe_available": torch.ones((), device=device),
+            "ls_task_probe_acc": acc,
+            "ls_task_probe_margin": margin,
+            "ls_task_probe_active_classes": torch.tensor(float(len(centers)), device=device),
+            "ls_task_probe_query_fraction": torch.tensor(
                 float(qfeat.shape[0]) / float(max(labels.numel(), 1)), device=device
             ),
-            "dreamer_task_evidence_mean": evidence.mean(),
-            "dreamer_task_evidence_std": evidence.std(unbiased=False),
-            "dreamer_task_evidence_span": evidence.max() - evidence.min(),
-            "dreamer_task_success_fraction": success.float().mean(),
+            "ls_task_evidence_mean": evidence.mean(),
+            "ls_task_evidence_std": evidence.std(unbiased=False),
+            "ls_task_evidence_span": evidence.max() - evidence.min(),
+            "ls_task_success_fraction": success.float().mean(),
         }
 
     @torch.no_grad()
@@ -494,7 +494,7 @@ class DreamerDiagnostics(nn.Module):
             dynamics, posterior, rewards, data, device
         ))
 
-        metrics["dreamer_diagnostics_active"] = torch.ones((), device=device)
+        metrics["ls_diagnostics_active"] = torch.ones((), device=device)
         return {
             key: value.detach().float().cpu().numpy()
             if torch.is_tensor(value) else np.asarray(value, dtype=np.float32)
