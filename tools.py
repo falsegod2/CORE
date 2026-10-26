@@ -5,7 +5,6 @@ import json
 import pathlib
 import time
 import random
-import wandb
 import copy
 import numpy as np
 import torch
@@ -16,8 +15,6 @@ from torch import distributions as torchd
 from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict
 from bisect import insort
-
-from stable_v1_2_utils import episode_has_positive_reward
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -96,11 +93,11 @@ class Logger:
         self._scalars = {}
         self._images = {}
         self._videos = {}
-        self._compact_health_log = bool(getattr(config, "compact_health_log", False))
-        self._print_all_scalars = bool(getattr(config, "print_all_scalars", True))
         self.step = step
 
         if self._wandb:
+            global wandb
+            import wandb
             if config.wandb_key is None:
                 raise ValueError("wandb_key is None")
             wandb.login(key=config.wandb_key)
@@ -125,16 +122,7 @@ class Logger:
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps", self._compute_fps(step)))
-        scalar_dict = dict(scalars)
-        if self._print_all_scalars:
-            print(
-                f"[{step}]",
-                " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars),
-            )
-        elif self._compact_health_log:
-            self._print_compact_summary(step, scalar_dict)
-        elif scalars:
-            print(f"[{step}]", " / ".join(f"{k} {self._format_scalar(v)}" for k, v in scalars))
+        print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / "metrics.jsonl").open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
 
@@ -177,90 +165,6 @@ class Logger:
             self._scalars = {}
             self._images = {}
             self._videos = {}
-
-    @staticmethod
-    def _format_scalar(value):
-        value = float(value)
-        av = abs(value)
-        if av == 0.0:
-            return "0"
-        if av >= 1000.0:
-            return f"{value:.1f}"
-        if av >= 10.0:
-            return f"{value:.2f}"
-        if av >= 1.0:
-            return f"{value:.3f}"
-        if av >= 1.0e-3:
-            return f"{value:.4f}"
-        return f"{value:.2e}"
-
-    def _print_compact_summary(self, step, d):
-        if not d:
-            return
-        f = self._format_scalar
-        if "eval_success" in d:
-            print(
-                f"[EVAL {step}] success={f(d.get('eval_success', 0.0))} "
-                f"return={f(d.get('eval_return', 0.0))} "
-                f"length={f(d.get('eval_length', 0.0))} "
-                f"first_success={f(d.get('eval_first_success_step', 0.0))}"
-            )
-            return
-        if "train_success" in d and "model_loss" not in d:
-            print(
-                f"[EP {step}] success={f(d.get('train_success', 0.0))} "
-                f"return={f(d.get('train_return', 0.0))} "
-                f"length={f(d.get('train_length', 0.0))} "
-                f"episodes={f(d.get('train_episodes', 0.0))}"
-            )
-            return
-
-        if "model_loss" in d:
-            print(
-                f"[TRAIN {step}] model={f(d.get('model_loss', 0.0))} "
-                f"image={f(d.get('image_loss', 0.0))} "
-                f"heat={f(d.get('heatmap_loss', 0.0))} "
-                f"S-Aff={f(d.get('loss_affordance_s', 0.0))} "
-                f"fps={f(d.get('fps', 0.0))}"
-            )
-            print(
-                "[HEALTH] "
-                f"S5A(cos/margin/gap)="
-                f"{f(d.get('health/s5a_cos15', 0.0))}/"
-                f"{f(d.get('health/cf_margin15', 0.0))}/"
-                f"{f(d.get('health/response_gap15', 0.0))} | "
-                f"Proto(acc/known/gate/succReady)="
-                f"{f(d.get('health/proto_acc15', 0.0))}/"
-                f"{f(d.get('health/proto_known', 0.0))}/"
-                f"{f(d.get('health/proto_gate', 1.0))}/"
-                f"{f(d.get('health/proto_success_ready', 0.0))} | "
-                f"Rel(batch/ema/effScale)="
-                f"{f(d.get('health/proto_reliability_batch', 0.0))}/"
-                f"{f(d.get('health/proto_reliability_ema', 0.0))}/"
-                f"{f(d.get('health/proto_effective_scale', 0.0))} | "
-                f"Guard(cos/norm/gate)="
-                f"{f(d.get('health/proto_grad_cos', 1.0))}/"
-                f"{f(d.get('health/proto_grad_norm_ratio', 0.0))}/"
-                f"{f(d.get('health/proto_grad_gate', 1.0))} | "
-                f"Replay(pri/posSeq)="
-                f"{f(d.get('health/replay_success_source', 0.0))}/"
-                f"{f(d.get('health/replay_positive_sequence', 0.0))} | "
-                f"Outcome(gate/posEMA/pos15/corr)="
-                f"{f(d.get('health/outcome_gate', 0.0))}/"
-                f"{f(d.get('health/outcome_positive_ema', 0.0))}/"
-                f"{f(d.get('health/outcome_positive15', 0.0))}/"
-                f"{f(d.get('health/outcome_corr15', 0.0))} | "
-                f"Policy(Rstd/Vstd/Agrad)="
-                f"{f(d.get('health/imag_reward_std', 0.0))}/"
-                f"{f(d.get('health/value_std', 0.0))}/"
-                f"{f(d.get('health/actor_grad_norm', 0.0))} | "
-                f"ALERT={int(d.get('health/policy_collapse_alert', 0.0) >= 0.5)}"
-            )
-            return
-
-        # Fallback for rare logger writes that do not match train/eval schemas.
-        short = list(d.items())[:8]
-        print(f"[{step}]", " / ".join(f"{k} {f(v)}" for k, v in short))
 
     def _compute_fps(self, step):
         if self._last_step is None:
@@ -313,7 +217,9 @@ def simulate(
     cache, 
     directory, 
     logger, 
+    step_calculator,
     max_steps,
+    gamma,
     is_eval=False,
     limit=None, 
     steps=0, 
@@ -349,6 +255,10 @@ def simulate(
                 t["discount"] = 1.0
                 # initial state should be added to cache
                 add_to_cache(cache, envs[index].id, t)
+
+                current_step = 0
+                if t["is_zoomed"] == True:
+                    step_calculator.add(envs[index].id, current_step, t["score_on_zoomed"])
 
                 # replace obs with done by initial state
                 obs[index] = result
@@ -397,7 +307,20 @@ def simulate(
             transition["first_success_step"] = info.get("first_success_step", max_steps)
             add_to_cache(cache, env.id, transition)
 
-            information[tmp_index]['real_done'] = True
+            length = len(cache[env.id]["reward"]) 
+            current_step = length - 1
+            if transition["is_zoomed"] == True and not d:
+                step_calculator.add(env.id, current_step, transition["score_on_zoomed"])
+
+            tmp_list = step_calculator.get_and_remove_less_than(env.id, current_step, transition["score"])
+            if len(tmp_list) > 0:
+                for ss in tmp_list:
+                    cache[env.id]["jumping_steps"][ss] = current_step - ss
+                    cache[env.id]["accumulated_reward"][ss] = calculate_accumulated_reward(cache[env.id]["reward"][ss+1:current_step], cache[env.id]["intrinsic"][ss+1:current_step], gamma)
+                    cache[env.id]["is_calculated"][ss] = True
+
+            if step_calculator.count_data_pairs(env.id) == 0:
+                information[tmp_index]['real_done'] = True
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -408,6 +331,7 @@ def simulate(
 
                 save_episodes(directory, {envs[i].id: cache[envs[i].id]})
 
+                step_calculator.remove_all(envs[i].id)
                 length = len(cache[envs[i].id]["reward"]) - 1
                 score = float(np.array(cache[envs[i].id]["reward"])[0:max_steps+1].sum())
                 suc = 1 if any(np.array(cache[envs[i].id]["success"])[:max_steps+1]) else 0
@@ -548,7 +472,7 @@ def save_episodes(directory, episodes):
     return True
 
 def replace_none_with_zeros(episode):
-    if "image" in episode and len(episode["image"]) > 0:
+    if "image" in episode and episode["image"]:
         reference_shape = episode["image"][0].shape
     else:
         raise ValueError("Image data is missing or malformed in episode.")
@@ -558,7 +482,7 @@ def replace_none_with_zeros(episode):
             np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
         ]
     
-    if "heatmap" in episode and len(episode["heatmap"]) > 0:
+    if "heatmap" in episode and episode["heatmap"]:
         heatmap_shape = episode["heatmap"][0].shape
     else:
         heatmap_shape = None
@@ -585,81 +509,20 @@ def from_generator(generator, batch_size):
         yield data
 
 
-def sample_episodes(
-    episodes,
-    length,
-    seed=0,
-    success_replay_ratio=0.0,
-    success_positive_threshold=1.0e-6,
-):
-    """Sample fixed-length replay sequences.
+def sample_episodes(episodes, length, seed=0, rng=None):
 
-    Stable-V1.2 adds a deliberately small success-aware mixture. With probability
-    ``success_replay_ratio`` an episode is drawn from the subset that has ever
-    contained a real positive environment reward; otherwise the original
-    length-proportional sampler is used. When no successful episode exists, this
-    is exactly the original sampler.
-
-    The sampled window itself does not have to contain the terminal reward. This
-    is intentional: windows from a successful trajectory also preserve useful
-    near-success context.
-    """
-    np_random = np.random.RandomState(seed)
-    success_replay_ratio = float(np.clip(success_replay_ratio, 0.0, 1.0))
-    success_positive_threshold = float(success_positive_threshold)
-    # Cache per-episode success metadata so the 10% priority mixture never
-    # rescans the entire replay reward history on every training sample.
-    success_cache = {}
-
+    # Optional external RNG lets the managed serial runner checkpoint sampling.
+    # Existing callers retain exactly the original seed=0 sampler.
+    np_random = np.random.RandomState(seed) if rng is None else rng
     while True:
         size = 0
         ret = None
-        used_success_priority = False
-
-        # ``episodes`` is updated online, therefore rebuild the light-weight
-        # sampling tables for every yielded training sequence just like the
-        # original implementation rebuilt its length probabilities.
-        episode_items = list(episodes.items())
-        episode_values = [episode for _, episode in episode_items]
-        lengths = np.asarray(
-            [len(next(iter(episode.values()))) for episode in episode_values],
-            dtype=np.float64,
+        p = np.array(
+            [len(next(iter(episode.values()))) for episode in episodes.values()]
         )
-        p_all = lengths / np.sum(lengths)
-
-        success_indices = []
-        if success_replay_ratio > 0.0:
-            for i, (episode_id, episode) in enumerate(episode_items):
-                if episode_id not in success_cache:
-                    success_cache[episode_id] = episode_has_positive_reward(
-                        episode, success_positive_threshold
-                    )
-                if success_cache[episode_id]:
-                    success_indices.append(i)
-        if success_indices:
-            success_lengths = lengths[success_indices]
-            p_success = success_lengths / np.sum(success_lengths)
-        else:
-            p_success = None
-
+        p = p / np.sum(p)
         while size < length:
-            draw_success = (
-                p_success is not None
-                and success_replay_ratio > 0.0
-                and np_random.rand() < success_replay_ratio
-            )
-            if draw_success:
-                local_index = int(
-                    np_random.choice(np.arange(len(success_indices)), p=p_success)
-                )
-                episode_index = int(success_indices[local_index])
-                used_success_priority = True
-            else:
-                episode_index = int(
-                    np_random.choice(np.arange(len(episode_values)), p=p_all)
-                )
-            episode = episode_values[episode_index]
-
+            episode = np_random.choice(list(episodes.values()), p=p)
             total = len(next(iter(episode.values())))
             # make sure at least one transition included
             if total < 2:
@@ -692,12 +555,6 @@ def sample_episodes(
                     ret["is_first"][size] = True
             size = len(next(iter(ret.values())))
             del episode_copy
-
-        # Diagnostic-only sequence flag. WorldModel ignores it for prediction
-        # heads, but logs the actual fraction of prioritized sequences.
-        ret["replay_success_source"] = np.full(
-            (length,), float(used_success_priority), dtype=np.float32
-        )
         yield ret
 
 
@@ -705,44 +562,35 @@ def load_episodes(directory, limit=None, reverse=True):
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
     total = 0
-    
-    # 1. First, get the list of files to know the total count
     if reverse:
-        filenames = list(reversed(sorted(directory.glob("*.npz"))))
-    else:
-        filenames = list(sorted(directory.glob("*.npz")))
-        
-    total_files = len(filenames)
-    print(f"Found {total_files} .npz files in {directory}. Beginning to load...")
-
-    # 2. Iterate through the pre-fetched list
-    for i, filename in enumerate(filenames):
-        try:
-            with filename.open("rb") as f:
-                episode = np.load(f)
-                episode = {k: episode[k] for k in episode.keys()}
-        except Exception as e:
-            print(f"Could not load episode: {e}")
-            continue
-            
-        # extract only filename without extension
-        if reverse:
+        for filename in reversed(sorted(directory.glob("*.npz"))):
+            try:
+                with filename.open("rb") as f:
+                    episode = np.load(f)
+                    episode = {k: episode[k] for k in episode.keys()}
+            except Exception as e:
+                print(f"Could not load episode: {e}")
+                continue
+            # extract only filename without extension
             episodes[str(os.path.splitext(os.path.basename(filename))[0])] = episode
-        else:
+            total += len(episode["reward"]) - 1
+            if limit and total >= limit:
+                break
+    else:
+        for filename in sorted(directory.glob("*.npz")):
+            try:
+                with filename.open("rb") as f:
+                    episode = np.load(f)
+                    episode = {k: episode[k] for k in episode.keys()}
+            except Exception as e:
+                print(f"Could not load episode: {e}")
+                continue
             episodes[str(filename)] = episode
-            
-        total += len(episode["reward"]) - 1
-        
-        # 3. Print progress every 100 files
-        if (i + 1) % 100 == 0 or (i + 1) == total_files:
-            print(f"Loaded {i + 1} / {total_files} files... (Total steps in buffer: {total})")
-
-        if limit and total >= limit:
-            print(f"Reached step limit ({limit}). Stopping load.")
-            break
-            
-    print(f"Loading complete! Total episodes: {len(episodes)}, Total steps: {total}")
+            total += len(episode["reward"]) - 1
+            if limit and total >= limit:
+                break
     return episodes
+
 
 class SampleDist:
     def __init__(self, dist, samples=100):
@@ -1372,7 +1220,7 @@ def uniform_weight_init(given_scale):
 def tensorstats(tensor, prefix=None):
     metrics = {
         "mean": to_np(torch.mean(tensor)),
-        "std": to_np(torch.std(tensor)),
+        "std": to_np(torch.std(tensor) if tensor.numel() > 1 else torch.zeros_like(torch.mean(tensor))),
         "min": to_np(torch.min(tensor)),
         "max": to_np(torch.max(tensor)),
     }

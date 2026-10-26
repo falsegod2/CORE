@@ -1,0 +1,474 @@
+{
+  "artifact": "LS_Imagine_Clean_Evidence_20261020",
+  "date_utc": "2026-10-20",
+  "clean_source_zip": "LS-Imagine_Clean_PixelAffordance_BinaryReward(2).zip",
+  "clean_source_zip_sha256": "ec53107a5bcf7d1312ee28ff07f802253674061eba04ce530bba82523fc56002",
+  "evidence_source_zip": "WM_Experiment_Suite_EvidenceDreamer_20261014(1).zip",
+  "evidence_source_zip_sha256": "bebc104e63ac28be11c9f5b27b8dcad8a91e2506ed4b6a95ee8f9ccbc4373a49",
+  "original_runtime_files_compared": 63,
+  "original_files_changed": [
+    "envs/tasks/minedojo/__init__.py"
+  ],
+  "original_files_unchanged": 62,
+  "missing_original_runtime_files": [],
+  "original_file_comparison": [
+    {
+      "path": ".gitignore",
+      "unchanged": true,
+      "original_sha256": "adb95442fe35942314d229c336780b0dc15ad7f70a512019e0f4ab5834f6ad13",
+      "current_sha256": "adb95442fe35942314d229c336780b0dc15ad7f70a512019e0f4ab5834f6ad13"
+    },
+    {
+      "path": "CLEAN_LS_IMAGINE_CHANGES.md",
+      "unchanged": true,
+      "original_sha256": "5fae43a329f1954da12d5f33278de284c65f3abb8ff37757893a049344a76a95",
+      "current_sha256": "5fae43a329f1954da12d5f33278de284c65f3abb8ff37757893a049344a76a95"
+    },
+    {
+      "path": "LICENSE",
+      "unchanged": true,
+      "original_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "current_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "README.md",
+      "unchanged": true,
+      "original_sha256": "34f979efc537a2d307c8b2359e2ed266672455a9e817a50a47f1d1e02e77b582",
+      "current_sha256": "34f979efc537a2d307c8b2359e2ed266672455a9e817a50a47f1d1e02e77b582"
+    },
+    {
+      "path": "affordance_map/concentration.py",
+      "unchanged": true,
+      "original_sha256": "9e6d2ebf6ccc16e52abbf80839ed777c97eeccd63abc0075576587a17115f828",
+      "current_sha256": "9e6d2ebf6ccc16e52abbf80839ed777c97eeccd63abc0075576587a17115f828"
+    },
+    {
+      "path": "affordance_map/conf.yaml",
+      "unchanged": true,
+      "original_sha256": "4535962bb3f9363563ee510a38dbf5260123baca443968787d1d250177fe4139",
+      "current_sha256": "4535962bb3f9363563ee510a38dbf5260123baca443968787d1d250177fe4139"
+    },
+    {
+      "path": "affordance_map/config.py",
+      "unchanged": true,
+      "original_sha256": "6089196414c71f3e5685f5afb8def6d339f0339dd27fcf1ae40fe50aa6ee4917",
+      "current_sha256": "6089196414c71f3e5685f5afb8def6d339f0339dd27fcf1ae40fe50aa6ee4917"
+    },
+    {
+      "path": "affordance_map/configs/swin_tiny_patch4_window7_224_lite.yaml",
+      "unchanged": true,
+      "original_sha256": "04d2298c077fb279bbc58b6ad1ac249b2db44b9b81c71f711e32e4e1509ba003",
+      "current_sha256": "04d2298c077fb279bbc58b6ad1ac249b2db44b9b81c71f711e32e4e1509ba003"
+    },
+    {
+      "path": "affordance_map/datasets/dataset_minecraft.py",
+      "unchanged": true,
+      "original_sha256": "69414345c08aa98d87d20fb3bd8e98eb680d1c7a963d2d2f8ef2bd9e906b4d9b",
+      "current_sha256": "69414345c08aa98d87d20fb3bd8e98eb680d1c7a963d2d2f8ef2bd9e906b4d9b"
+    },
+    {
+      "path": "affordance_map/finetune.py",
+      "unchanged": true,
+      "original_sha256": "dbbadafd056944b04ffd769b16962422c0d1b8b0ff68a993e4af7dddc2ffc5c5",
+      "current_sha256": "dbbadafd056944b04ffd769b16962422c0d1b8b0ff68a993e4af7dddc2ffc5c5"
+    },
+    {
+      "path": "affordance_map/generate_dataset_for_finetuning.py",
+      "unchanged": true,
+      "original_sha256": "6807ce9841f10b2be031723f9f8e44dbfeda077424bde9175581779e65c7c730",
+      "current_sha256": "6807ce9841f10b2be031723f9f8e44dbfeda077424bde9175581779e65c7c730"
+    },
+    {
+      "path": "affordance_map/networks/swin_transformer_unet_skip_expand_decoder_sys.py",
+      "unchanged": true,
+      "original_sha256": "98e4c23f472951a16fab34de816188d0c1e3001036e6d3bd033af08e355f5332",
+      "current_sha256": "98e4c23f472951a16fab34de816188d0c1e3001036e6d3bd033af08e355f5332"
+    },
+    {
+      "path": "affordance_map/networks/vision_transformer.py",
+      "unchanged": true,
+      "original_sha256": "d4e9341042e9a425103b409f16757bcc32b910a33fb2a982f8d23596c155c97c",
+      "current_sha256": "d4e9341042e9a425103b409f16757bcc32b910a33fb2a982f8d23596c155c97c"
+    },
+    {
+      "path": "affordance_map/test.py",
+      "unchanged": true,
+      "original_sha256": "abcc8bc970e74cf95b4ec9ef920a6b51ad9032bd11c5bc4b951b499d02182d70",
+      "current_sha256": "abcc8bc970e74cf95b4ec9ef920a6b51ad9032bd11c5bc4b951b499d02182d70"
+    },
+    {
+      "path": "affordance_map/train.py",
+      "unchanged": true,
+      "original_sha256": "5bf4a8ac296dfe5662e75f9cd4cbd5594c605e5e3d317a932c6287ede662bf46",
+      "current_sha256": "5bf4a8ac296dfe5662e75f9cd4cbd5594c605e5e3d317a932c6287ede662bf46"
+    },
+    {
+      "path": "affordance_map/trainer.py",
+      "unchanged": true,
+      "original_sha256": "d2b0b2e47290383cbb32c78f25d00a2184aae48f26bc0f07cbd315050ee11c83",
+      "current_sha256": "d2b0b2e47290383cbb32c78f25d00a2184aae48f26bc0f07cbd315050ee11c83"
+    },
+    {
+      "path": "affordance_map/utils.py",
+      "unchanged": true,
+      "original_sha256": "7f6826b4a795c2186b1fe2f836a2073a8d0420c5fcd305e18c1f0c6d9ad35a82",
+      "current_sha256": "7f6826b4a795c2186b1fe2f836a2073a8d0420c5fcd305e18c1f0c6d9ad35a82"
+    },
+    {
+      "path": "affordance_map/variant/attn.yaml",
+      "unchanged": true,
+      "original_sha256": "20ad4cbc964eef447bf7c20cdffc9ffa1f536225fef32fe920e5741d4002f9b2",
+      "current_sha256": "20ad4cbc964eef447bf7c20cdffc9ffa1f536225fef32fe920e5741d4002f9b2"
+    },
+    {
+      "path": "affordance_map/variant/avg.yaml",
+      "unchanged": true,
+      "original_sha256": "1b51471a763ad7e79d0956af18a31b0c4339d6af8ebf445fb00e1c64e3baefa9",
+      "current_sha256": "1b51471a763ad7e79d0956af18a31b0c4339d6af8ebf445fb00e1c64e3baefa9"
+    },
+    {
+      "path": "assets/iron_demo.gif",
+      "unchanged": true,
+      "original_sha256": "d4e33063411598d9f3c2049ef71342ef8f242f64ca90125886c3c5f046f99949",
+      "current_sha256": "d4e33063411598d9f3c2049ef71342ef8f242f64ca90125886c3c5f046f99949"
+    },
+    {
+      "path": "assets/log_demo.gif",
+      "unchanged": true,
+      "original_sha256": "0b3365484dca8bfbcae80b30448bf9a07553a3b6257961d7a0abd2576b5c9765",
+      "current_sha256": "0b3365484dca8bfbcae80b30448bf9a07553a3b6257961d7a0abd2576b5c9765"
+    },
+    {
+      "path": "assets/logo_long.png",
+      "unchanged": true,
+      "original_sha256": "df12037f8506fcded9bbc40c4b53ebe52be27523391b32b971236ec859485db0",
+      "current_sha256": "df12037f8506fcded9bbc40c4b53ebe52be27523391b32b971236ec859485db0"
+    },
+    {
+      "path": "assets/minecraft.png",
+      "unchanged": true,
+      "original_sha256": "c9da2a2f54075b7570bf0e5945278901b3d37d8f3fdc7b0087cbb1715db5107b",
+      "current_sha256": "c9da2a2f54075b7570bf0e5945278901b3d37d8f3fdc7b0087cbb1715db5107b"
+    },
+    {
+      "path": "assets/overview.png",
+      "unchanged": true,
+      "original_sha256": "2261fb4c4d4a0a8c8684d3f928a3fb3002a88fcc2c9005e2351bf229dbe806bd",
+      "current_sha256": "2261fb4c4d4a0a8c8684d3f928a3fb3002a88fcc2c9005e2351bf229dbe806bd"
+    },
+    {
+      "path": "assets/success_rate_with_barplot.png",
+      "unchanged": true,
+      "original_sha256": "10dcc1830d8f3ac68dff1137abf073be83118fdd911f4fb9065d3e697e3a332d",
+      "current_sha256": "10dcc1830d8f3ac68dff1137abf073be83118fdd911f4fb9065d3e697e3a332d"
+    },
+    {
+      "path": "assets/water_demo.gif",
+      "unchanged": true,
+      "original_sha256": "c18f2f5192686320a1e6174c635dfeba2f440b84305054189bfd7775404b16f8",
+      "current_sha256": "c18f2f5192686320a1e6174c635dfeba2f440b84305054189bfd7775404b16f8"
+    },
+    {
+      "path": "assets/wool_demo.gif",
+      "unchanged": true,
+      "original_sha256": "59cd196561a505c3bb7f6caa1c80ecb6f1beb54a2471c84c19980bc5eea0265e",
+      "current_sha256": "59cd196561a505c3bb7f6caa1c80ecb6f1beb54a2471c84c19980bc5eea0265e"
+    },
+    {
+      "path": "collect_rollouts.py",
+      "unchanged": true,
+      "original_sha256": "434da119eff0ccc68a678cc79437ae8807d94bc715c3d502af7631ded37474bb",
+      "current_sha256": "434da119eff0ccc68a678cc79437ae8807d94bc715c3d502af7631ded37474bb"
+    },
+    {
+      "path": "configs.yaml",
+      "unchanged": true,
+      "original_sha256": "cf5e8e8a493e4c1fb3a10d700ffcd0a9b961015b398519f09ab416f9c4326f9a",
+      "current_sha256": "cf5e8e8a493e4c1fb3a10d700ffcd0a9b961015b398519f09ab416f9c4326f9a"
+    },
+    {
+      "path": "docs/minedojo_installation.md",
+      "unchanged": true,
+      "original_sha256": "4dd510b6296653d9d8560e45bcbf5b4a64b7bf991eee67d3a63eb66b9100d34f",
+      "current_sha256": "4dd510b6296653d9d8560e45bcbf5b4a64b7bf991eee67d3a63eb66b9100d34f"
+    },
+    {
+      "path": "docs/task_setups.md",
+      "unchanged": true,
+      "original_sha256": "bc10a65ddffafb1d0c5fe030487894d8be0d062abf30ad5bee0c240c07ef81c5",
+      "current_sha256": "bc10a65ddffafb1d0c5fe030487894d8be0d062abf30ad5bee0c240c07ef81c5"
+    },
+    {
+      "path": "envs/minedojo.py",
+      "unchanged": true,
+      "original_sha256": "23637004c9d3b1a64529a5ff56f95754c67f52bd098c72fd9831cb7e7c5873d1",
+      "current_sha256": "23637004c9d3b1a64529a5ff56f95754c67f52bd098c72fd9831cb7e7c5873d1"
+    },
+    {
+      "path": "envs/tasks/__init__.py",
+      "unchanged": true,
+      "original_sha256": "6691f17eb35582ed4c8ce7eaf028cb2868352d3e2982a7c6480c07d6f432cf2a",
+      "current_sha256": "6691f17eb35582ed4c8ce7eaf028cb2868352d3e2982a7c6480c07d6f432cf2a"
+    },
+    {
+      "path": "envs/tasks/base/HUD_mask.png",
+      "unchanged": true,
+      "original_sha256": "1bf96e7cc3b2b8d32210e01ada32af3d2beca1d223713b908a03b1ff5f4bba82",
+      "current_sha256": "1bf96e7cc3b2b8d32210e01ada32af3d2beca1d223713b908a03b1ff5f4bba82"
+    },
+    {
+      "path": "envs/tasks/base/__init__.py",
+      "unchanged": true,
+      "original_sha256": "16406b4186f903a4adb30d9bfb67196a5316fecc8dcdee6fa6b4baf49eeed78a",
+      "current_sha256": "16406b4186f903a4adb30d9bfb67196a5316fecc8dcdee6fa6b4baf49eeed78a"
+    },
+    {
+      "path": "envs/tasks/base/clip_reward.py",
+      "unchanged": true,
+      "original_sha256": "1090b840726c2aba16778acac2a425bcbd453d4fb53e9b158ea022b295961467",
+      "current_sha256": "1090b840726c2aba16778acac2a425bcbd453d4fb53e9b158ea022b295961467"
+    },
+    {
+      "path": "envs/tasks/base/clip_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "b0a818aca4fe378e3165c65c5735c4ab153c1c8c54ce6c97d2df37c2863573bd",
+      "current_sha256": "b0a818aca4fe378e3165c65c5735c4ab153c1c8c54ce6c97d2df37c2863573bd"
+    },
+    {
+      "path": "envs/tasks/base/concentration_reward.py",
+      "unchanged": true,
+      "original_sha256": "a9086b75a7171a80a71960b683608912b2cf7074e1c884f788fac5a17aa6b0ae",
+      "current_sha256": "a9086b75a7171a80a71960b683608912b2cf7074e1c884f788fac5a17aa6b0ae"
+    },
+    {
+      "path": "envs/tasks/base/concentration_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "8422ce710048da0c3ac6cb7acd8bcd9c46b98781862cd583ecd645bec3a42c0c",
+      "current_sha256": "8422ce710048da0c3ac6cb7acd8bcd9c46b98781862cd583ecd645bec3a42c0c"
+    },
+    {
+      "path": "envs/tasks/base/ls_imagine_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "174950ba183982226d847654ad54f6a046603a326a4ce89cd4d1f4e843f31bd6",
+      "current_sha256": "174950ba183982226d847654ad54f6a046603a326a4ce89cd4d1f4e843f31bd6"
+    },
+    {
+      "path": "envs/tasks/base/reward_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "ae4565caf66683b7360f427a02bb88ce2fd959302ffb95ae81769e585d898f47",
+      "current_sha256": "ae4565caf66683b7360f427a02bb88ce2fd959302ffb95ae81769e585d898f47"
+    },
+    {
+      "path": "envs/tasks/base/screenshot_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "8293e0bee8cd77f82c91b2b20c6e22433f325e6f45a5556ad0177e414ea96e43",
+      "current_sha256": "8293e0bee8cd77f82c91b2b20c6e22433f325e6f45a5556ad0177e414ea96e43"
+    },
+    {
+      "path": "envs/tasks/base/success_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "50174e68e82c7d3cc34097aef992aa1099427551a98b92a209762465c8c63a8f",
+      "current_sha256": "50174e68e82c7d3cc34097aef992aa1099427551a98b92a209762465c8c63a8f"
+    },
+    {
+      "path": "envs/tasks/base/terminal_wrapper.py",
+      "unchanged": true,
+      "original_sha256": "72260b68a22014ff98c9fbf931e75b7f3ef40871c3cbcdfb4757235d188f14c9",
+      "current_sha256": "72260b68a22014ff98c9fbf931e75b7f3ef40871c3cbcdfb4757235d188f14c9"
+    },
+    {
+      "path": "envs/tasks/minedojo/__init__.py",
+      "unchanged": false,
+      "original_sha256": "67b8ce739de78e8518d3e5f639fd2c25335a46203c4e8d841a797ccc4b46049d",
+      "current_sha256": "724a9508427d28c45e54058109192cfaaeaadce5cce4f8299e0ffb96f9971c1d"
+    },
+    {
+      "path": "envs/tasks/minedojo/wrappers.py",
+      "unchanged": true,
+      "original_sha256": "81325fd958ced286273567a1f7057c18d1f221c61df1ce148de27eb9bb482f56",
+      "current_sha256": "81325fd958ced286273567a1f7057c18d1f221c61df1ce148de27eb9bb482f56"
+    },
+    {
+      "path": "envs/tasks/task_specs.yaml",
+      "unchanged": true,
+      "original_sha256": "ebd2ddd6ae1d1965f470f244389bc32049f422fdb6aa62c3c53ab8a19809209d",
+      "current_sha256": "ebd2ddd6ae1d1965f470f244389bc32049f422fdb6aa62c3c53ab8a19809209d"
+    },
+    {
+      "path": "envs/wrappers.py",
+      "unchanged": true,
+      "original_sha256": "8c7d01f36651cf49c2d53cfd2e78577169a4058a3c7a20443396082544a3a109",
+      "current_sha256": "8c7d01f36651cf49c2d53cfd2e78577169a4058a3c7a20443396082544a3a109"
+    },
+    {
+      "path": "exploration.py",
+      "unchanged": true,
+      "original_sha256": "3dfab3f3645f9cee4c6fc3f3ba5819ece53dd22e120171382822f5c947e270dc",
+      "current_sha256": "3dfab3f3645f9cee4c6fc3f3ba5819ece53dd22e120171382822f5c947e270dc"
+    },
+    {
+      "path": "expr.py",
+      "unchanged": true,
+      "original_sha256": "1a6cfe973550518fe5185bae33f512fbb8af2988a5c167bce52e05729acec1ff",
+      "current_sha256": "1a6cfe973550518fe5185bae33f512fbb8af2988a5c167bce52e05729acec1ff"
+    },
+    {
+      "path": "models.py",
+      "unchanged": true,
+      "original_sha256": "87243910561b70184709c59115d05bbcccf67fd6203aa8c2a08d6d9aa4ebdd77",
+      "current_sha256": "87243910561b70184709c59115d05bbcccf67fd6203aa8c2a08d6d9aa4ebdd77"
+    },
+    {
+      "path": "networks.py",
+      "unchanged": true,
+      "original_sha256": "ea19ccaf1a2f01b5edea6fca6ddc2d991cea692f0424a1981009c64d6d7e0130",
+      "current_sha256": "ea19ccaf1a2f01b5edea6fca6ddc2d991cea692f0424a1981009c64d6d7e0130"
+    },
+    {
+      "path": "parallel.py",
+      "unchanged": true,
+      "original_sha256": "4fa41d57d84b1c39a1c9de394ed66e869ded6632a5ee114c00b33e56f8fff678",
+      "current_sha256": "4fa41d57d84b1c39a1c9de394ed66e869ded6632a5ee114c00b33e56f8fff678"
+    },
+    {
+      "path": "requirements.txt",
+      "unchanged": true,
+      "original_sha256": "d9c5ce2d430ab8d3494645cbb5d975378cdca279a9c0e9f2861835b434b2a5db",
+      "current_sha256": "d9c5ce2d430ab8d3494645cbb5d975378cdca279a9c0e9f2861835b434b2a5db"
+    },
+    {
+      "path": "scripts/affordance.sh",
+      "unchanged": true,
+      "original_sha256": "d4b8ce455794e87db82bfe025ceb1f78fd18f2691a725ea1c327cb716f44e6bf",
+      "current_sha256": "d4b8ce455794e87db82bfe025ceb1f78fd18f2691a725ea1c327cb716f44e6bf"
+    },
+    {
+      "path": "scripts/collect.sh",
+      "unchanged": true,
+      "original_sha256": "51c362b5e87e0bd795f2e5aba8ca1a8544ea86dea973eaecaa77219d8c636d6d",
+      "current_sha256": "51c362b5e87e0bd795f2e5aba8ca1a8544ea86dea973eaecaa77219d8c636d6d"
+    },
+    {
+      "path": "scripts/finetune_unet.sh",
+      "unchanged": true,
+      "original_sha256": "43dea808253200ffeb6ccd40ef01d95793f2d9599cffe187353bea62de970a49",
+      "current_sha256": "43dea808253200ffeb6ccd40ef01d95793f2d9599cffe187353bea62de970a49"
+    },
+    {
+      "path": "scripts/test.sh",
+      "unchanged": true,
+      "original_sha256": "a9bdf204c9e0c9dd8145301203bc80e990717680a966e5e2c373ef554954fc82",
+      "current_sha256": "a9bdf204c9e0c9dd8145301203bc80e990717680a966e5e2c373ef554954fc82"
+    },
+    {
+      "path": "scripts/train.sh",
+      "unchanged": true,
+      "original_sha256": "c8c8717c6bfddd1bad33a3d02339b489b602a6e9d2d068d6e6385a03f619a73a",
+      "current_sha256": "c8c8717c6bfddd1bad33a3d02339b489b602a6e9d2d068d6e6385a03f619a73a"
+    },
+    {
+      "path": "test.py",
+      "unchanged": true,
+      "original_sha256": "31e9fc058b9395d8eba1765fc0705e19fc67db99315ff257597a1ef06c9d6c2a",
+      "current_sha256": "31e9fc058b9395d8eba1765fc0705e19fc67db99315ff257597a1ef06c9d6c2a"
+    },
+    {
+      "path": "tools.py",
+      "unchanged": true,
+      "original_sha256": "f8215e3864461068fb5f37384b09d6aabeea39533bda2fb33c204da9ab938612",
+      "current_sha256": "f8215e3864461068fb5f37384b09d6aabeea39533bda2fb33c204da9ab938612"
+    },
+    {
+      "path": "variant/attn.yaml",
+      "unchanged": true,
+      "original_sha256": "20ad4cbc964eef447bf7c20cdffc9ffa1f536225fef32fe920e5741d4002f9b2",
+      "current_sha256": "20ad4cbc964eef447bf7c20cdffc9ffa1f536225fef32fe920e5741d4002f9b2"
+    },
+    {
+      "path": "variant/avg.yaml",
+      "unchanged": true,
+      "original_sha256": "1b51471a763ad7e79d0956af18a31b0c4339d6af8ebf445fb00e1c64e3baefa9",
+      "current_sha256": "1b51471a763ad7e79d0956af18a31b0c4339d6af8ebf445fb00e1c64e3baefa9"
+    }
+  ],
+  "new_source_sha256": {
+    "EVIDENCE_PORT_CHANGES.md": "cb3e8b85ac889583f4cf6f2334975fff278c7e649f9d38e0f9193d7557091620",
+    "README_EVIDENCE_CN.md": "e621cb3f1819d83accf65fe8adf385f68cae22885145f5e7460ad565f5943eaf",
+    "clean_evidence/__init__.py": "5165d47e5d45ca60674a7dee2833ef2f250ab38809f381ef985d6adf71f10378",
+    "clean_evidence/configs/evidence.yaml": "915553714e239fd407514c365d03465b1eaf137310e03060c4a0e91cc8d8a7c4",
+    "clean_evidence/configuration.py": "89ec1260b664050b90bfd50f65903531141ea385359be8a732831565fb6a0712",
+    "clean_evidence/environment.py": "1662328fdd00c3615cf1e02e887157509b668b1166dbe7db275607e736735c25",
+    "clean_evidence/methods/__init__.py": "5165d47e5d45ca60674a7dee2833ef2f250ab38809f381ef985d6adf71f10378",
+    "clean_evidence/methods/dual_rssm_torch.py": "2e64558ded363b723957472a90fae4f8688d195ff4708f85908bde08976afd1e",
+    "clean_evidence/methods/evidence_behavior.py": "0b39d5f386bfc0f249ff6207d464c6d9de27d5e6ad891aea1ea9ed2c80e1def1",
+    "clean_evidence/methods/evidence_dreamer.py": "c597939bed522c2540414b363ff947478bcc97e6de02b3255314be0163a7b516",
+    "clean_evidence/methods/evidence_model.py": "449bc65c77ec3988072184f44e6979e5550b10f14e732c02a7a8a4ae7f43136d",
+    "clean_evidence/methods/evidence_replay.py": "1743d4cb209b01ec957b542cabc37913440737883117bc7bcf7021c58072d9de",
+    "clean_evidence/methods/evidence_rssm.py": "70d52e30bcefd523d8fee78bd5572f247ee55b31e45d37b3dd63447c3431e705",
+    "clean_evidence/methods/lifecycle.py": "24428028ac58dcc8a7f0b7f2529eeec7f92413a889a069eb3b64fecc022c225d",
+    "clean_evidence/metrics.py": "a7fb99ed06dc0f65d889bc499f152af47504d69f7d56239712e676f8711a6dcb",
+    "clean_evidence/model_utils.py": "95fb7601bfda17520e689fe4fc1bc03c97b944fe633b123907505276a11650b4",
+    "clean_evidence/rng.py": "11abc2ab30ad6e26e5d1cca1f636b0813f483067545e76ce4c017debb6e7320d",
+    "clean_evidence/runner.py": "296a267c274aa0cd6131005b4af28c3976a8084367f7cdf418ea29dba5fff4ab",
+    "clean_evidence/runtime/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "clean_evidence/runtime/preflight.py": "d3276ef578cd47ba55db8b3539830972a8ea5359b89510572109581181b5a4cc",
+    "clean_evidence/runtime/tokenizer.py": "667d7be0eb97a0d60421a5d2e80320a904e8e2598b45323b4a1a287fa0286b2f",
+    "clean_evidence/semantic_teacher.py": "65b2e87acaa8c1589eff3f7282c1c3227d01fa4f0ed5493bce4a2be5321d9afb",
+    "clean_evidence/storage.py": "6d14a6f61f4b931813fae8012ef6fa1024bc28172d72d1153b4004740daa0a45",
+    "clean_evidence/vendor/__init__.py": "5165d47e5d45ca60674a7dee2833ef2f250ab38809f381ef985d6adf71f10378",
+    "clean_evidence/vendor/dreamerv3_torch/LICENSE": "2991634eca8d411611f201feafb50cb7041afbca049b6618b3be1cd515393ada",
+    "clean_evidence/vendor/dreamerv3_torch/__init__.py": "79992c1e8f3ce2b9552e3afb3275e3560d555c18205ba2666c23faf591cfc180",
+    "clean_evidence/vendor/dreamerv3_torch/configs.yaml": "6ddfa13ed0f0329a7dd079a01c80ac5eca3cca2238ee01c5f6b2bf3b13762779",
+    "clean_evidence/vendor/dreamerv3_torch/models.py": "185e862cbe9427ebf5f904e4d31d588f6da941e5c9c190f54af4d260b34ba3e2",
+    "clean_evidence/vendor/dreamerv3_torch/networks.py": "d9f6b39eb66bef2ea5e9158281ebeac93e135e18ea681710ebbc53683112fcdd",
+    "clean_evidence/vendor/dreamerv3_torch/tools.py": "32266d2d3b741e6b0afe2a2033ec37aa2849e759f39c147020042920df73c7c5",
+    "evidence_tests/__init__.py": "95c9d3093f28681ab442574e9a76549afec991231cf8ed89d825bb34850e5a37",
+    "evidence_tests/test_configuration.py": "f17fd3ba8b5c4666dc47a07d2241e9bafa4804acc476f2499a6058de5b0edcc1",
+    "evidence_tests/test_environment.py": "cdc8819fc13e53cf4e622a8a534d9d79f19404449dad626900b254bfcf6b9253",
+    "evidence_tests/test_model_behavior.py": "6e4f19b61772c8990943eee670b3c346830bd6c4b9dd5193fc64a6017c185489",
+    "evidence_tests/test_model_core.py": "0cafce84351b87b2a0ef17cc24ad2d7fe709ca3cb041599c0a5586b9952c89fa",
+    "evidence_tests/test_runner.py": "416dff53ae798d263e10897e3f86005e03deadbf5f5b6b3bbd13cc483ed8fec9",
+    "run_evidence.py": "e0202392d540439dfd2afb5f02c3989c642455b133cad0e3959c03ce4316d2fa",
+    "run_evidence.sh": "be1c17636311906094ad353276443806b65c7467200d4656c8207bf93f4efd6f"
+  },
+  "tests": {
+    "total": 57,
+    "failures": 0,
+    "errors": 0,
+    "seconds": 6.241,
+    "command": "python -m pytest -q evidence_tests",
+    "runtime": {
+      "python": "3.12.14",
+      "torch": "2.5.1+cpu",
+      "numpy": "1.26.4",
+      "gym": "0.21.0 original release source",
+      "pytest": "9.1.1"
+    },
+    "real_components": [
+      "Evidence world model, FC/RC, actor-critic optimizer updates",
+      "replay and complete checkpoint restoration",
+      "Clean action, reward, success, terminal, screenshot/HUD and semifast reset wrappers"
+    ],
+    "mocked_components": [
+      "MineDojo physical simulator",
+      "MineCLIP and U-Net in environment protocol tests"
+    ],
+    "warnings": [
+      "Original Clean uint8 infinite Box casts in Gym0.21/NumPy",
+      "Pinned backend torch.cuda.amp APIs deprecated on test Torch2.5; target requirements use Torch2.1"
+    ]
+  },
+  "syntax": {
+    "python_3_9_ast_modules_passed": 33,
+    "bash_syntax_passed": true
+  },
+  "not_executed": [
+    "Actual Minecraft/Java/Gradle startup and reset",
+    "Formal-size CUDA optimizer update",
+    "Million-step learning experiment"
+  ],
+  "excluded_archive_items": [
+    "Python bytecode and caches",
+    "macOS Finder metadata"
+  ]
+}

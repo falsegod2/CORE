@@ -1,0 +1,762 @@
+--- 20261021/README_ABLATIONS_CN.md
++++ 20261025/README_ABLATIONS_CN.md
+@@ -1,6 +1,6 @@
+-# Clean LS + Evidence 消融实验（2026-10-21）
++# Clean LS + Evidence 消融实验（2026-10-25）
+ 
+-本包以 `LS_Imagine_Clean_Evidence_20261020` 为基础，加入命名消融、统一入口和受管理的 LS-Imagine 串行运行入口。正式实验请以本文为准。旧说明保留用于追溯历史版本。
++本包在 `LS_Imagine_Evidence_Ablations_20261021` 上新增两组无记忆组合消融、固定回放诊断和 LS/no_memory 配对种子入口。训练损失权重与原 Clean 环境协议不变。正式实验请以本文和 [诊断及配对运行说明](README_DIAGNOSTICS_PAIRED_CN.md) 为准；旧说明保留用于追溯历史版本。
+ 
+ ## 1. 安装位置与已有资源
+ 
+@@ -8,8 +8,9 @@
+ 
+ ```bash
+ cd "$HOME/CJJ"
+-unzip -n LS_Imagine_Evidence_Ablations_20261021.zip
+-cd LS_Imagine_Evidence_Ablations_20261021
++unzip -n LS_Imagine_Evidence_Ablations_20261025.zip
++cd LS_Imagine_Evidence_Ablations_20261025
++conda activate ls_imagine
+ ```
+ 
+ 脚本优先使用 `$HOME/CJJ/miniconda3/envs/ls_imagine/bin/python`；如不同，设置 `ENV_PYTHON=/你的环境/bin/python`。包内不包含 MineCLIP/U-Net 权重、Java 或 MineDojo 安装，不会修改你现有的 Gradle 缓存。
+@@ -29,6 +30,8 @@
+ |---|---|---|
+ | `full` | 完整方法，对照组 | 观察记忆、S/Z 动力学、FC、RC、语义监督 |
+ | `no_memory` | 关闭记忆 token 的写入/读取路径 | 局部语义预测辅助头、FC、RC；不是把全部语义监督一起删掉 |
++| `no_memory_no_rc` | 关闭记忆和 RC | FC、局部/后验语义监督、task/clip 奖励头 |
++| `no_memory_no_fc_rc` | 关闭记忆、FC 和 RC | 局部/后验语义监督、task/clip 奖励头 |
+ | `memory_start_only` | 想象 rollout 仅在起点读取记忆 | 真实观察的记忆积累、其余辅助损失 |
+ | `no_fc` | 关闭 FC | 记忆、局部/后验语义监督、RC |
+ | `no_rc` | 关闭 RC | 记忆、语义监督、FC |
+@@ -73,7 +76,7 @@
+ 
+ LS 保留原有 heatmap 输入、concentration shaping、zoom 及长时想象分支。Evidence 保留 RGB policy、只作训练目标的语义标签，以及自身 FC/RC。两种方法共享 Clean 的任务、HUD、动作、终止和 SemifastResetWrapper，不加入 WM 的 RPC/异步评估或固定世界库。两种方法的信息利用和辅助奖励机制仍然不同，不能仅凭“同框架”声称信息预算相同。
+ 
+-七个 Evidence 组在同 seed 下，共有世界模型、actor、value 和 slow value 的初始化参数一致。两个新入口均关闭 `torch.compile`。LS 的总训练步数包含原算法收集长期标签所需的尾段环境动作；评估动作不计入训练预算。
++九个 Evidence 组在同 seed 下，共有世界模型、actor、value 和 slow value 的初始化参数一致。这不表示 LS 与 Evidence 网络初始化相同，也不保证不同方法逐回合遇到相同世界。两个入口均关闭 `torch.compile`。LS 的总训练步数包含原算法收集长期标签所需的尾段环境动作；评估动作不计入训练预算。
+ 
+ ## 4. 输出与恢复
+ 
+@@ -88,7 +91,7 @@
+ 
+ 正式配置默认每 20,000 个累计训练动作保存一次，保留最近两份完整 checkpoint；不是从 100,000 重新计数。`--steps` 是累计目标，恢复按最新完整 checkpoint 的实际步数继续。保存模型、优化器、replay 和训练调度；Minecraft 物理世界需要重新开始一个 episode，不能逐帧接续。日志追加保留，checkpoint 之后尚未保存的交互可能重做。
+ 
+-源码、关键配置与资源身份不匹配会拒绝恢复。**本包新增功能后的实验应使用新目录；不要直接拿旧 WM、原 `expr.py` 的 `latest.pt` 或 20261020 包的 checkpoint 强行恢复。** 这防止把不同方法/源码的状态混为一个实验。
++源码、关键配置与资源身份不匹配会拒绝恢复。**本包新增功能后的实验应使用新目录；不要覆盖仍在运行的 20261021 代码，不要直接拿 20261021、20261020、旧 WM 或原 `expr.py` 的 checkpoint 强行恢复。** 原实验继续用原源码、原命令和原目录恢复；新诊断/新组合从本包的新目录开始。不要删除或修改 `provenance.json` 来绕过身份检查。
+ 
+ 在 tmux 会话中启动后，可以断开本地连接：
+ 
+@@ -107,17 +110,29 @@
+   --gpu 1 --seeds 0 1 2 --include-ls
+ ```
+ 
+-确认资源和单次 smoke 运行正常后，加 `--execute` 才会依次运行全部实验。默认 7 个 Evidence 组 × 3 个 seed；`--include-ls` 再增加 3 个 LS 实验，共 24 次，各自独立目录。不会在一个 GPU 上同时开 24 个 Minecraft；任一实验失败即停止队列。
++确认资源和单次 smoke 运行正常后，加 `--execute` 才会依次运行全部实验。默认 9 个 Evidence 组 × 3 个 seed；`--include-ls` 再增加 3 个 LS 实验，共 30 次，各自独立目录。不会在一个 GPU 上同时开 30 个 Minecraft；任一实验失败即停止队列。
+ 
+ 只运行部分组可用 `--ablations full no_memory no_fc no_rc`。队列的 `--resume` 要求其中每个实验已有有效 checkpoint；部分实验从未启动时，分别使用单次实验命令启动/恢复。
++
++本次最直接的配对计划使用独立的 `paired_20261025` 目录：
++
++```bash
++bash run_paired_benchmark.sh --gpu 1 --seeds 0 1 2
++# 上一行只打印计划；加 --execute 才启动。
++bash run_paired_benchmark.sh --gpu 1 --seeds 0 1 2 --execute
++```
++
++默认仅 LS 与 no_memory 两方法、三个种子，共六次。新增组合可用 `--methods no_memory_no_rc no_memory_no_fc_rc`。分 GPU、恢复和只读统计的完整命令见 [README_DIAGNOSTICS_PAIRED_CN.md](README_DIAGNOSTICS_PAIRED_CN.md)。
+ 
+ ## 6. 日志与解释
+ 
+ Evidence 新增真实训练/评估动作计数和频率，以及想象中的 task/clip 奖励分项。可区分“总想象奖励变高”是哪个 head 的变化，并检查真实动作是否长期偏向 action3（向下看）。
+ 
+-具体字段为 `imag_task_reward_mean`、`imag_clip_reward_mean`、`imag_scaled_clip_reward_mean`，以及 `real_action_counts` / `real_action_fractions`、`eval_action_counts` / `eval_action_fractions`。LS 的原有指标在 `metrics.jsonl`，运行/保存/恢复事件在 `runtime.jsonl`。
++具体字段为 `imag_task_reward_mean`、`imag_clip_reward_mean`、`imag_scaled_clip_reward_mean`，以及 `real_action_counts` / `real_action_fractions`、`eval_action_counts` / `eval_action_fractions`。本版 LS 的 `metrics.jsonl` 同时含原有标量和运行事件；`runtime.jsonl` 保留兼容副本。LS 的结构化 `evaluation` 事件把重复摘要放在 `result` 内，统计评估曲线只读取顶层 `eval_success`，避免重复计数。
+ 
+ RC 条件误差改为按日志窗口累计误差分子/有效权重，再求比值；没有正样本时记为 `null`，不会再用 0 稀释正样本 MAE。此修正改变诊断口径，不改变完整 Evidence 的 RC 训练损失；新旧 RC MAE 曲线不能直接当成同一统计量。
++
++本版每 20,000 步额外记录 `event=diagnostics` 的固定回放诊断；数据和采样位置保存进 checkpoint。诊断测量零/非零目标回报误差、FC/RC 梯度与 Memory 读取，不更新参数。`train` 行仍然是原训练采样窗口的指标，不能与固定 bank 指标混为同一条曲线。字段、限制和开关见新诊断说明。
+ 
+ `task_reward` 始终保留底层原生任务奖励；success 独立读取环境成功标志，不能把 reward 恒当作严格二值成功标签。MineCLIP record-high intrinsic 延续 Clean 实现，不是相邻帧分数差。
+ 
+--- 20261021/clean_evidence/ablations.py
++++ 20261025/clean_evidence/ablations.py
+@@ -1,4 +1,4 @@
+-"""Named single-component controls for the Clean Evidence experiment.
++"""Named component and combination controls for the Clean Evidence experiment.
+ 
+ The environment, MineCLIP reward, model size recipe and interaction budget are
+ shared. ``no_semantic`` deliberately removes all teacher supervision together;
+@@ -17,6 +17,15 @@
+     'no_memory': {
+         'description': 'Disable RGB memory writes and reads; retain semantic targets, FC and RC.',
+         'evidence': {'memory_enabled': False, 'read_mode': 'none'},
++    },
++    'no_memory_no_rc': {
++        'description': 'Disable RGB memory and RC; retain FC, semantic targets and both supervised reward heads.',
++        'evidence': {'memory_enabled': False, 'read_mode': 'none', 'rc_weight': 0.0},
++    },
++    'no_memory_no_fc_rc': {
++        'description': 'Disable RGB memory, FC and RC; retain local/posterior semantic targets and both supervised reward heads.',
++        'evidence': {'memory_enabled': False, 'read_mode': 'none',
++                     'fc_weight': 0.0, 'rc_weight': 0.0},
+     },
+     'memory_start_only': {
+         'description': 'Read the fixed RGB memory only at the first imagined transition; retain real-observation updates.',
+--- 20261021/clean_evidence/configuration.py
++++ 20261025/clean_evidence/configuration.py
+@@ -93,6 +93,7 @@
+         replay_capacity=int(clean['dataset_size']), eval_every=int(clean['eval_every']),
+         eval_episodes=int(clean['eval_episode_num']), log_every=int(clean['log_every']),
+         checkpoint_every=20000, keep_checkpoints=2, min_free_gb=8.0,
++        diagnostics=dict(enabled=True, every=20000, batch_size=2, gradients=True),
+         num_actions=12, max_episode_steps=int(specs['terminal_specs']['max_steps']),
+         needs_heatmap=True, semantic_teacher_only=True,
+         protocol=dict(name='uploaded_clean_ls_environment', eval_action='mode',
+@@ -117,6 +118,7 @@
+         config['evidence'].update(memory_observations=2, memory_dim=16, attention_heads=2,
+                                   writer_depth=4, burnin=4, horizons=[1, 2, 4],
+                                   horizon_weights=[1., 1., .5], starts_per_sequence=2)
++        config['diagnostics']['every'] = 2500
+     apply_ablation(config, ablation)
+     for expression in overrides:
+         set_value(config, expression)
+@@ -158,6 +160,15 @@
+     if not math.isfinite(config['train_ratio']) or config['train_ratio'] <= 0:
+         raise ValueError('train_ratio must be finite and positive')
+     options = config['evidence']
++    diagnostic = config['diagnostics']
++    for key in ('enabled', 'gradients'):
++        if not isinstance(diagnostic[key], bool):
++            raise ValueError(f'diagnostics.{key} must be a boolean')
++    for key in ('every', 'batch_size'):
++        if isinstance(diagnostic[key], bool) or not isinstance(diagnostic[key], int) or diagnostic[key] < 1:
++            raise ValueError(f'diagnostics.{key} must be a positive integer')
++    if diagnostic['batch_size'] > 16:
++        raise ValueError('diagnostics.batch_size must be <= 16; diagnostic probes are bounded')
+     for key in ('memory_observations', 'memory_dim', 'attention_heads', 'writer_depth',
+                 'heatmap_size', 'starts_per_sequence', 'mc_samples'):
+         if isinstance(options[key], bool) or not isinstance(options[key], int) or options[key] < 1:
+@@ -225,8 +236,12 @@
+         if not path.is_file():
+             raise FileNotFoundError(f'Missing {key} resource: {path}')
+         assets[key] = {'path': str(path), 'sha256': sha256(path)}
+-    ignored = {'train_steps', 'logdir', 'assets_root', 'device', 'env_device', 'min_free_gb', 'keep_checkpoints'}
++    ignored = {'train_steps', 'logdir', 'assets_root', 'device', 'env_device', 'min_free_gb', 'keep_checkpoints', 'diagnostics'}
+     semantic_config = {key: value for key, value in config.items() if key not in ignored}
++    # Toggle/cadence/gradient measurement are operational. Retain the bank
++    # size in identity so a resumed audit cannot silently change its sample
++    # design while the first nonzero bank is still pending.
++    semantic_config['diagnostics'] = {'batch_size': config.get('diagnostics', {}).get('batch_size', 2)}
+     # Device and output path inside the copied Clean settings are operational.
+     semantic_config['clean'] = {key: value for key, value in config['clean'].items()
+                                 if key not in ('device', 'logdir', 'traindir', 'evaldir', 'results_dir')}
+--- 20261021/clean_evidence/methods/evidence_dreamer.py
++++ 20261025/clean_evidence/methods/evidence_dreamer.py
+@@ -92,6 +92,11 @@
+         self.behavior.requires_grad_(False)
+         self.replay = EvidenceReplay(config, self.options)
+         self.updates = 0
++        from ..diagnostics import FixedReplayProbes
++        self.diagnostic_probes = FixedReplayProbes(config)
++
++    def diagnostics(self, step):
++        return self.diagnostic_probes.evaluate(self, step)
+ 
+     def act(self, obs, carry, training=True, random_action=None):
+         torch = self.torch
+--- 20261021/clean_evidence/methods/evidence_model.py
++++ 20261025/clean_evidence/methods/evidence_model.py
+@@ -442,3 +442,14 @@
+                    "loss_mask": mask.detach(), "sequence_valid": data["sequence_valid"].detach()}
+         return {key: value.detach() for key, value in post.items()}, context, metrics
+ 
++    def diagnostic_metrics(self, batch, gradients=True, starts_per_sequence=None):
++        """Measure a fixed recorded batch without optimizing any parameter.
++
++        The caller owns a persisted probe batch and isolates RNG/module modes.
++        Disabled FC/RC are still measured here; their configured gradient
++        contributions remain zero. This does not change the training path.
++        """
++        from .diagnostic_model import diagnostic_metrics
++        return diagnostic_metrics(self, batch, gradients=gradients,
++                                  starts_per_sequence=starts_per_sequence)
++
+--- 20261021/clean_evidence/methods/evidence_rssm.py
++++ 20261025/clean_evidence/methods/evidence_rssm.py
+@@ -7,11 +7,107 @@
+ """
+ from __future__ import annotations
+ 
++import contextlib
++import math
++
+ import torch
+ from torch import nn
++from torch.nn import functional as F
+ 
+ from ..vendor.dreamerv3_torch import tools
+ from .dual_rssm_torch import DualRSSM
++
++
++class _MemoryDiagnostics:
++    """Detached sufficient statistics from an explicitly requested probe.
++
++    Read measurements include only rows whose memory actually influences the
++    transition. Thus an empty buffer or a skipped start-only read has no gate,
++    attention or residual observation, rather than a misleading zero error.
++    Stored values are Python numbers, never live autograd tensors.
++    """
++    _ratios = (
++        "available_fraction", "active_read_fraction", "gate_mean",
++        "gate_low_fraction", "gate_high_fraction", "attention_null_mass",
++        "attention_real_mass", "attention_entropy_normalized",
++        "attended_age_steps", "gated_delta_to_state_norm",
++        "effective_delta_to_state_norm",
++    )
++
++    def __init__(self, prefix, enabled, read_mode):
++        self.prefix = prefix
++        self.stats = {
++            prefix + "_enabled": int(enabled),
++            prefix + "_read_mode_code": {"none": 0, "start_only": 1, "each_step": 2}[read_mode],
++            prefix + "_transition_rows": 0,
++            prefix + "_active_read_rows": 0,
++        }
++        for name in self._ratios:
++            self.stats[prefix + "_" + name + "_numerator"] = 0.0
++            self.stats[prefix + "_" + name + "_denominator"] = 0.0
++
++    def add(self, name, numerator, denominator):
++        key = self.prefix + "_" + name
++        self.stats[key + "_numerator"] += float(numerator)
++        self.stats[key + "_denominator"] += float(denominator)
++
++    @torch.no_grad()
++    def transition(self, available, active):
++        available_count = int(available.sum().item())
++        active_count = int(active.sum().item())
++        count = available.numel()
++        self.stats[self.prefix + "_transition_rows"] += count
++        self.stats[self.prefix + "_active_read_rows"] += active_count
++        self.add("available_fraction", available_count, count)
++        self.add("active_read_fraction", active_count, count)
++
++    @torch.no_grad()
++    def read(self, model, query, keys, valid, raw_age, use, gate,
++             base_state, gated_delta, retrieved):
++        active = use.squeeze(-1).bool()
++        if not bool(active.any()):
++            return
++        # Keep the real forward's need_weights=False call untouched. Rebuild
++        # only Q/K weights from detached values; dropout is zero in this RSSM.
++        # This auxiliary calculation never feeds the state or optimizer.
++        attention = model.attention
++        with torch.autocast(device_type=query.device.type, enabled=False):
++            width, heads = attention.embed_dim, attention.num_heads
++            weight = attention.in_proj_weight.detach().float()
++            bias = attention.in_proj_bias
++            bias = None if bias is None else bias.detach().float()
++            q = F.linear(query.detach().float(), weight[:width],
++                         None if bias is None else bias[:width])
++            k = F.linear(keys.detach().float(), weight[width:2 * width],
++                         None if bias is None else bias[width:2 * width])
++            q = q.reshape(q.shape[0], heads, width // heads)
++            k = k.reshape(k.shape[0], k.shape[1], heads, width // heads).transpose(1, 2)
++            logits = torch.einsum("bhd,bhtd->bht", q, k) / math.sqrt(width // heads)
++            weights = logits.masked_fill(~valid[:, None, :], -torch.inf).softmax(-1)
++            weights = weights[active]
++            null_mass = weights[..., -1]
++            real_weights = weights[..., :-1]
++            real_mass = real_weights.sum(-1)
++            entropy = -(weights * weights.clamp_min(1e-30).log()).sum(-1)
++            # Includes the learned null token. Uniform attention over all
++            # available keys has normalized entropy one, regardless of fill.
++            key_count = valid[active].sum(-1).float()
++            normalized_entropy = entropy / key_count.log()[:, None]
++            age = raw_age.detach().float()[active, None, :]
++            self.add("attention_null_mass", null_mass.sum().item(), null_mass.numel())
++            self.add("attention_real_mass", real_mass.sum().item(), real_mass.numel())
++            self.add("attention_entropy_normalized", normalized_entropy.sum().item(), normalized_entropy.numel())
++            self.add("attended_age_steps", (real_weights * age).sum().item(), real_mass.sum().item())
++            active_gate = gate.detach().float()[active]
++            self.add("gate_mean", active_gate.sum().item(), active_gate.numel())
++            self.add("gate_low_fraction", (active_gate < 0.05).sum().item(), active_gate.numel())
++            self.add("gate_high_fraction", (active_gate > 0.95).sum().item(), active_gate.numel())
++            base = base_state.detach().float()[active]
++            norm = base.norm(dim=-1).clamp_min(1e-8)
++            delta_ratio = gated_delta.detach().float()[active].norm(dim=-1) / norm
++            effective_ratio = (retrieved.detach().float()[active] - base).norm(dim=-1) / norm
++            self.add("gated_delta_to_state_norm", delta_ratio.sum().item(), delta_ratio.numel())
++            self.add("effective_delta_to_state_norm", effective_ratio.sum().item(), effective_ratio.numel())
+ 
+ 
+ class EvidenceRSSM(DualRSSM):
+@@ -39,6 +135,8 @@
+             raise ValueError("memory_enabled must be a boolean")
+         self.memory_enabled = memory_enabled
+         self.read_mode = read_mode
++        self._memory_diagnostics = None
++        self._memory_diagnostic_rows = None
+         branch_deter, branch_hidden = self._deter // 2, self._hidden // 2
+         branch_stoch = self._stoch // 2 * self._discrete
+         with torch.random.fork_rng(devices=[]):
+@@ -57,6 +155,47 @@
+                 nn.init.constant_(self.read_gate.bias, -2.0)
+                 self.read_norm = nn.LayerNorm(branch_deter, eps=1e-3)
+ 
++    @contextlib.contextmanager
++    def capture_memory_diagnostics(self, prefix="memory"):
++        """Yield ratio sufficient statistics for transitions in this scope.
++
++        Modes: none=0, start_only=1, each_step=2. Empty populations have a zero
++        denominator and should be reported as null, not as successful reads.
++        This scope does not isolate RNG or alter model mode; the caller owns
++        those protections for the complete fixed-batch diagnostic pass.
++        """
++        if not isinstance(prefix, str) or not prefix:
++            raise ValueError("Memory diagnostic prefix must be a nonempty string")
++        if self._memory_diagnostics is not None:
++            raise RuntimeError("Nested memory diagnostic captures are unsupported")
++        collector = _MemoryDiagnostics(prefix, self.memory_enabled, self.read_mode)
++        self._memory_diagnostics = collector
++        try:
++            yield collector.stats
++        finally:
++            self._memory_diagnostics = None
++
++    @contextlib.contextmanager
++    def memory_diagnostic_mask(self, valid_rows):
++        """Limit telemetry to selected batch rows without limiting the rollout.
++
++        Recorded-prefix probes may computationally roll all rows to their
++        maximum horizon. The caller masks rows beyond their valid recorded
++        prefix with this scope so they do not become memory observations.
++        ``valid_rows`` is a one-dimensional boolean tensor matching each
++        img_step batch in this scope. Nested scopes temporarily override the
++        previous mask and restore it even on failure. No mask affects the
++        latent state, attention computation, random draws or gradients.
++        """
++        if not isinstance(valid_rows, torch.Tensor) or valid_rows.dtype != torch.bool or valid_rows.ndim != 1:
++            raise ValueError("Memory diagnostic mask must be a one-dimensional boolean tensor")
++        previous = self._memory_diagnostic_rows
++        self._memory_diagnostic_rows = valid_rows.detach()
++        try:
++            yield
++        finally:
++            self._memory_diagnostic_rows = previous
++
+     def _validate_state(self, state):
+         if not isinstance(state, dict) or not set(self._latent_keys).issubset(state):
+             raise ValueError("EvidenceRSSM needs deter, stoch and logit")
+@@ -110,6 +249,21 @@
+         # execute attention. Real obs_step resets imag_steps to zero as before.
+         if should_read and self.read_mode == "start_only":
+             should_read = bool((prev_state["imag_steps"] == 0).any())
++        collector = self._memory_diagnostics
++        diagnostic_rows = None
++        if collector is not None:
++            available = prev_state["mem_valid"].any(-1)
++            active = available & bool(should_read)
++            if self.read_mode == "start_only":
++                active = active & (prev_state["imag_steps"].squeeze(-1) == 0)
++            diagnostic_rows = self._memory_diagnostic_rows
++            if diagnostic_rows is None:
++                collector.transition(available, active)
++            else:
++                if diagnostic_rows.shape != available.shape:
++                    raise ValueError("Memory diagnostic mask must match the img_step batch")
++                diagnostic_rows = diagnostic_rows.to(device=available.device)
++                collector.transition(available[diagnostic_rows], active[diagnostic_rows])
+         if should_read:
+             query = self.query(torch.cat([s_deter, z_deter, prev_action], -1))
+             tokens = prev_state["mem_tokens"]
+@@ -127,7 +281,13 @@
+             if self.read_mode == "start_only":
+                 use = use & (prev_state["imag_steps"] == 0)
+             gate = torch.sigmoid(self.read_gate(torch.cat([s_deter, z_deter, evidence], -1)))
+-            retrieved = self.read_norm(s_deter + gate * self.read_out(evidence))
++            gated_delta = gate * self.read_out(evidence)
++            retrieved = self.read_norm(s_deter + gated_delta)
++            if collector is not None:
++                diagnostic_use = use if diagnostic_rows is None else use & diagnostic_rows[:, None]
++                collector.read(self, query, keys, valid,
++                               prev_state["mem_age"] + prev_state["imag_steps"] + 1,
++                               diagnostic_use, gate, s_deter, gated_delta, retrieved)
+             s_deter = torch.where(use, retrieved, s_deter)
+         state = self._merge_state(self._prior(self.s, s_deter, sample), self._prior(self.z, z_deter, sample))
+         # No clone/write/refresh: the branch keeps the exact evidence snapshot.
+--- 20261021/clean_evidence/methods/lifecycle.py
++++ 20261025/clean_evidence/methods/lifecycle.py
+@@ -48,6 +48,8 @@
+ 
+         state = cpu(state)
+         state['replay'] = self.replay.state_dict()
++        if hasattr(self, 'diagnostic_probes'):
++            state['diagnostic_probes'] = self.diagnostic_probes.state_dict()
+         return state
+ 
+     def load_state_dict(self, state):
+@@ -65,6 +67,8 @@
+         self.behavior._updates = int(state['behavior_updates'])
+         self.updates = int(state['updates'])
+         self.replay.load_state_dict(state['replay'])
++        if hasattr(self, 'diagnostic_probes') and 'diagnostic_probes' in state:
++            self.diagnostic_probes.load_state_dict(state['diagnostic_probes'])
+         self.torch.set_rng_state(state['torch_rng'])
+         if state['cuda_rng'] is not None and self.torch.cuda.is_available():
+             if len(state['cuda_rng']) != self.torch.cuda.device_count():
+--- 20261021/clean_evidence/runner.py
++++ 20261025/clean_evidence/runner.py
+@@ -8,6 +8,7 @@
+ import contextlib
+ import copy
+ import json
++import os
+ from pathlib import Path
+ import random
+ import time
+@@ -173,6 +174,8 @@
+         self.prefill_random = np.random.RandomState(int(config['seed']))
+         self.elapsed_prior = 0.0
+         self.started = 0.0
++        self.next_diagnostic = int(config.get('diagnostics', {}).get('every', 20000))
++        self.last_diagnostic = -1
+ 
+     def _make_method(self):
+         factory = self.method_factory
+@@ -239,6 +242,7 @@
+                 self.logger.write('resume' if self.resume else 'launch', self.step,
+                                   config=self.c, identity=self.meta['identity'],
+                                   parameters=self.method.parameter_report(),
++                                  cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
+                                   environment_protocol='clean_ls_source_tree',
+                                   validation_scope='Not paper-performance validation')
+                 if self.step < self.c['train_steps']:
+@@ -274,6 +278,28 @@
+             values = _finite(self.logger, self.method.update())
+             self.mean.add(values)
+             self.updates += 1
++
++    def _diagnose(self):
++        if not self.c.get('diagnostics', {}).get('enabled', False) or self.last_diagnostic == self.step:
++            return
++        if not self.method.ready():
++            return
++        started = time.monotonic()
++        self.logger.write('diagnostics_start', self.step, update_count=self.updates)
++        print(f'[DIAGNOSTICS START] step={self.step}', flush=True)
++        try:
++            result = self.method.diagnostics(self.step)
++            self.logger.write('diagnostics', self.step, update_count=self.updates,
++                              seconds=time.monotonic() - started, **result)
++            print(f'[DIAGNOSTICS DONE] step={self.step} seconds={time.monotonic() - started:.1f}', flush=True)
++        except Exception as error:
++            # An optional audit must not discard an otherwise healthy run.
++            # Failure remains explicit, never an invented zero-valued result.
++            self.logger.write('diagnostics_failed', self.step, error_type=type(error).__name__,
++                              error=str(error), traceback=traceback.format_exc(),
++                              seconds=time.monotonic() - started)
++            print(f'[DIAGNOSTICS FAILED] step={self.step} {type(error).__name__}: {error}', flush=True)
++        self.last_diagnostic = self.step
+ 
+     def _pop_train_metrics(self):
+         values = self.mean.pop()
+@@ -346,6 +372,10 @@
+                 self.logger.write('train', self.step, update_count=self.updates, **self._pop_train_metrics())
+                 self.last_log = self.step
+                 print(f'[TRAIN {self.step}] updates={self.updates} episodes={self.episodes}', flush=True)
++            if self.step >= self.next_diagnostic:
++                self._diagnose()
++                while self.next_diagnostic <= self.step:
++                    self.next_diagnostic += int(self.c.get('diagnostics', {}).get('every', 20000))
+             if self.c['checkpoint_every'] and self.step >= self.next_checkpoint:
+                 while self.next_checkpoint <= self.step:
+                     self.next_checkpoint += int(self.c['checkpoint_every'])
+@@ -359,6 +389,7 @@
+             self.logger.write('budget_cut', self.step, partial_episode_steps=length)
+         if self.method.ready() and self.last_eval != self.step:
+             self._evaluate()
++        self._diagnose()
+         self.mean.add(_finite(self.logger, self.method.flush_metrics()))
+         values = self._pop_train_metrics()
+         if values:
+@@ -367,10 +398,14 @@
+     def save(self):
+         if self.step == self.last_checkpoint:
+             return
++        started = time.monotonic()
++        self.logger.write('checkpoint_start', self.step)
+         self.checkpoints.require_space()
+         state = dict(method=self.method.state_dict(), step=self.step,
+                      updates=self.updates, episodes=self.episodes, evaluations=self.evaluations,
+                      next_eval=self.next_eval, next_checkpoint=self.next_checkpoint,
++                     next_diagnostic=self.next_diagnostic, last_diagnostic=self.last_diagnostic,
++                     diagnostic_settings=copy.deepcopy(self.c.get('diagnostics', {})),
+                      pretrained=self.pretrained, last_eval=self.last_eval,
+                      last_log=self.last_log, prefill_rng=self.prefill_random.get_state(),
+                      global_rng=_global_rng_state(),
+@@ -381,7 +416,7 @@
+                      elapsed=self.elapsed_prior + time.monotonic() - self.started)
+         path = self.checkpoints.save(self.step, state, self.meta['identity'])
+         self.last_checkpoint = self.step
+-        self.logger.write('checkpoint', self.step, path=str(path))
++        self.logger.write('checkpoint', self.step, path=str(path), checkpoint_seconds=time.monotonic() - started)
+ 
+     def restore(self):
+         state = self.checkpoints.load(self.meta['identity'])
+@@ -398,6 +433,11 @@
+         if self.action_counts.shape != (int(self.c['num_actions']),) or (self.action_counts < 0).any():
+             raise ValueError('Checkpoint action-count shape or values are invalid')
+         self.prefill_action_steps = int(state.get('prefill_action_steps', 0))
++        self.next_diagnostic = int(state.get('next_diagnostic', self.next_diagnostic))
++        self.last_diagnostic = int(state.get('last_diagnostic', -1))
++        if state.get('diagnostic_settings', {}).get('every') != self.c.get('diagnostics', {}).get('every'):
++            interval = int(self.c.get('diagnostics', {}).get('every', 20000))
++            self.next_diagnostic = (self.step // interval + 1) * interval
+         self.elapsed_prior = float(state['elapsed'])
+         self.last_checkpoint = self.step
+         self.logger.write('resume_boundary', self.step,
+--- 20261021/clean_ls/runner.py
++++ 20261025/clean_ls/runner.py
+@@ -6,8 +6,8 @@
+ from __future__ import annotations
+ from collections import OrderedDict
+ import copy
+-import functools
+ import json
++import os
+ from pathlib import Path
+ import time
+ import traceback
+@@ -21,6 +21,76 @@
+ from clean_evidence.storage import RunLock, Checkpoints, atomic_json
+ from clean_evidence.runner import _global_rng_state, _restore_global_rng
+ from .configuration import namespace, experiment_manifest
++
++
++class _RunEvents:
++    """Keep runtime compatibility while making metrics.jsonl self-contained.
++
++    Native LS scalar rows remain unique. Evaluation completion events carry
++    their repeated scalar summary under ``result`` rather than repeating flat
++    ``eval_success`` fields which older plotting scripts count as evaluations.
++    """
++    def __init__(self, directory):
++        self.primary = Metrics(directory / 'metrics.jsonl')
++        self.compatibility = Metrics(directory / 'runtime.jsonl')
++
++    def write(self, event, step, **values):
++        self.primary.write(event, step, **values)
++        self.compatibility.write(event, step, **values)
++
++
++class _ObservedLogger:
++    """Observe the original logger without changing LS learning or scalars.
++
++    Extra evaluation timing/count scalars are written in the original, single
++    evaluation row. The wrapped native logger retains TensorBoard/video behavior.
++    """
++    def __init__(self, logger):
++        object.__setattr__(self, '_native', logger)
++        object.__setattr__(self, '_pending', {})
++        object.__setattr__(self, '_evaluation_started', None)
++        object.__setattr__(self, '_evaluation_steps', None)
++        object.__setattr__(self, 'last_evaluation', None)
++
++    def __getattr__(self, name):
++        return getattr(self._native, name)
++
++    def __setattr__(self, name, value):
++        if name in ('_native', '_pending', '_evaluation_started',
++                    '_evaluation_steps', 'last_evaluation'):
++            object.__setattr__(self, name, value)
++        else:
++            setattr(self._native, name, value)
++
++    def scalar(self, name, value):
++        self._pending[name] = float(value)
++        self._native.scalar(name, value)
++
++    def begin_evaluation(self, started, steps):
++        self.last_evaluation = None
++        self._evaluation_started, self._evaluation_steps = started, steps
++
++    def end_evaluation(self):
++        self._evaluation_started = self._evaluation_steps = None
++
++    def write(self, *args, **kwargs):
++        if self._evaluation_started is not None and 'eval_success' in self._pending:
++            self.scalar('eval_actual_steps', int(self._evaluation_steps()))
++            self.scalar('eval_seconds', time.monotonic() - self._evaluation_started)
++            self.last_evaluation = {key: value for key, value in self._pending.items()
++                                    if key.startswith('eval_')}
++        result = self._native.write(*args, **kwargs)
++        self._pending.clear()
++        return result
++
++
++def _device_metadata(device):
++    """Report visibility rather than guessing the physical CUDA index."""
++    result = dict(cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
++                  logical_device=str(device), device_name=None)
++    if str(device).startswith('cuda') and torch.cuda.is_available():
++        result['device_name'] = torch.cuda.get_device_name(torch.device(device))
++    return result
+ 
+ 
+ def _cpu(value):
+@@ -74,7 +144,7 @@
+             else:
+                 atomic_json(self.dir / 'config.json', self.config)
+                 atomic_json(self.dir / 'provenance.json', self.meta)
+-            self.events = Metrics(self.dir / 'runtime.jsonl')
++            self.events = _RunEvents(self.dir)
+             self.checkpoints = Checkpoints(self.dir / 'checkpoints', self.config['keep_checkpoints'],
+                                            self.config['min_free_gb'])
+             for path in (self.c.traindir, self.c.evaldir):
+@@ -82,11 +152,12 @@
+             tools.set_seed_everywhere(self.c.seed)
+             if self.c.deterministic_run:
+                 tools.enable_deterministic_run()
+-            self.logger = tools.Logger(self.c, self.dir, 0)
++            self.logger = _ObservedLogger(tools.Logger(self.c, self.dir, 0))
+             try:
+                 self._initialize()
+                 self.events.write('resume' if self.resume else 'launch', self.step,
+                                   method='ls_imagine', config=self.config,
++                                  runtime=_device_metadata(self.c.device),
+                                   count_scope='all train environment actions including LS label tails')
+                 self._loop()
+                 self.save()
+@@ -152,13 +223,34 @@
+     def _evaluate(self):
+         started = time.monotonic()
+         self.events.write('evaluation_start', self.step, episodes=self.c.eval_episode_num)
+-        self._simulate(functools.partial(self.agent, training=False), evaluation=True)
++        # envs=1 is validated by configuration. Each call results in exactly
++        # one real environment action; the legacy simulator owns all semantics.
++        actual_steps = 0
++        def evaluation_agent(*args, **kwargs):
++            nonlocal actual_steps
++            result = self.agent(*args, training=False, **kwargs)
++            actual_steps += 1
++            return result
++        self.logger.begin_evaluation(started, lambda: actual_steps)
++        try:
++            simulation = self._simulate(evaluation_agent, evaluation=True)
++        finally:
++            self.logger.end_evaluation()
++        result = copy.deepcopy(self.logger.last_evaluation)
++        if result is None or int(result['eval_episodes']) != self.c.eval_episode_num:
++            raise RuntimeError('LS evaluation did not produce its complete native scalar summary')
++        if int(simulation[0]) != actual_steps:
++            raise RuntimeError('LS evaluation action count disagrees with native simulation')
+         if self.c.video_pred_log:
+             video = self.agent._wm.video_pred(next(self.eval_dataset))
+             self.logger.video('eval_openl', video.detach().cpu().numpy())
+             self.logger.write()
+         self.last_eval = self.step
+-        self.events.write('evaluation_done', self.step, seconds=time.monotonic() - started)
++        self.events.write('evaluation', self.step, split='eval', result=result,
++                          eval_actual_steps=actual_steps,
++                          eval_seconds=time.monotonic() - started,
++                          timing_scope='complete evaluation including video logging',
++                          scalar_timing_scope='environment and policy before final logger flush')
+ 
+     def _prefill(self):
+         if self.step < self.c.prefill:
+@@ -194,6 +286,7 @@
+     def save(self):
+         if self.last_checkpoint == self.step:
+             return
++        started = time.monotonic()
+         schedules = {name: copy.deepcopy(getattr(self.agent, name).__dict__) for name in
+                      ('_should_train', '_should_pretrain', '_should_log', '_should_reset')}
+         opts = {name: dict(optimizer=_cpu(opt._opt.state_dict()), scaler=opt._scaler.state_dict())
+@@ -209,7 +302,8 @@
+                      next_eval=self.next_eval, next_checkpoint=self.next_checkpoint, last_eval=self.last_eval)
+         path = self.checkpoints.save(self.step, state, self.meta['identity'])
+         self.last_checkpoint = self.step
+-        self.events.write('checkpoint', self.step, path=str(path))
++        self.events.write('checkpoint', self.step, path=str(path),
++                          checkpoint_seconds=time.monotonic() - started)
+ 
+     def restore(self):
+         state = self.checkpoints.load(self.meta['identity'])
+--- 20261021/evidence_tests/test_ablations.py
++++ 20261025/evidence_tests/test_ablations.py
+@@ -29,6 +29,11 @@
+ 
+ @pytest.mark.parametrize('name,key,value', [
+     ('no_memory', 'memory_enabled', 'true'),
++    ('no_memory_no_rc', 'memory_enabled', 'true'),
++    ('no_memory_no_rc', 'rc_weight', '0.01'),
++    ('no_memory_no_fc_rc', 'fc_weight', '0.05'),
++    ('no_memory_no_fc_rc', 'rc_weight', '0.01'),
++    ('no_memory_no_fc_rc', 'read_mode', 'each_step'),
+     ('memory_start_only', 'read_mode', 'each_step'),
+     ('no_fc', 'fc_weight', '0.05'),
+     ('no_rc', 'rc_weight', '0.01'),
+@@ -97,11 +102,11 @@
+     assert method.updates == 1 and metrics['actor_skipped'] == 0
+     assert np.isfinite([value for value in metrics.values() if isinstance(value, (float, int))]).all()
+     assert any(not torch.equal(parameters[key], value) for key, value in method.wm.named_parameters())
+-    if name in ('no_fc', 'no_fc_rc'):
++    if name in ('no_fc', 'no_fc_rc', 'no_memory_no_fc_rc'):
+         assert metrics['fc_loss'] == metrics['fc_prefixes'] == 0
+-    if name in ('no_rc', 'no_fc_rc'):
++    if name in ('no_rc', 'no_fc_rc', 'no_memory_no_rc', 'no_memory_no_fc_rc'):
+         assert metrics['rc_loss'] == metrics['rc_prefixes'] == 0
+-    if name == 'no_memory':
++    if name in ('no_memory', 'no_memory_no_rc', 'no_memory_no_fc_rc'):
+         assert not hasattr(method.wm.dynamics, 'attention')
+         assert metrics['memory_fill'] == 0
+         # The independent local semantic predictor remains trained, but the
+@@ -122,6 +127,20 @@
+     for key, value in method.wm.state_dict().items():
+         assert torch.equal(value, restored.wm.state_dict()[key]), key
+     assert restored.parameter_report()['ablation'] == name
++
++
++@pytest.mark.parametrize('name,fc', [('no_memory_no_rc', 0.05),
++                                   ('no_memory_no_fc_rc', 0.0)])
++def test_combination_controls_preserve_real_reward_and_semantic_supervision(name, fc):
++    full = build_config()
++    c = build_config(ablation=name)
++    assert c['needs_heatmap'] and c['semantic_teacher_only']
++    assert c['protocol'] == full['protocol']
++    assert not c['evidence']['memory_enabled'] and c['evidence']['read_mode'] == 'none'
++    assert c['evidence']['rc_weight'] == 0 and c['evidence']['fc_weight'] == fc
++    for key in ('task_reward_weight', 'clip_reward_weight', 'clip_scale',
++                'local_heat_weight', 'posterior_heat_weight'):
++        assert c['evidence'][key] == full['evidence'][key] == 1.0
+ 
+ 
+ def test_start_only_skips_attention_after_first_imagined_transition(monkeypatch):
+--- 20261021/evidence_tests/test_suite_cli.py
++++ 20261025/evidence_tests/test_suite_cli.py
+@@ -35,7 +35,7 @@
+             assert config['logdir'] not in paths
+             assert '/formal/' in config['logdir']
+             paths.add(config['logdir'])
+-    assert len(paths) == 8
++    assert len(paths) == len(VARIANTS) + 1
+ 
+ 
+ def test_ls_rejects_evidence_ablation_instead_of_silently_ignoring_it():
+--- 20261021/run_ablation_suite.py
++++ 20261025/run_ablation_suite.py
+@@ -6,9 +6,9 @@
+ import sys
+ from pathlib import Path
+ 
++from clean_evidence.ablations import ABLATIONS
+ 
+-VARIANTS = ('full', 'no_memory', 'memory_start_only', 'no_fc', 'no_rc',
+-            'no_fc_rc', 'no_semantic')
++VARIANTS = tuple(ABLATIONS)
+ ROOT = Path(__file__).resolve().parent
+ 
+ 

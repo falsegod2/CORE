@@ -1,0 +1,56 @@
+{
+  "test_counts": {
+    "tests": 158,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "python39_syntax_files": 90,
+  "protected_files_byte_identical": 31,
+  "protected_paths": [
+    "envs",
+    "configs.yaml",
+    "models.py",
+    "networks.py",
+    "tools.py",
+    "expr.py",
+    "clean_evidence/vendor",
+    "clean_evidence/environment.py",
+    "clean_ls/environment.py"
+  ],
+  "modified": [
+    "README_ABLATIONS_CN.md",
+    "clean_evidence/ablations.py",
+    "clean_evidence/configuration.py",
+    "clean_evidence/methods/evidence_dreamer.py",
+    "clean_evidence/methods/evidence_model.py",
+    "clean_evidence/methods/evidence_rssm.py",
+    "clean_evidence/methods/lifecycle.py",
+    "clean_evidence/runner.py",
+    "clean_ls/runner.py",
+    "evidence_tests/test_ablations.py",
+    "evidence_tests/test_suite_cli.py",
+    "run_ablation_suite.py"
+  ],
+  "added": [
+    "README_DIAGNOSTICS_PAIRED_CN.md",
+    "clean_evidence/diagnostics.py",
+    "clean_evidence/methods/diagnostic_model.py",
+    "evidence_tests/test_diagnostic_model.py",
+    "evidence_tests/test_diagnostics_runtime.py",
+    "evidence_tests/test_ls_paired_runtime.py",
+    "evidence_tests/test_memory_diagnostics.py",
+    "evidence_tests/test_paired_benchmark.py",
+    "evidence_tests/test_paired_summary.py",
+    "run_paired_benchmark.py",
+    "run_paired_benchmark.sh",
+    "summarize_paired_benchmark.py"
+  ],
+  "tests_scope": "CPU small real neural networks and fake physics; no remote Minecraft or formal CUDA run",
+  "omitted_optional_files": [
+    "assets/iron_demo.gif",
+    "assets/log_demo.gif",
+    "assets/water_demo.gif",
+    "assets/wool_demo.gif"
+  ]
+}

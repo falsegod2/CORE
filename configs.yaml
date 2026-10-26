@@ -1,235 +1,72 @@
 defaults:
-  # ==========================================
-  # 1. 系统与日志配置 (System & Logging)
-  # ==========================================
+
+  use_wandb: False
+  wandb_key: None
   logdir: null
   traindir: null
   evaldir: null
   offline_traindir: ''
   offline_evaldir: ''
   seed: 0
-
-  video_pred_log: True
-  
   deterministic_run: False
+  steps: 1e6
+  parallel: False
+  eval_every: 20000
+  eval_episode_num: 10
+  log_every: 20000
+  reset_every: 0
+  checkpoint_every: 100000
   device: 'cuda:0'
   compile: True
   precision: 32
   debug: False
-  
-  use_wandb: False
-  wandb_key: None
-  # Stable-V1 optional readable console/health diagnostics. Disabled in the
-  # baseline profile so old experiments remain behaviorally/logging compatible.
-  compact_health_log: False
-  print_all_scalars: True
-  health_metrics_enabled: False
-  health_value_std_low: 0.01
-  health_actor_grad_low: 0.003
-  health_imag_reward_std_low: 0.001
+  video_pred_log: True
 
-  # Stable-V1.2 success-aware replay. Disabled by default so all earlier
-  # profiles remain behaviorally identical. This is a sampling mixture over the
-  # existing replay cache, not a new buffer and not extra environment data.
-  success_replay_enabled: False
-  success_replay_ratio: 0.0
-  success_replay_positive_threshold: 1.0e-6
-
-  resume_path: null
-  enable_cloud_backup: False
-  cloud_backup_interval: 7200
-
-  # ==========================================
-  # 2. 核心创新点与消融实验控制 (CJJ Innovations)
-  # ==========================================
-  inverse_loss_scale: 0.0      # 本消融关闭inverse监督；inverse head保留实例以维持初始化/RNG路径可比性
-  affordance_s_scale: 1.0      # Affordance仅作为S分支辅助监督，不再输入encoder
-  z_action_adv_scale: 0.0      # 关闭Z对抗；只测试S-Aff + S-only 5A
-  z_action_grl_scale: 1.0      # Gradient Reversal强度
-
-  # S-only Experiment 5A: multi-step open-loop consistency on controllable S branch only.
-  # 与原5A保持同一 horizons / weights / scale；Z不参与该辅助损失。
-  s_multi_step_consistency:
-    enabled: true
-    horizons: [1, 2, 4, 8, 15]
-    horizon_weights: [1.0, 1.0, 0.75, 0.5, 0.25]
-    projection_dim: 512
-    starts_per_sequence: 4
-    projection_seed: 314159
-    loss_scale: 0.05
-
-    # S-Outcome: 用同一条S5A rollout的 [S_t, S_hat_{t+k}] 预测真实环境
-    # k-step discounted return。只作为world-model辅助监督，不加入Actor reward。
-    outcome:
-      enabled: true
-      loss_scale: 0.01
-      hidden_dim: 256
-      init_seed: 161803
-      # 省略/设为null时由代码继承全局 discount=0.997；这里显式写出便于审计。
-      discount: 0.997
-
-      # Balanced Multi-Step Return Prediction
-      # 原始Outcome中非零真实回报极稀疏（约1e-3量级），普通MSE容易退化为“全预测0”。
-      # balanced模式分别求正/负样本均值，再按positive_mix混合；只有一类样本时退化为该类均值。
-      balance_mode: balanced
-      positive_mix: 0.5
-      positive_threshold: 1.0e-6
-      # Legacy/default semantics used by MineDojo/Crafter. ViZDoom overrides
-      # this to positive_return because native rewards include living penalties.
-      positive_mode: absolute_nonzero
-      # 仅用于legacy sample_weighted模式；balanced模式下不使用。
-      positive_weight: 1.0
-
-      # Head calibration：额外使用同一replay batch中所有合法posterior窗口，
-      # 从 [S_t, S_{t+k}] 预测真实k-step return。posterior特征detach，
-      # 因而该项只校准Outcome head，不向S/Z encoder或RSSM注入捷径。
-      # 主rollout outcome loss仍使用 [S_t, S_hat_{t+k}]，并继续向S dynamics反传。
-      calibration_enabled: true
-      calibration_scale: 0.5
-
-      # Stable-V1 return-evidence gate. Baseline remains disabled; the
-      # stable_v1 profile turns it on. Calibration still trains the head while
-      # only the rollout loss that shapes S is gated.
-      evidence_gate_enabled: false
-      evidence_gate_ema: 0.99
-      evidence_gate_low: 5.0e-5
-      evidence_gate_high: 5.0e-4
-      evidence_gate_horizon: 15
-      evidence_gate_min: 0.0
-
-    # Generic Few-shot Prototypical Utility v2:
-    # 不再按“距离成功还有4/15步”做任务特定的时间分层。默认使用所有任务都存在的
-    # task-conditioned evidence：MineCLIP task score + affordance heatmap + 少量 intrinsic
-    # progress event，经过 batch 内稳健分位数归一化后形成 Low/Mid/High/Success 四类。
-    # real environment reward 只负责 Success 硬锚点。仍然只作为 representation
-    # supervision，不加入 Actor imagined reward，因此 RGB-only inference 不变。
-    prototype_utility:
-      enabled: true
-      loss_scale: 0.01
-      temperature: 0.10
-      prototype_ema: 0.95
-      # Stable-V1 keys. Baseline keeps batch quantiles and immediate success
-      # prototype activation; stable_v1 overrides them.
-      quantile_mode: batch
-      quantile_ema: 0.99
-      success_min_support: 1
-
-      # Stable-V1.2 Proto-only gradient guard. Disabled by default. It samples
-      # gradient conflict on S prior dynamics every N updates and only attenuates
-      # Proto when it conflicts with the established core objective.
-      gradient_guard_enabled: false
-      gradient_guard_interval: 16
-      gradient_guard_conflict_low: -0.20
-      gradient_guard_conflict_high: 0.0
-      gradient_guard_min_conflict_gate: 0.25
-      gradient_guard_max_norm_ratio: 0.35
-      gradient_guard_min_total_gate: 0.10
-      gradient_guard_ema: 0.80
-
-      # task_evidence = 默认通用版；temporal_success = 旧版时间分层，仅供消融。
-      label_mode: task_evidence
-
-      # 通用 teacher 权重。task_score 和 heatmap 都是 task-conditioned，
-      # 数值会先在每个 replay batch 内做稳健分位数归一化，因此不需要为每个任务手调阈值。
-      semantic_weight: 0.65
-      affordance_weight: 0.30
-      intrinsic_weight: 0.05
-      heatmap_topk_fraction: 0.05
-
-      # robust component normalization: q05 -> 0, q95 -> 1
-      robust_low_quantile: 0.05
-      robust_high_quantile: 0.95
-
-      # combined task evidence 的三段相对分层：Low / Mid / High。
-      # 边界附近留作 Unknown，降低 noisy pseudo labels。
-      stage_low_quantile: 0.30
-      stage_high_quantile: 0.70
-      boundary_margin: 0.05
-      min_signal_span: 1.0e-4
-
-      # Stable-V1.1 reliability defaults. MineDojo/Crafter use raw absolute
-      # q05-q95 span; ViZDoom overrides to relative_contrast.
-      reliability_mode: absolute_span
-      reliability_span_floor: 0.02
-
-      # 真实成功永远覆盖 pseudo stage，成为 class 3 的硬锚点。
-      positive_threshold: 1.0e-6
-
-      # 下面三个参数仅 label_mode=temporal_success 时使用。
-      ready_steps: 4
-      near_steps: 15
-      progress_steps: null
-
-    # 仅诊断，不加入 total_loss，不反传梯度，也不改变随机数流。
-    diagnostics:
-      enabled: true
-      counterfactual_actions: true      # true prefix vs cyclic-shuffled / zero prefix
-      direct_vs_composed: true          # ISO3 surrogate: full open-loop vs posterior-reanchored terminal
-      direct_vs_composed_horizon: 15
-      direct_vs_composed_midpoint: 7
-  # 【已移除 long_term_branch_weight】
-
-  gaussian_reward_weight: 0.0  
-  gaussian_sigma_weight: 0.5   
-
-  # ==========================================
-  # 3. 强化学习与训练超参 (RL & Training Params)
-  # ==========================================
-  steps: 1e6                   
-  parallel: False
-  eval_every: 20000            
-  eval_episode_num: 10          # 减少3-episode评估造成的离散高方差
-  log_every: 20000
-  reset_every: 0
-  train_ratio: 16              
-  pretrain: 100                
-  prefill: 2500                
-  dataset_size: 1000000
-  batch_size: 16
-  batch_length: 32
-  model_lr: 1e-4
-  opt_eps: 1e-8
-  grad_clip: 1000
-  opt: 'adam'
-  reward_EMA: True             
-
-  # ==========================================
-  # 4. 环境设置 (Environment)
-  # ==========================================
+  # Environment
   task: 'minedojo'
   size: [64, 64]
   envs: 1
   action_repeat: 1
-  time_limit: 36000
+  time_limit: 1000
   grayscale: False
-  break_speed: 100.0
+  prefill: 2500
+  reward_EMA: True
 
-  # ==========================================
-  # 5. 行为策略与长短期想象 (Behavior & Imagination)
-  # ==========================================
-  discount: 0.997
-  discount_lambda: 0.95
-  # 【已移除 jump_prob 和 jump_prob_decay】
-  imag_horizon: 15             
-  max_imag_sequences_num: 1024
-  imag_gradient: 'reinforce'   
-  imag_gradient_mix: 0.0
-  eval_state_mean: False
-
-  # ==========================================
-  # 6. 世界模型架构 (World Model Architecture)
-  # ==========================================
-  dyn_hidden: 1024
-  dyn_deter: 4096
+  # Model
+  dyn_hidden: 512
+  dyn_deter: 512
   dyn_stoch: 32
   dyn_discrete: 32
   dyn_rec_depth: 1
   dyn_mean_act: 'none'
   dyn_std_act: 'sigmoid2'
   dyn_min_std: 0.1
-  units: 1024
+  grad_heads: ['decoder', 'reward', 'end', 'intrinsic', 'jump', 'jumping_steps', 'accumulated_reward']
+  units: 512
   act: 'SiLU'
   norm: True
+  encoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
+  decoder:
+    {mlp_keys: '$^', cnn_keys: 'image', act: 'SiLU', norm: True, cnn_depth: 32, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
+  actor:
+    {layers: 2, dist: 'normal', entropy: 3e-4, unimix_ratio: 0.01, std: 'learned', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
+  critic:
+    {layers: 2, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
+  reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  end_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  jump_head:
+    {layers: 2, loss_scale: 1.0, outscale: 1.0}
+  concentration_score_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  intrinsic_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  jumping_steps_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
+  accumulated_reward_head:
+    {layers: 2, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
   dyn_scale: 0.5
   rep_scale: 0.1
   kl_free: 1.0
@@ -238,31 +75,30 @@ defaults:
   weight_decay: 0.0
   unimix_ratio: 0.01
   initial: 'learned'
-  
-  encoder:
-    {mlp_keys: '$^', cnn_keys: '^image$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, symlog_inputs: True}
-  decoder:
-    {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', act: 'SiLU', norm: True, cnn_depth: 96, kernel_size: 4, minres: 4, mlp_layers: 5, mlp_units: 1024, cnn_sigmoid: False, image_dist: mse, vector_dist: symlog_mse, outscale: 1.0}
-  
-  # 【已移除 'jump', 'jumping_steps', 'accumulated_reward'】
-  grad_heads: ['decoder', 'reward', 'end', 'intrinsic']
 
-  # ==========================================
-  # 7. 策略与价值网络 (Actor-Critic & Heads)
-  # ==========================================
-  actor:
-    {layers: 5, dist: 'onehot', entropy: 3e-4, unimix_ratio: 0.01, std: 'none', min_std: 0.1, max_std: 1.0, temp: 0.1, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 1.0}
-  critic: 
-    {layers: 5, dist: 'symlog_disc', slow_target: True, slow_target_update: 1, slow_target_fraction: 0.02, lr: 3e-5, eps: 1e-5, grad_clip: 100.0, outscale: 0.0}
-  
-  reward_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  end_head: {layers: 5, loss_scale: 1.0, outscale: 1.0}
-  intrinsic_head: {layers: 5, dist: 'symlog_disc', loss_scale: 1.0, outscale: 0.0}
-  # 【已移除 jump_head, jumping_steps_head, accumulated_reward_head, concentration_score_head】
+  # Training
+  batch_size: 16
+  batch_length: 32
+  train_ratio: 512
+  pretrain: 100
+  model_lr: 1e-4
+  opt_eps: 1e-8
+  grad_clip: 1000
+  dataset_size: 1000000
+  opt: 'adam'
 
-  # ==========================================
-  # 8. 探索参数 (Exploration)
-  # ==========================================
+  # Behavior.
+  discount: 0.997
+  discount_lambda: 0.95
+  jump_prob: 0.7
+  jump_prob_decay: 0.9997
+  imag_horizon: 15
+  max_imag_sequences_num: 1024
+  imag_gradient: 'dynamics'
+  imag_gradient_mix: 0.0
+  eval_state_mean: False
+
+  # Exploration
   expl_behavior: 'greedy'
   expl_until: 0
   expl_extr_scale: 0.0
@@ -276,133 +112,44 @@ defaults:
   disag_action_cond: False
 
 minedojo:
-  target_item: "log"
-  name: "test"
-  results_dir: "./results"
-  agent_checkpoint_dir: ""
-  unet_batch_size: 64
-  rollout_image_num: 2000
+
+  long_term_branch_weight: 1.0
+  gaussian_reward_weight: 1.0
+  gaussian_sigma_weight: 0.5
+
+  # rollout
   is_random: True
+  agent_checkpoint_dir: ""
+  rollout_image_num: 2000
 
-# ViZDoom adapter profile. Combine with stable_v1 stable_v1_1 stable_v1_2.
-# Example:
-#   python expr.py --configs vizdoom stable_v1 stable_v1_1 stable_v1_2 \
-#     --task vizdoom_my_way_home
-vizdoom:
-  # Fast first-person proxy protocol shared with the Dreamer baseline.
-  steps: 300000
-  eval_every: 20000
+  unet_batch_size: 64
+  results_dir: "./results"
+  name: "test"
+  target_item: "log"
+  steps: 1e6
+  parallel: False
+  envs: 1
   eval_episode_num: 10
-  log_every: 20000
-  prefill: 2500
+  eval_every: 20000
   action_repeat: 1
-  size: [64, 64]
-
-  vizdoom_frame_skip: 4
-  vizdoom_reward_mode: native
-  vizdoom_success_threshold: -1.0   # <0 => task default
-  vizdoom_teacher_mode: auto       # MyWayHome/Corridor=>green_goal; PredictPosition=>moving_target
-
-  # Main cross-environment protocol is intentionally no-intrinsic.  Keep the
-  # head instantiated for checkpoint/code compatibility, but remove both its
-  # world-model loss and imagined actor reward contribution.
-  intrinsic_reward_scale: 0.0
-  grad_heads: ['decoder', 'reward', 'end']
-  intrinsic_head:
-    {layers: 5, dist: 'symlog_disc', loss_scale: 0.0, outscale: 0.0}
-
-  s_multi_step_consistency:
-    outcome:
-      # ViZDoom native rewards contain per-step living penalties.  Positive
-      # Outcome evidence must mean genuinely positive task return, not merely
-      # any non-zero return.  Crafter/MineDojo keep the legacy default.
-      positive_mode: positive_return
-    prototype_utility:
-      intrinsic_weight: 0.0
-      # RGB teachers in ViZDoom can have a smaller absolute numeric range than
-      # MineCLIP while still being strongly discriminative.  Use within-signal
-      # contrast plus a noise floor instead of MineDojo's raw absolute span.
-      reliability_mode: relative_contrast
-      reliability_span_floor: 0.02
-
-
-stable_v1:
-  # Stable-V1 keeps the strongest method architecture and its original
-  # Full-Heatmap + S-only Affordance + S5A losses unchanged. Only reliability
-  # handling for Proto/Outcome and diagnostics are modified.
-  compact_health_log: True
-  print_all_scalars: False
-  health_metrics_enabled: True
-
-  s_multi_step_consistency:
-    outcome:
-      enabled: true
-      loss_scale: 0.01
-      # Gate only the rollout Outcome path that backpropagates into S dynamics.
-      # Dense posterior calibration stays active at all times.
-      evidence_gate_enabled: true
-      evidence_gate_ema: 0.99
-      evidence_gate_low: 5.0e-5
-      evidence_gate_high: 5.0e-4
-      evidence_gate_horizon: 15
-      evidence_gate_min: 0.0
-
-    prototype_utility:
-      enabled: true
-      loss_scale: 0.01
-      prototype_ema: 0.98
-      quantile_mode: ema
-      quantile_ema: 0.99
-      boundary_margin: 0.10
-      # Prevent a handful of rare success samples from immediately defining a
-      # high-authority Success prototype.
-      success_min_support: 256
-
-stable_v1_1:
-  # Stable-V1.1 = Stable-V1 + Proto teacher reliability gate.
-  # Keep all Stable-V1 architecture/losses unchanged; only make Proto
-  # supervision reliability-aware when semantic/affordance evidence is weak.
-  s_multi_step_consistency:
-    prototype_utility:
-      reliability_gate_enabled: true
-      # Zero-start EMA on raw teacher discrimination:
-      # R = 0.65 * semantic_span + 0.30 * affordance_span.
-      reliability_ema: 0.99
-      reliability_low: 0.30
-      reliability_high: 0.60
-      reliability_min: 0.0
-      reliability_semantic_weight: 0.65
-      reliability_affordance_weight: 0.30
-      # Real Success support still accumulates, but the Success class is not
-      # allowed into Proto logits until both support and teacher reliability
-      # are adequate.
-      success_reliability_min_gate: 0.10
-      # When gate is exactly zero, do not let weak pseudo Low/Mid/High labels
-      # update the prototype bank. Real Success anchors are still accumulated.
-      mask_pseudo_bank_when_gate_zero: true
-
-stable_v1_2:
-  # Stable-V1.2 is intentionally restrained:
-  #   1) keep Stable-V1.1 Proto reliability gate;
-  #   2) add a Proto-only gradient conflict/norm guard;
-  #   3) sample only 10% from already-successful episodes to prevent rare
-  #      success trajectories from vanishing from replay.
-  # No changes to architecture, Full Heatmap, S-Aff, S5A, Outcome gate, actor,
-  # critic, optimizer, or learning rates.
-  success_replay_enabled: True
-  success_replay_ratio: 0.10
-  success_replay_positive_threshold: 1.0e-6
-
-  s_multi_step_consistency:
-    prototype_utility:
-      gradient_guard_enabled: true
-      gradient_guard_interval: 16
-      gradient_guard_conflict_low: -0.20
-      gradient_guard_conflict_high: 0.0
-      gradient_guard_min_conflict_gate: 0.25
-      gradient_guard_max_norm_ratio: 0.35
-      gradient_guard_min_total_gate: 0.10
-      gradient_guard_ema: 0.80
+  train_ratio: 16
+  video_pred_log: true
+  dyn_hidden: 1024
+  dyn_deter: 4096
+  units: 1024
+  encoder: {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  decoder: {mlp_keys: '$^', cnn_keys: '^(image|heatmap)$', cnn_depth: 96, mlp_layers: 5, mlp_units: 1024}
+  actor: {layers: 5, dist: 'onehot', std: 'none'}
+  value: {layers: 5}
+  reward_head: {layers: 5}
+  intrinsic_head: {layers: 5}
+  jumping_steps_head: {layers: 5}
+  accumulated_reward_head: {layers: 5}
+  end_head: {layers: 5}
+  jump_head: {layers: 5}
+  imag_gradient: 'reinforce'
+  break_speed: 100.0
+  time_limit: 36000
 
 debug:
   debug: True

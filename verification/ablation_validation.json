@@ -1,0 +1,26 @@
+{
+  "date": "2026-10-21",
+  "base_zip": "LS_Imagine_Clean_Evidence_20261020.zip",
+  "base_zip_sha256": "f01890ecef7109c2857f4471154bccc782ab8a829297ea7f5805af8820116e35",
+  "pytest": {
+    "passed": 95,
+    "failed": 0,
+    "warnings": 83,
+    "seconds": 13.72,
+    "command": "python -m pytest -q evidence_tests --disable-warnings --junitxml=verification/ablation_test_results.xml"
+  },
+  "runtime": {
+    "python": "3.12.14",
+    "torch": "2.5.1+cpu",
+    "numpy": "1.26.4",
+    "gym": "0.21.0 source (test metadata compatibility shim)",
+    "ruamel.yaml": "0.17.40"
+  },
+  "python39_syntax_files": 69,
+  "bash_launchers_checked": 3,
+  "not_executed": [
+    "Remote Minecraft/Java/Gradle startup and reset",
+    "CUDA formal-size training updates",
+    "Million-step learning performance"
+  ]
+}
