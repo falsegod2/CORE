@@ -1,5 +1,3 @@
-> 2026-10-21 新入口与消融说明：请先阅读 [README_ABLATIONS_CN.md](README_ABLATIONS_CN.md)。本文下方保留历史版本说明，历史测试数量与启动目录不代表当前包。
-
 <div align="center">
 <img src='assets/logo_long.png' style="height:60px"></img>
 </div>

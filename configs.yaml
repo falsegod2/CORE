@@ -151,6 +151,16 @@ minedojo:
   break_speed: 100.0
   time_limit: 36000
 
+b_plan1:
+  b_plan1: True
+  b_plan_start: 50000
+  b_mineclip_intrinsic: False
+  compile: False
+  video_pred_log: False
+  encoder: {mlp_keys: '$^', cnn_keys: '^image$'}
+  decoder: {mlp_keys: '$^', cnn_keys: '^image$'}
+  grad_heads: ['decoder', 'reward', 'end']
+
 debug:
   debug: True
   pretrain: 1

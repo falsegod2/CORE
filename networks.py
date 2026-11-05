@@ -28,6 +28,8 @@ class RSSM(nn.Module):
         num_actions=None,
         embed=None,
         device=None,
+        *,
+        extra_jump_action=True,
     ):
         super(RSSM, self).__init__()
         self._stoch = stoch
@@ -41,15 +43,15 @@ class RSSM(nn.Module):
         self._std_act = std_act
         self._unimix_ratio = unimix_ratio
         self._initial = initial
-        self._num_actions = num_actions + 1
+        self._num_actions = num_actions + int(extra_jump_action)
         self._embed = embed
         self._device = device
 
         inp_layers = []
         if self._discrete:
-            inp_dim = self._stoch * self._discrete + num_actions + 1
+            inp_dim = self._stoch * self._discrete + self._num_actions
         else:
-            inp_dim = self._stoch + num_actions + 1
+            inp_dim = self._stoch + self._num_actions
         inp_layers.append(nn.Linear(inp_dim, self._hidden, bias=False))
         if norm:
             inp_layers.append(nn.LayerNorm(self._hidden, eps=1e-03))

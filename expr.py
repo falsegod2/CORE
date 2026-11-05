@@ -65,11 +65,6 @@ class LS_Imagine(nn.Module):
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
                 for name, values in self._metrics.items():
-                    # A log boundary may occur before the next learner update
-                    # (including just after resume). Empty windows are missing,
-                    # not NaN training losses.
-                    if isinstance(values, (list, tuple)) and not values:
-                        continue
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
@@ -173,6 +168,10 @@ def make_env(config, mode, id):
                 log_dir=log_dir,
                 target_item=config.target_item
             )
+        if getattr(config, "b_plan1", False):
+            kwargs["concentration_specs"] = None
+            if not config.b_mineclip_intrinsic:
+                kwargs["clip_specs"] = None
         env = minedojo.make_env(task, **kwargs)
         env = wrappers.OneHotAction(env)
 
@@ -300,7 +299,11 @@ def main(config): # config is namespace
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = LS_Imagine(
+    agent_cls = LS_Imagine
+    if getattr(config, "b_plan1", False):
+        from b_plan1 import RealAnchoredAgent
+        agent_cls = RealAnchoredAgent
+    agent = agent_cls(
         train_envs[0].observation_space,
         train_envs[0].action_space,
         config,

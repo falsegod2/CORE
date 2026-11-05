@@ -56,8 +56,6 @@ def _add_wrappers(
     fast_reset: int = None,
     log_dir: str = None,
     freeze_equipped: bool = True,
-    evidence_specs: Dict = None,
-    ls_runtime_specs: Dict = None,
     **kwargs
 ):
     
@@ -76,41 +74,13 @@ def _add_wrappers(
 
     # Add reward shaping wrapper
     if clip_specs is not None:
-        teacher_runtime = evidence_specs if evidence_specs is not None else ls_runtime_specs
-        if teacher_runtime is None:
-            clip_reward = MinedojoClipReward()
-        else:
-            clip_reward = MinedojoClipReward(
-                ckpt=teacher_runtime["clip_checkpoint"],
-                device=teacher_runtime["device"],
-            )
+        clip_reward = MinedojoClipReward()
         env = ClipWrapper(env, clip_reward, **clip_specs)
 
-    if evidence_specs is not None:
-        # Evidence uses the Clean task/action/reset chain with current-view
-        # heatmaps as training targets. It does not request LS shaping or zooms.
-        if evidence_specs.get("training", True) and evidence_specs.get("semantic_teacher", True):
-            if concentration_specs is None:
-                raise ValueError("Evidence training requires task concentration_specs")
-            from clean_evidence.semantic_teacher import make_heatmap_only_wrapper
-            concentration_reward = MinedojoConcentrationReward(
-                ckpt=evidence_specs["clip_checkpoint"],
-                unet_checkpoint_dir=evidence_specs["unet_checkpoint_dir"],
-                output_dir=log_dir,
-                gaussian_sigma_weight=concentration_specs.get("gaussian_sigma_weight", 0.5),
-                device=evidence_specs["device"],
-            )
-            env = make_heatmap_only_wrapper(
-                env, concentration_reward, concentration_specs.get("prompts"),
-            )
-    elif concentration_specs is not None:
+    if concentration_specs is not None:
         unet_checkpoint_dir = concentration_specs["unet_checkpoint_dir"] if "unet_checkpoint_dir" in concentration_specs else "envs/tasks/base/unet_checkpoint"
         gaussian_sigma_weight = concentration_specs["gaussian_sigma_weight"] if "gaussian_sigma_weight" in concentration_specs else 0.5
-        runtime = dict(ls_runtime_specs or {})
-        if runtime:
-            unet_checkpoint_dir = runtime.pop("unet_checkpoint_dir")
-            runtime["ckpt"] = runtime.pop("clip_checkpoint")
-        concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight, **runtime)
+        concentration_reward = MinedojoConcentrationReward(unet_checkpoint_dir=unet_checkpoint_dir, output_dir=log_dir, gaussian_sigma_weight=gaussian_sigma_weight)
         env = ConcentrationWrapper(env, concentration_reward, **concentration_specs)
 
     env = MinedojoLSImagineWrapper(env, **LS_Imagine_specs)

@@ -5,6 +5,7 @@ import json
 import pathlib
 import time
 import random
+import wandb
 import copy
 import numpy as np
 import torch
@@ -96,8 +97,6 @@ class Logger:
         self.step = step
 
         if self._wandb:
-            global wandb
-            import wandb
             if config.wandb_key is None:
                 raise ValueError("wandb_key is None")
             wandb.login(key=config.wandb_key)
@@ -509,11 +508,9 @@ def from_generator(generator, batch_size):
         yield data
 
 
-def sample_episodes(episodes, length, seed=0, rng=None):
+def sample_episodes(episodes, length, seed=0):
 
-    # Optional external RNG lets the managed serial runner checkpoint sampling.
-    # Existing callers retain exactly the original seed=0 sampler.
-    np_random = np.random.RandomState(seed) if rng is None else rng
+    np_random = np.random.RandomState(seed)
     while True:
         size = 0
         ret = None
@@ -1220,7 +1217,7 @@ def uniform_weight_init(given_scale):
 def tensorstats(tensor, prefix=None):
     metrics = {
         "mean": to_np(torch.mean(tensor)),
-        "std": to_np(torch.std(tensor) if tensor.numel() > 1 else torch.zeros_like(torch.mean(tensor))),
+        "std": to_np(torch.std(tensor)),
         "min": to_np(torch.min(tensor)),
         "max": to_np(torch.max(tensor)),
     }
